@@ -1,0 +1,7 @@
+/core/target/
+/build/
+*.ipa
+.DS_Store
+/ios/*.xcodeproj/
+/ios/Generated/
+.venv/
