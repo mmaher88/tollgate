@@ -163,8 +163,9 @@ the CA, exercises the whole filtering path without a phone.
 
 `startTunnel`:
 
-1. Load `config.json` and the CA from the App Group container (identifier read from the
-   extension's entitlements at runtime, never hard-coded).
+1. Load `config.json` and the CA from the App Group container. The identifier comes from
+   the `TollgateAppGroup` Info.plist key, which project generation fills from
+   `tooling/config.env`; Swift code never hard-codes it.
 2. Create the Rust `Engine`, start the proxy, get its port.
 3. Apply `NEPacketTunnelNetworkSettings`:
    - remote address `127.0.0.1` (placeholder), IPv4 `198.18.0.2/32` with included route
