@@ -1,0 +1,93 @@
+name: ios
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load identifiers
+        run: grep -E '^[A-Z_]+=' tooling/config.env | tr -d '"' >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Build Rust core and Swift bindings
+        run: tooling/scripts/build-core-ios.sh
+
+      - name: Toolchain versions
+        run: |
+          xcodebuild -version
+          swift --version
+          rustc --version
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          cd ios && xcodegen generate
+
+      - name: Detect signing secrets
+        id: signing
+        env:
+          P12: ${{ secrets.DEV_CERT_P12_BASE64 }}
+        run: |
+          if [ -n "$P12" ]; then echo "enabled=true" >> "$GITHUB_OUTPUT"; else echo "enabled=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Compile without signing
+        if: steps.signing.outputs.enabled != 'true'
+        run: |
+          xcodebuild -project ios/Tollgate.xcodeproj -scheme Tollgate -configuration Release \
+            -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
+
+      - name: Install signing certificate and profiles
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          DEV_CERT_P12_BASE64: ${{ secrets.DEV_CERT_P12_BASE64 }}
+          DEV_CERT_P12_PASSWORD: ${{ secrets.DEV_CERT_P12_PASSWORD }}
+          APP_PROFILE_BASE64: ${{ secrets.APP_PROFILE_BASE64 }}
+          TUNNEL_PROFILE_BASE64: ${{ secrets.TUNNEL_PROFILE_BASE64 }}
+        run: tooling/ci/install-signing.sh
+
+      - name: Archive
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          TEAM_ID: ${{ vars.TEAM_ID }}
+        run: |
+          xcodebuild -project ios/Tollgate.xcodeproj -scheme Tollgate -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath build/Tollgate.xcarchive \
+            DEVELOPMENT_TEAM="$TEAM_ID" OTHER_CODE_SIGN_FLAGS="--keychain $SIGNING_KEYCHAIN" archive
+
+      - name: Export .ipa
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          TEAM_ID: ${{ vars.TEAM_ID }}
+        run: tooling/ci/export-ipa.sh build/Tollgate.xcarchive build/export
+
+      - uses: actions/upload-artifact@v7
+        if: steps.signing.outputs.enabled == 'true'
+        with:
+          name: Tollgate-ipa
+          path: build/export/*.ipa
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Remove signing keychain
+        if: always() && env.SIGNING_KEYCHAIN != ''
+        run: security delete-keychain "$SIGNING_KEYCHAIN"
