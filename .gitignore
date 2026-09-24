@@ -17,3 +17,6 @@
 /ios/App/Tollgate.entitlements
 /ios/Tunnel/Info.plist
 /ios/Tunnel/TollgateTunnel.entitlements
+# Python
+__pycache__/
+.pytest_cache/

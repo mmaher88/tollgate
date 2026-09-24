@@ -11,7 +11,6 @@ settings:
     SWIFT_STRICT_CONCURRENCY: complete
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
-    TARGETED_DEVICE_FAMILY: "1"
     SWIFT_INCLUDE_PATHS: $(SRCROOT)/Generated/TollgateFFI
     LIBRARY_SEARCH_PATHS: $(SRCROOT)/Generated/lib
     OTHER_LDFLAGS: -ltollgate_ffi
@@ -30,6 +29,8 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: Tollgate
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
@@ -43,6 +44,7 @@ targets:
           - ${TOLLGATE_APP_GROUP}
     settings:
       base:
+        TARGETED_DEVICE_FAMILY: "1"
         PRODUCT_BUNDLE_IDENTIFIER: ${TOLLGATE_BUNDLE_ID}
         PROVISIONING_PROFILE_SPECIFIER: ${TOLLGATE_APP_PROFILE}
     dependencies:
@@ -60,6 +62,8 @@ targets:
       path: Tunnel/Info.plist
       properties:
         CFBundleDisplayName: Tollgate Tunnel
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
@@ -73,6 +77,7 @@ targets:
           - ${TOLLGATE_APP_GROUP}
     settings:
       base:
+        TARGETED_DEVICE_FAMILY: "1"
         PRODUCT_BUNDLE_IDENTIFIER: ${TOLLGATE_TUNNEL_BUNDLE_ID}
         PROVISIONING_PROFILE_SPECIFIER: ${TOLLGATE_TUNNEL_PROFILE}
     dependencies:

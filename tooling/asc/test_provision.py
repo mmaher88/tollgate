@@ -34,13 +34,6 @@ def test_team_token_claims(ec_key_pem):
     assert "sub" not in claims
 
 
-def test_individual_token_uses_sub(ec_key_pem):
-    key, pem = ec_key_pem
-    token = provision.make_token("KEY123", "", pem, dt.datetime.now(dt.timezone.utc))
-    claims = jwt.decode(token, key.public_key(), algorithms=["ES256"], audience="appstoreconnect-v1")
-    assert claims["sub"] == "user"
-    assert "iss" not in claims
-
 
 def test_csr_is_rsa_2048_with_common_name():
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)

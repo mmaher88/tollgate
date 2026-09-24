@@ -7,7 +7,7 @@
 
 Environment:
   ASC_KEY_ID     API key ID
-  ASC_ISSUER_ID  issuer ID for a team key; leave empty for an individual key
+  ASC_ISSUER_ID  issuer ID of the Team key (individual keys cannot use provisioning endpoints)
   ASC_KEY_PATH   path to AuthKey_<KEYID>.p8
 
 Commands (all idempotent):
@@ -59,11 +59,7 @@ def load_config(path: Path) -> dict[str, str]:
 
 def make_token(key_id: str, issuer_id: str, private_key_pem: bytes, now: dt.datetime) -> str:
     iat = int(now.timestamp())
-    claims = {"iat": iat, "exp": iat + 15 * 60, "aud": "appstoreconnect-v1"}
-    if issuer_id:
-        claims["iss"] = issuer_id
-    else:
-        claims["sub"] = "user"
+    claims = {"iss": issuer_id, "iat": iat, "exp": iat + 15 * 60, "aud": "appstoreconnect-v1"}
     return jwt.encode(claims, private_key_pem, algorithm="ES256", headers={"kid": key_id, "typ": "JWT"})
 
 
@@ -96,12 +92,14 @@ class Client:
     def __init__(self) -> None:
         try:
             self.key_id = os.environ["ASC_KEY_ID"]
+            self.issuer_id = os.environ["ASC_ISSUER_ID"]
             self.key_pem = Path(os.environ["ASC_KEY_PATH"]).expanduser().read_bytes()
         except KeyError as missing:
             sys.exit(f"missing environment variable {missing}")
         except OSError as err:
             sys.exit(f"cannot read ASC_KEY_PATH: {err}")
-        self.issuer_id = os.environ.get("ASC_ISSUER_ID", "")
+        if not self.issuer_id:
+            sys.exit("ASC_ISSUER_ID is empty: individual API keys cannot call provisioning endpoints, use a Team key")
         self.session = requests.Session()
 
     def request(self, method: str, path: str, **kwargs) -> dict:
@@ -132,7 +130,10 @@ def cmd_check(c: Client, cfg: dict) -> None:
 
 
 def connected_udid() -> tuple[str, str]:
-    out = subprocess.run(["idevice_id", "-l"], capture_output=True, text=True).stdout.split()
+    try:
+        out = subprocess.run(["idevice_id", "-l"], capture_output=True, text=True).stdout.split()
+    except FileNotFoundError:
+        sys.exit("idevice_id not found (install libimobiledevice), or pass --udid and --name")
     if len(out) != 1:
         sys.exit("connect exactly one iPhone by USB, or pass --udid and --name")
     name = subprocess.run(["ideviceinfo", "-u", out[0], "-k", "DeviceName"], capture_output=True, text=True).stdout.strip()
@@ -212,8 +213,10 @@ def cmd_cert(c: Client, force: bool = False) -> None:
 
 def cmd_profiles(c: Client, cfg: dict) -> None:
     cert_id = load_state().get("certificate_id") or sys.exit("run `cert` first")
+    # Apple TVs also register under the IOS platform but are rejected by iOS profiles.
     devices = [{"type": "devices", "id": d["id"]} for d in
-               c.get_all("/devices", {"filter[platform]": "IOS", "filter[status]": "ENABLED", "limit": 200})]
+               c.get_all("/devices", {"filter[platform]": "IOS", "filter[status]": "ENABLED", "limit": 200})
+               if d["attributes"].get("deviceClass") in ("IPHONE", "IPAD", "IPOD")]
     if not devices:
         sys.exit("no enabled iOS devices; run `device` first")
     team_ids = set()
