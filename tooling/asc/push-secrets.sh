@@ -2,7 +2,7 @@
 # Owner-run: copies the signing assets from tooling/asc/out into the GitHub repo secrets.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
-# shellcheck source=../config.env
+# shellcheck source=SCRIPTDIR/../config.env
 source tooling/config.env
 OUT=tooling/asc/out
 
