@@ -1,0 +1,79 @@
+# Generated into Tollgate.xcodeproj by `xcodegen generate` with tooling/config.env
+# exported. Never edit the generated project.
+name: Tollgate
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1"
+    SWIFT_INCLUDE_PATHS: $(SRCROOT)/Generated/TollgateFFI
+    LIBRARY_SEARCH_PATHS: $(SRCROOT)/Generated/lib
+    OTHER_LDFLAGS: -ltollgate_ffi
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: Apple Development
+    DEAD_CODE_STRIPPING: YES
+targets:
+  Tollgate:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+      - path: Shared
+      - path: Generated/Swift
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Tollgate
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        TollgateAppGroup: ${TOLLGATE_APP_GROUP}
+    entitlements:
+      path: App/Tollgate.entitlements
+      properties:
+        com.apple.developer.networking.networkextension:
+          - packet-tunnel-provider
+        com.apple.security.application-groups:
+          - ${TOLLGATE_APP_GROUP}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ${TOLLGATE_BUNDLE_ID}
+        PROVISIONING_PROFILE_SPECIFIER: ${TOLLGATE_APP_PROFILE}
+    dependencies:
+      - target: TollgateTunnel
+      - sdk: NetworkExtension.framework
+    scheme: {}
+  TollgateTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Tunnel
+      - path: Shared
+      - path: Generated/Swift
+    info:
+      path: Tunnel/Info.plist
+      properties:
+        CFBundleDisplayName: Tollgate Tunnel
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
+        TollgateAppGroup: ${TOLLGATE_APP_GROUP}
+    entitlements:
+      path: Tunnel/TollgateTunnel.entitlements
+      properties:
+        com.apple.developer.networking.networkextension:
+          - packet-tunnel-provider
+        com.apple.security.application-groups:
+          - ${TOLLGATE_APP_GROUP}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ${TOLLGATE_TUNNEL_BUNDLE_ID}
+        PROVISIONING_PROFILE_SPECIFIER: ${TOLLGATE_TUNNEL_PROFILE}
+    dependencies:
+      - sdk: NetworkExtension.framework
