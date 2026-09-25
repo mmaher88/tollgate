@@ -1396,6 +1396,8 @@ dependencies = [
  "arc-swap",
  "etherparse",
  "hickory-proto",
+ "log",
+ "thiserror 2.0.21",
  "tollgate-common",
  "tollgate-filter",
 ]

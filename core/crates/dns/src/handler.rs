@@ -8,7 +8,8 @@ use hickory_proto::op::{Message, OpCode};
 use tollgate_common::stats::Stats;
 use tollgate_filter::DomainSet;
 
-use crate::answer::{self, FORMERR, NOERROR, NOTIMP, Requester};
+use crate::answer::{self, FORMERR, NOERROR, NOTIMP, Requester, SERVFAIL, UpstreamAnswer};
+use crate::doh::DohError;
 use crate::packet::{build_udp, parse_udp};
 use crate::wire::{self, HEADER_LEN};
 use crate::{TUNNEL_DNS_V4, TUNNEL_DNS_V6};
@@ -21,16 +22,21 @@ const TYPE_HTTPS: u16 = 65;
 pub enum Outcome {
     /// Write this packet back to the tunnel now.
     Reply(Vec<u8>),
-    /// Resolve [`ForwardJob::query`] upstream.
+    /// Resolve [`ForwardJob::query`] upstream, then pass the result to
+    /// [`DnsHandler::complete`].
     Forward(ForwardJob),
     /// Not a DNS query for the tunnel; counted in `packets_dropped`.
     Drop,
 }
 
-/// A query that needs the upstream resolver.
+/// A query that needs the upstream resolver, with what is needed to answer it.
 #[derive(Debug)]
 pub struct ForwardJob {
     query: Vec<u8>,
+    client: SocketAddr,
+    server: SocketAddr,
+    requester: Requester,
+    key: Box<[u8]>,
 }
 
 impl ForwardJob {
@@ -118,9 +124,44 @@ impl DnsHandler {
             Stats::inc(&self.stats.dns_blocked);
             return reply(requester.blocked());
         }
+        let key = wire::question_key(query, question_end);
         Stats::inc(&self.stats.dns_forwarded);
         Outcome::Forward(ForwardJob {
             query: query.to_vec(),
+            client,
+            server,
+            requester,
+            key,
         })
+    }
+
+    /// Builds the reply packet for a forwarded query from the upstream result. A usable
+    /// answer is adapted to the client; an error or an unusable answer becomes SERVFAIL and
+    /// counts in `dns_failed`.
+    pub fn complete(
+        &self,
+        job: ForwardJob,
+        answer: Result<Vec<u8>, DohError>,
+        _now: u64,
+    ) -> Vec<u8> {
+        let ForwardJob {
+            client,
+            server,
+            requester,
+            key,
+            ..
+        } = job;
+        let checked = answer
+            .map_err(|e| e.to_string())
+            .and_then(|wire| UpstreamAnswer::parse(&wire, &key).map_err(str::to_string));
+        let payload = match checked {
+            Ok(upstream) => upstream.render(&requester, 0),
+            Err(reason) => {
+                log::debug!("DNS query failed: {reason}");
+                Stats::inc(&self.stats.dns_failed);
+                requester.empty(SERVFAIL)
+            }
+        };
+        reply_packet(server, client, &payload)
     }
 }

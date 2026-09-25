@@ -7,7 +7,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TransportSlice};
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
-use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::{Name, RData, Record, RecordType};
 use tollgate_dns::{ForwardJob, Outcome};
 
 pub const CLIENT_V4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
@@ -160,4 +161,28 @@ pub fn expect_forward(outcome: Outcome) -> ForwardJob {
         Outcome::Forward(job) => job,
         other => panic!("expected a forward job, got {other:?}"),
     }
+}
+
+/// An upstream answer to `query` built with hickory: same id, the question with its name
+/// lowercased (as some upstreams send it), QR, RD and RA set. `build` adds the rest.
+pub fn upstream_answer(query: &[u8], build: impl FnOnce(&mut Message)) -> Vec<u8> {
+    let request = Message::from_vec(query).unwrap();
+    let mut answer = Message::response(request.metadata.id, OpCode::Query);
+    answer.metadata.recursion_desired = request.metadata.recursion_desired;
+    answer.metadata.recursion_available = true;
+    for q in &request.queries {
+        let mut lowered = Query::query(q.name().to_lowercase(), q.query_type());
+        lowered.set_query_class(q.query_class());
+        answer.add_query(lowered);
+    }
+    build(&mut answer);
+    answer.to_vec().unwrap()
+}
+
+pub fn a_record(name: &str, ttl: u32, ip: [u8; 4]) -> Record {
+    Record::from_rdata(
+        Name::from_ascii(name).unwrap(),
+        ttl,
+        RData::A(A(Ipv4Addr::from(ip))),
+    )
 }
