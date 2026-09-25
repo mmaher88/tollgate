@@ -32,7 +32,7 @@ final class ListUpdater: ObservableObject {
 
     /// Lists older than this are refreshed on launch, on returning to the foreground and by
     /// the background refresh task.
-    static let maxAge: TimeInterval = 24 * 60 * 60
+    nonisolated static let maxAge: TimeInterval = 24 * 60 * 60
 
     init() {
         lastUpdated = UserDefaults.standard.object(forKey: Self.lastUpdatedKey) as? Date
