@@ -4,10 +4,14 @@
 mod bundled;
 mod config;
 mod pattern;
+mod policy;
 
 pub use bundled::bundled_passthrough;
 pub use config::{Config, DohUpstream};
 pub use pattern::HostPattern;
+pub use policy::{
+    Decision, PIN_LIFETIME_SECS, PassthroughReason, Policy, REJECTION_WINDOW_SECS, RejectionKind,
+};
 
 /// Errors from parsing configuration and host patterns.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
