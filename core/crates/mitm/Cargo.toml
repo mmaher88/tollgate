@@ -1,0 +1,27 @@
+[package]
+name = "tollgate-mitm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+tollgate-common = { workspace = true }
+tollgate-filter = { workspace = true }
+tollgate-policy = { workspace = true }
+arc-swap = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+log = { workspace = true }
+lru = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser"] }
+ring = { workspace = true }
+rustls = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+x509-parser = { workspace = true }

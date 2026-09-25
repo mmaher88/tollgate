@@ -5,6 +5,7 @@ members = [
     "crates/policy",
     "crates/filter",
     "crates/dns",
+    "crates/mitm",
     "crates/tollgate-ffi",
     "tools/uniffi-bindgen-swift",
 ]
@@ -22,6 +23,7 @@ tollgate-common = { path = "crates/common" }
 tollgate-policy = { path = "crates/policy" }
 tollgate-filter = { path = "crates/filter" }
 tollgate-dns = { path = "crates/dns" }
+tollgate-mitm = { path = "crates/mitm" }
 
 # FFI. Default features are off so the runtime crate does not build cargo_metadata;
 # tools/uniffi-bindgen-swift turns on the features it needs.
@@ -38,27 +40,34 @@ webpki-roots = "1.0.9"
 adblock = { version = "=0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
 memmap2 = "0.9.11"
 
-# DNS: packet parsing, DNS messages, the answer cache and DNS over HTTPS. tokio-rustls, like
-# rustls, needs default-features = false to keep aws-lc out.
-etherparse = "0.21.0"
-hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
-lru = "0.18.5"
-arc-swap = "1.9.2"
-tokio = { version = "1.53.1", features = ["rt", "net", "time", "sync"] }
-tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "logging", "tls12"] }
-hyper = { version = "1.11.1", features = ["client", "http2"] }
-hyper-util = { version = "0.1.21", features = ["tokio"] }
-http-body-util = "0.1.5"
-bytes = "1.12.1"
-
 libc = "0.2.189"
 log = "0.4.34"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"
 
-# Tests only.
+# DNS: packet parsing, DNS messages, the answer cache and DNS over HTTPS. tokio-rustls, like
+# rustls, needs default-features = false to keep aws-lc out.
+etherparse = "0.21.0"
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+lru = { version = "0.18.5", default-features = false }
+arc-swap = "1.9.2"
+
+# Certificates. rcgen with ring only; tollgate-mitm adds the x509-parser feature so leaves
+# are issued from the stored CA certificate.
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
+x509-parser = "0.18.1"
+time = { version = "0.3.55", default-features = false, features = ["std"] }
+
+# Runtime, HTTP and TLS streams, shared by the DoH resolver and the proxy.
+tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "macros", "time", "sync"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "logging", "tls12"] }
+hyper = { version = "1.11.1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "http1", "http2"] }
+http-body-util = "0.1.5"
+bytes = "1.12.1"
+
+# Tests only.
 tempfile = "3.27.0"
 
 [profile.release]
