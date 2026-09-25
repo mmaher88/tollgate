@@ -1,9 +1,11 @@
 //! `CONNECT`: classify, then tunnel the bytes untouched or intercept TLS.
 //!
-//! The host is classified from the `CONNECT` target; a passthrough host is tunneled
-//! without reading anything. Otherwise the ClientHello is read and kept for replay: low
-//! memory and a full interception table tunnel with it replayed, everything else is
-//! intercepted.
+//! The host is classified from the `CONNECT` target first; a passthrough host is tunneled
+//! without reading anything. Otherwise the first bytes are read and kept for replay.
+//! Non-TLS traffic, and a client that waits for the server to speak first, is tunneled
+//! with those bytes replayed. For TLS the SNI is classified as well; passthrough, TLS
+//! without an HTTP protocol, low memory and a full interception table also tunnel, with
+//! the ClientHello replayed.
 
 use std::sync::Arc;
 
@@ -94,6 +96,26 @@ async fn plan<C>(state: &State, client: &mut C, buffer: &mut Vec<u8>, host: &str
 where
     C: AsyncRead + Unpin,
 {
+    let not_tls = || Plan::Tunnel(format!("{:?}", PassthroughReason::NotTls));
+    let first = tokio::time::timeout(
+        state.options.first_bytes_timeout,
+        hello::read_more(client, buffer),
+    )
+    .await;
+    match first {
+        // A silent client is probably waiting for the server to speak first.
+        Err(_) => return not_tls(),
+        Ok(Ok(0)) => return Plan::Close,
+        Ok(Err(e)) => {
+            log::debug!("CONNECT {host}:{port}: {e}");
+            return Plan::Close;
+        }
+        Ok(Ok(_)) => {}
+    }
+    if !hello::looks_like_tls(buffer) {
+        return not_tls();
+    }
+
     let read = tokio::time::timeout(
         state.options.handshake_timeout,
         hello::read_client_hello(client, buffer),
@@ -104,10 +126,7 @@ where
             log::debug!("no complete ClientHello for {host}:{port} in time");
             return Plan::Close;
         }
-        Ok(Err(HelloError::NotTls)) => {
-            log::debug!("CONNECT {host}:{port} does not start with a ClientHello");
-            return Plan::Close;
-        }
+        Ok(Err(HelloError::NotTls)) => return not_tls(),
         Ok(Err(HelloError::Io(e))) => {
             log::debug!("ClientHello for {host}:{port}: {e}");
             return Plan::Close;
@@ -115,7 +134,18 @@ where
         Ok(Ok(hello)) => hello,
     };
 
-    let name = hello.server_name.unwrap_or_else(|| host.to_string());
+    let name = hello
+        .server_name
+        .clone()
+        .unwrap_or_else(|| host.to_string());
+    if !name.eq_ignore_ascii_case(host)
+        && let Decision::Passthrough(reason) = state.ctx.policy.classify(&name, unix_secs())
+    {
+        return Plan::Tunnel(format!("{reason:?} for {name}"));
+    }
+    if !hello.offers_http() {
+        return not_tls();
+    }
     if (state.ctx.available_memory)().is_some_and(|bytes| bytes < LOW_MEMORY_BYTES) {
         return Plan::Tunnel(format!("{:?}", PassthroughReason::LowMemory));
     }
