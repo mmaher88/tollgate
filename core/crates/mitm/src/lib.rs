@@ -19,6 +19,7 @@ mod request;
 mod rewind;
 mod shutdown;
 mod upstream;
+mod websocket;
 
 pub use ca::{
     CA_VALIDITY_DAYS, CertAuthority, LEAF_CACHE_SIZE, LEAF_REISSUE_SECS, LEAF_VALIDITY_DAYS,

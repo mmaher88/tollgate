@@ -12,6 +12,7 @@ use crate::filtering::is_blocked;
 use crate::idle::InFlight;
 use crate::intercept::Origin;
 use crate::proxy::State;
+use crate::websocket;
 
 pub(crate) async fn handle(
     state: Arc<State>,
@@ -37,15 +38,24 @@ async fn respond(state: &State, origin: &Origin, mut request: Request<Incoming>)
         .path_and_query()
         .map_or("/", |pq| pq.as_str())
         .to_string();
-    let url = format!("https://{}{path_and_query}", origin.authority());
+    let websocket = websocket::is_upgrade(&request);
+    let (scheme, forced_type) = if websocket {
+        ("wss", Some("websocket"))
+    } else {
+        ("https", None)
+    };
+    let url = format!("{scheme}://{}{path_and_query}", origin.authority());
     if is_blocked(
         &state.ctx,
         &url,
         request.uri().path(),
         request.headers(),
-        None,
+        forced_type,
     ) {
         return blocked();
+    }
+    if websocket {
+        return websocket::forward(state, origin.target(), request).await;
     }
     if let Ok(uri) = url.parse::<Uri>() {
         *request.uri_mut() = uri;
