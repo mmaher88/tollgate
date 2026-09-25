@@ -11,7 +11,7 @@ use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{RData, RecordType};
 use support::doh::DohServer;
-use support::{query, reply, sink};
+use support::{query, reply, sink, wait_until};
 use tollgate_ffi::{Engine, EngineOptions, PacketSink, Stats};
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -93,7 +93,9 @@ fn a_full_queue_answers_servfail_at_once() {
         assert_eq!(reply(packet).metadata.response_code, ResponseCode::ServFail);
     }
     // Only forward_in_flight queries reach the server while it holds them; the rest wait
-    // in the queue.
+    // in the queue. The first may take a while on a slow machine (a new TLS connection),
+    // so wait for it before giving the others time to arrive too if they could.
+    wait_until("the first query at the server", || server.requests() >= 1);
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(
         server.requests(),
