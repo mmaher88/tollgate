@@ -1632,12 +1632,17 @@ dependencies = [
 name = "tollgate-ffi"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "hickory-proto",
  "log",
  "ring",
  "tempfile",
  "thiserror 2.0.21",
+ "tollgate-common",
+ "tollgate-dns",
  "tollgate-filter",
  "tollgate-mitm",
+ "tollgate-policy",
  "uniffi",
 ]
 

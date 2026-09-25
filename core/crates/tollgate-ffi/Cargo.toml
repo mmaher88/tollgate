@@ -11,12 +11,17 @@ name = "tollgate_ffi"
 crate-type = ["lib", "staticlib"]
 
 [dependencies]
+arc-swap = { workspace = true }
 log = { workspace = true }
 ring = { workspace = true }
 thiserror = { workspace = true }
+tollgate-common = { workspace = true }
+tollgate-dns = { workspace = true }
 tollgate-filter = { workspace = true }
 tollgate-mitm = { workspace = true }
+tollgate-policy = { workspace = true }
 uniffi = { workspace = true }
 
 [dev-dependencies]
+hickory-proto = { workspace = true }
 tempfile = { workspace = true }

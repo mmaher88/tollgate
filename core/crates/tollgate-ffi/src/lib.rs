@@ -8,6 +8,7 @@
 uniffi::setup_scaffolding!();
 
 mod ca;
+mod engine;
 mod error;
 mod lists;
 mod logging;
@@ -16,6 +17,7 @@ pub use ca::{
     CA_CERT_FILE, CA_COMMON_NAME, CA_KEY_FILE, CaInfo, PROFILE_DISPLAY_NAME, PROFILE_IDENTIFIER,
     ca_mobileconfig, generate_ca, load_ca,
 };
+pub use engine::{Engine, LEARNED_PINS_FILE, Stats};
 pub use error::{TollgateError, catch_panic, panic_message};
 pub use lists::{CompileReport, ListFormat, ListInput, ListTarget, compile_lists};
 pub use logging::{CoreLogger, LogLevel, set_logger};
