@@ -25,6 +25,15 @@ final class ListUpdater: ObservableObject {
         lastUpdated = UserDefaults.standard.object(forKey: Self.lastUpdatedKey) as? Date
     }
 
+    /// Lists older than this are refreshed on launch, on returning to the foreground and by
+    /// the background refresh task.
+    static let maxAge: TimeInterval = 24 * 60 * 60
+
+    var isStale: Bool {
+        guard compiled, let lastUpdated else { return true }
+        return Date().timeIntervalSince(lastUpdated) > Self.maxAge
+    }
+
     var isBusy: Bool {
         switch state {
         case .downloading, .compiling: true
@@ -40,19 +49,34 @@ final class ListUpdater: ObservableObject {
             state = .failed("App Group container unavailable")
             return false
         }
-        let lists = FilterLists.defaults
-        var inputs: [ListInput] = []
-        for (index, list) in lists.enumerated() {
-            state = .downloading(done: index, total: lists.count)
-            do {
-                inputs.append(ListInput(
-                    name: list.name, text: try await Self.download(list.url),
-                    format: list.format, target: list.target))
-            } catch {
-                log.error("download \(list.name, privacy: .public) failed: \(String(describing: error), privacy: .public)")
-                state = .failed("\(list.name): \(error.localizedDescription)")
+        let settings = ListSettings.load()
+        var sources: [(name: String, url: URL, format: ListFormat, target: ListTarget)] =
+            FilterLists.defaults.filter(settings.isEnabled).map { ($0.name, $0.url, $0.format, $0.target) }
+        for list in settings.custom {
+            guard let url = URL(string: list.url), url.scheme == "https" || url.scheme == "http" else {
+                state = .failed("\(list.name): not a valid URL")
                 return false
             }
+            sources.append((list.name, url, list.kind.format, list.kind.target))
+        }
+        var inputs: [ListInput] = []
+        for (index, source) in sources.enumerated() {
+            state = .downloading(done: index, total: sources.count)
+            do {
+                inputs.append(ListInput(
+                    name: source.name, text: try await Self.download(source.url),
+                    format: source.format, target: source.target))
+            } catch {
+                log.error("download \(source.name, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+                state = .failed("\(source.name): \(error.localizedDescription)")
+                return false
+            }
+        }
+        let myRules = settings.myRules.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !myRules.isEmpty {
+            // The user's rules block requests and, for ||domain^ rules, DNS names too.
+            inputs.append(ListInput(name: "My rules", text: myRules, format: .adblock, target: .url))
+            inputs.append(ListInput(name: "My rules (DNS)", text: myRules, format: .adblock, target: .dns))
         }
         state = .compiling
         do {

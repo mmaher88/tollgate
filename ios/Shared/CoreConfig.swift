@@ -5,9 +5,24 @@ import Foundation
 struct CoreConfig: Codable, Equatable {
     /// HTTPS filtering. Stays off until the root certificate is trusted for TLS.
     var mitmEnabled = false
+    /// Host patterns that are never decrypted (`example.com` or `*.example.com`).
+    var passthrough: [String] = []
+    /// Host patterns where nothing is blocked.
+    var allowlist: [String] = []
 
     enum CodingKeys: String, CodingKey {
         case mitmEnabled = "mitm_enabled"
+        case passthrough
+        case allowlist
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        mitmEnabled = try container.decodeIfPresent(Bool.self, forKey: .mitmEnabled) ?? false
+        passthrough = try container.decodeIfPresent([String].self, forKey: .passthrough) ?? []
+        allowlist = try container.decodeIfPresent([String].self, forKey: .allowlist) ?? []
     }
 
     static let fileName = "config.json"

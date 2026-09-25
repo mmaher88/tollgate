@@ -1,0 +1,348 @@
+import SwiftUI
+import UIKit
+
+struct SettingsView: View {
+    @EnvironmentObject private var lists: ListUpdater
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    NavigationLink {
+                        FilterListsView()
+                    } label: {
+                        LabeledContent("Filter lists", value: listsSummary)
+                    }
+                    NavigationLink("My rules") { MyRulesView() }
+                } header: {
+                    Text("Blocking")
+                } footer: {
+                    Text("Lists update automatically about once a day.")
+                }
+
+                Section {
+                    NavigationLink {
+                        HostListEditor(
+                            title: "Allowed sites",
+                            explanation: "Nothing is blocked on these sites or for these domains. Use *.example.com for a site and all its subdomains.",
+                            keyPath: \.allowlist)
+                    } label: {
+                        LabeledContent("Allowed sites", value: "\(CoreConfig.load().allowlist.count)")
+                    }
+                    NavigationLink {
+                        HostListEditor(
+                            title: "Never filtered",
+                            explanation: "HTTPS connections to these hosts are never decrypted. Apple services, banks and apps that pin certificates are already on a built-in list.",
+                            keyPath: \.passthrough)
+                    } label: {
+                        LabeledContent("Never filtered", value: "\(CoreConfig.load().passthrough.count)")
+                    }
+                    NavigationLink("Learned certificate pins") { PinsView() }
+                } header: {
+                    Text("Exceptions")
+                }
+            }
+            .navigationTitle("Settings")
+        }
+    }
+
+    private var listsSummary: String {
+        let settings = ListSettings.load()
+        let count = FilterLists.defaults.filter(settings.isEnabled).count + settings.custom.count
+        return "\(count) enabled"
+    }
+}
+
+// MARK: - Filter lists
+
+struct FilterListsView: View {
+    @EnvironmentObject private var lists: ListUpdater
+    @EnvironmentObject private var tunnel: TunnelController
+    @State private var settings = ListSettings.load()
+    @State private var adding = false
+    @State private var dirty = false
+
+    var body: some View {
+        List {
+            Section("Built-in") {
+                ForEach(FilterLists.defaults) { list in
+                    Toggle(isOn: Binding(
+                        get: { settings.isEnabled(list) },
+                        set: { enabled in
+                            settings.disabledDefaults.removeAll { $0 == list.id }
+                            if !enabled { settings.disabledDefaults.append(list.id) }
+                            save()
+                        }
+                    )) {
+                        VStack(alignment: .leading) {
+                            Text(list.name)
+                            Text(list.target == .dns ? "Domains" : "Requests")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            Section("Added by you") {
+                ForEach(settings.custom) { list in
+                    VStack(alignment: .leading) {
+                        Text(list.name)
+                        Text("\(list.kind.label) · \(list.url)")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+                .onDelete { offsets in
+                    settings.custom.remove(atOffsets: offsets)
+                    save()
+                }
+                Button("Add a list") { adding = true }
+            }
+            Section {
+                Button(dirty ? "Apply changes now" : "Update now") {
+                    Task {
+                        if await lists.update() {
+                            dirty = false
+                            await tunnel.listsUpdated()
+                        }
+                    }
+                }
+                .disabled(lists.isBusy)
+                Text(statusText).font(.footnote).foregroundStyle(.secondary)
+            }
+        }
+        .navigationTitle("Filter lists")
+        .sheet(isPresented: $adding) {
+            AddListView { list in
+                settings.custom.append(list)
+                save()
+            }
+        }
+    }
+
+    private var statusText: String {
+        switch lists.state {
+        case let .downloading(done, total): return "Downloading \(done + 1) of \(total)"
+        case .compiling: return "Compiling"
+        case let .failed(message): return "Update failed: \(message)"
+        case .idle:
+            if dirty { return "Changes apply at the next update." }
+            if let date = lists.lastUpdated {
+                return "Updated \(date.formatted(date: .abbreviated, time: .shortened))"
+            }
+            return "Not downloaded yet"
+        }
+    }
+
+    private func save() {
+        try? settings.save()
+        dirty = true
+    }
+}
+
+struct AddListView: View {
+    let onAdd: (CustomList) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var url = ""
+    @State private var kind: CustomList.Kind = .requestRules
+
+    private var valid: Bool {
+        guard let parsed = URL(string: url.trimmingCharacters(in: .whitespaces)) else { return false }
+        return (parsed.scheme == "https" || parsed.scheme == "http") && parsed.host != nil
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Name", text: $name)
+                TextField("https://example.com/list.txt", text: $url)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Picker("Type", selection: $kind) {
+                    ForEach(CustomList.Kind.allCases) { Text($0.label).tag($0) }
+                }
+                Text("Request rules use adblock syntax and filter requests (HTTPS sites need HTTPS filtering). Domain rules and hosts files block names for every app.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            .navigationTitle("Add a list")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Add") {
+                        let trimmed = url.trimmingCharacters(in: .whitespaces)
+                        let title = name.trimmingCharacters(in: .whitespaces)
+                        onAdd(CustomList(name: title.isEmpty ? (URL(string: trimmed)?.host ?? trimmed) : title,
+                                         url: trimmed, kind: kind))
+                        dismiss()
+                    }
+                    .disabled(!valid)
+                }
+            }
+        }
+    }
+}
+
+struct MyRulesView: View {
+    @EnvironmentObject private var lists: ListUpdater
+    @EnvironmentObject private var tunnel: TunnelController
+    @State private var text = ListSettings.load().myRules
+    @State private var saved = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("One rule per line in adblock syntax, for example ||ads.example.com^ to block a domain or @@||example.com^ to allow one.")
+                .font(.footnote).foregroundStyle(.secondary)
+                .padding(.horizontal)
+            TextEditor(text: $text)
+                .font(.system(.body, design: .monospaced))
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .padding(.horizontal, 12)
+                .onChange(of: text) { _, _ in saved = false }
+        }
+        .navigationTitle("My rules")
+        .toolbar {
+            Button("Save") {
+                var settings = ListSettings.load()
+                settings.myRules = text
+                try? settings.save()
+                saved = true
+                Task {
+                    if await lists.update() { await tunnel.listsUpdated() }
+                }
+            }
+            .disabled(saved || lists.isBusy)
+        }
+    }
+}
+
+// MARK: - Host lists
+
+/// Edits one list of host patterns in config.json, validated by the core's own parser.
+struct HostListEditor: View {
+    let title: String
+    let explanation: String
+    let keyPath: WritableKeyPath<CoreConfig, [String]>
+
+    @EnvironmentObject private var tunnel: TunnelController
+    @State private var patterns: [String] = []
+    @State private var draft = ""
+    @State private var error: String?
+
+    var body: some View {
+        List {
+            Section {
+                HStack {
+                    TextField("*.example.com", text: $draft)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                        .onSubmit(add)
+                    Button("Add", action: add).disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                if let error {
+                    Text(error).font(.footnote).foregroundStyle(.red)
+                }
+            } footer: {
+                Text(explanation)
+            }
+            Section {
+                ForEach(patterns, id: \.self) { Text($0) }
+                    .onDelete { offsets in
+                        patterns.remove(atOffsets: offsets)
+                        save()
+                    }
+            }
+        }
+        .navigationTitle(title)
+        .onAppear { patterns = CoreConfig.load()[keyPath: keyPath] }
+    }
+
+    private func add() {
+        let pattern = draft.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !pattern.isEmpty else { return }
+        do {
+            try validateHostPattern(pattern: pattern)
+        } catch {
+            self.error = "Not a valid host pattern"
+            return
+        }
+        error = nil
+        draft = ""
+        guard !patterns.contains(pattern) else { return }
+        patterns.append(pattern)
+        save()
+    }
+
+    private func save() {
+        var config = CoreConfig.load()
+        config[keyPath: keyPath] = patterns
+        do {
+            try config.save()
+            Task { await tunnel.restartIfRunning() }
+        } catch {
+            self.error = "Could not save: \(error.localizedDescription)"
+        }
+    }
+}
+
+// MARK: - Learned pins
+
+struct PinsView: View {
+    @EnvironmentObject private var tunnel: TunnelController
+    @State private var pins: [PinEntry] = []
+    @State private var error: String?
+
+    var body: some View {
+        List {
+            Section {
+                if pins.isEmpty {
+                    Text("None yet").foregroundStyle(.secondary)
+                }
+                ForEach(pins) { pin in
+                    LabeledContent(pin.host, value: pin.date.formatted(date: .abbreviated, time: .omitted))
+                }
+                .onDelete { offsets in
+                    forget(offsets.map { pins[$0].host })
+                }
+            } footer: {
+                Text("Apps that reject the Tollgate certificate are passed through automatically for 30 days. Forget a host to filter it again.")
+            }
+            if !pins.isEmpty {
+                Button("Forget all", role: .destructive) { forget(pins.map(\.host)) }
+            }
+            if let error {
+                Text(error).font(.footnote).foregroundStyle(.red)
+            }
+        }
+        .navigationTitle("Learned pins")
+        .task { await reload() }
+        .refreshable { await reload() }
+    }
+
+    private func reload() async {
+        if let running = await tunnel.pins() {
+            pins = running
+            return
+        }
+        guard let directory = AppGroup.coreDirectory else { return }
+        do {
+            pins = try storedLearnedPins(dataDir: directory.path).map { PinEntry(host: $0.host, learnedAt: $0.learnedAt) }
+        } catch {
+            self.error = "Could not read pins: \(error.localizedDescription)"
+        }
+    }
+
+    private func forget(_ hosts: [String]) {
+        Task {
+            if !(await tunnel.forgetPins(hosts)), let directory = AppGroup.coreDirectory {
+                do {
+                    _ = try forgetStoredPins(dataDir: directory.path, hosts: hosts)
+                } catch {
+                    self.error = "Could not update pins: \(error.localizedDescription)"
+                }
+            }
+            await reload()
+        }
+    }
+}

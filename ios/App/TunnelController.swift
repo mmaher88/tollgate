@@ -173,11 +173,35 @@ final class TunnelController: ObservableObject {
         }
     }
 
-    private func send(_ command: TunnelCommand) async -> Data? {
+    /// Recent blocks, newest first; nil when the tunnel is not running.
+    func events() async -> [TunnelEvent]? {
+        guard status == .connected, let data = await send(.events) else { return nil }
+        return try? JSONDecoder().decode([TunnelEvent].self, from: data)
+    }
+
+    func clearEvents() async {
+        guard status == .connected else { return }
+        _ = await send(.clearEvents)
+    }
+
+    /// Learned pins from the running engine; nil when the tunnel is not running.
+    func pins() async -> [PinEntry]? {
+        guard status == .connected, let data = await send(.pins) else { return nil }
+        return try? JSONDecoder().decode([PinEntry].self, from: data)
+    }
+
+    /// Returns false when the tunnel is not running (the caller then edits the stored file).
+    func forgetPins(_ hosts: [String]) async -> Bool {
+        guard status == .connected, let payload = try? JSONEncoder().encode(hosts) else { return false }
+        return await send(.forgetPins, payload: payload) != nil
+    }
+
+    private func send(_ command: TunnelCommand, payload: Data? = nil) async -> Data? {
         guard let session = manager?.connection as? NETunnelProviderSession else { return nil }
+        let message = TunnelMessage.encode(command, payload: payload)
         return await withCheckedContinuation { continuation in
             do {
-                try session.sendProviderMessage(Data(command.rawValue.utf8)) { reply in
+                try session.sendProviderMessage(message) { reply in
                     continuation.resume(returning: reply)
                 }
             } catch {

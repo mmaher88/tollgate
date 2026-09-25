@@ -48,8 +48,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
-        let text = String(decoding: messageData, as: UTF8.self)
-        switch TunnelCommand(rawValue: text) {
+        let message = TunnelMessage(messageData)
+        switch message.command {
         case .ping:
             completionHandler?(Data("pong \(coreVersion())".utf8))
         case .stats:
@@ -63,11 +63,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 log.error("reload failed: \(String(describing: error), privacy: .public)")
                 completionHandler?(Data(String(describing: error).utf8))
             }
+        case .events:
+            let events = (engine?.recentEvents(limit: 500) ?? []).map { TunnelEvent($0) }
+            completionHandler?(try? JSONEncoder().encode(events))
+        case .clearEvents:
+            engine?.clearEvents()
+            completionHandler?(Data("ok".utf8))
+        case .pins:
+            let pins = (engine?.learnedPins() ?? []).map { PinEntry(host: $0.host, learnedAt: $0.learnedAt) }
+            completionHandler?(try? JSONEncoder().encode(pins))
+        case .forgetPins:
+            let hosts = (try? JSONDecoder().decode([String].self, from: message.payload)) ?? []
+            let forgotten = engine?.forgetPins(hosts: hosts) ?? 0
+            log.info("forgot \(forgotten, privacy: .public) learned pins")
+            completionHandler?(Data(String(forgotten).utf8))
         case .probeMemory:
             completionHandler?(Data("probing, watch the logs".utf8))
             probeMemory()
         case nil:
-            log.error("unknown app message: \(text, privacy: .public)")
+            log.error("unknown app message")
             completionHandler?(nil)
         }
     }
@@ -236,6 +250,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             log.info("probe finished without termination, held=\(held.count, privacy: .public)")
         }
+    }
+}
+
+extension TunnelEvent {
+    init(_ event: BlockEvent) {
+        self.init(
+            unixSecs: event.unixSecs,
+            kind: event.kind == .dns ? .dns : .request,
+            host: event.host, url: event.url, sourceHost: event.sourceHost)
     }
 }
 

@@ -36,6 +36,10 @@ targets:
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
+        UIBackgroundModes:
+          - fetch
+        BGTaskSchedulerPermittedIdentifiers:
+          - dev.tollgate.lists-refresh
         TollgateAppGroup: ${TOLLGATE_APP_GROUP}
     entitlements:
       path: App/Tollgate.entitlements

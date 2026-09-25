@@ -83,11 +83,10 @@ struct ContentView: View {
         }
     }
 
-    /// Downloads the lists when none are compiled yet (offline at first launch, or a failed
-    /// first attempt), then hands them to the tunnel.
+    /// Downloads the lists when they are missing (offline at first launch, a failed first
+    /// attempt) or more than a day old, then hands them to the tunnel.
     private func updateListsIfMissing() async {
-        guard !lists.compiled, !lists.isBusy else { return }
-        if await lists.update() { await tunnel.listsUpdated() }
+        await AppModel.shared.refreshListsIfNeeded()
     }
 
     /// HTTPS filtering with an untrusted root breaks every intercepted site, so it is turned
