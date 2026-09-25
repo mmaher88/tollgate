@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use devproxy::args::{self, Command, USAGE};
-use devproxy::server::{DevProxy, instructions};
+use devproxy::server::{DevProxy, format_events, instructions};
 
 fn main() -> ExitCode {
     let args = match args::parse(std::env::args().skip(1)) {
@@ -39,12 +39,13 @@ fn main() -> ExitCode {
             "{}",
             instructions(proxy.proxy_addr(), proxy.dns_addr(), &proxy.ca_path())
         );
-        let stats = proxy
+        let summary = proxy
             .serve(async {
                 let _ = tokio::signal::ctrl_c().await;
             })
             .await;
-        println!("{stats:#?}");
+        println!("{:#?}", summary.stats);
+        print!("{}", format_events(&summary.events));
         ExitCode::SUCCESS
     })
 }

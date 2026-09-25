@@ -7,11 +7,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use devproxy::args::{Args, ListKind, ListSpec};
-use devproxy::server::{DevProxy, instructions};
+use devproxy::server::{DevProxy, EVENTS_ON_EXIT, format_events, instructions};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, RecordType};
 use tokio::runtime::Runtime;
+use tollgate_common::events::{BlockEvent, EventKind};
 
 fn query(id: u16, name: &str, rtype: RecordType) -> Vec<u8> {
     let mut message = Message::new(id, MessageType::Query, OpCode::Query);
@@ -99,7 +100,7 @@ fn compiles_serves_dns_and_filters_http() {
     let mut stream = TcpStream::connect(http).unwrap();
     stream
         .write_all(
-            b"GET http://blocked.example/ad.js HTTP/1.1\r\nHost: blocked.example\r\nConnection: close\r\n\r\n",
+            b"GET http://blocked.example/ad.js HTTP/1.1\r\nHost: blocked.example\r\nReferer: https://news.test/\r\nConnection: close\r\n\r\n",
         )
         .unwrap();
     let mut response = String::new();
@@ -107,9 +108,35 @@ fn compiles_serves_dns_and_filters_http() {
     assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
 
     stop.send(()).unwrap();
-    let stats = server.join().unwrap();
+    let summary = server.join().unwrap();
+    let stats = summary.stats;
     assert_eq!((stats.dns_queries, stats.dns_blocked), (1, 1));
     assert_eq!((stats.http_requests, stats.http_blocked), (1, 1));
+    // The proxy and the DNS responder share one blocked log.
+    let events: Vec<_> = summary
+        .events
+        .iter()
+        .map(|e| {
+            (
+                e.kind,
+                e.host.as_str(),
+                e.url.as_deref(),
+                e.source_host.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        events,
+        [
+            (
+                EventKind::Request,
+                "blocked.example",
+                Some("http://blocked.example/ad.js"),
+                Some("news.test")
+            ),
+            (EventKind::Dns, "ads.example", None, None),
+        ]
+    );
     assert_eq!(
         std::fs::read_to_string(data.join("learned-pins.json")).unwrap(),
         r#"{"version":1,"pins":[]}"#
@@ -208,4 +235,110 @@ fn instructions_name_the_addresses_and_firefox_settings() {
     ] {
         assert!(text.contains(expected), "missing {expected:?} in\n{text}");
     }
+}
+
+#[test]
+fn the_exit_summary_keeps_the_last_20_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hosts = tmp.path().join("hosts");
+    let names: Vec<String> = (0..25).map(|i| format!("ads{i}.example")).collect();
+    let text: String = names.iter().map(|n| format!("0.0.0.0 {n}\n")).collect();
+    std::fs::write(&hosts, text).unwrap();
+    let args = args(tmp.path(), vec![list(ListKind::Hosts, &hosts)]);
+    let runtime = runtime();
+    let proxy = runtime.block_on(DevProxy::prepare(&args)).unwrap();
+    let dns = proxy.dns_addr();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = std::thread::spawn(move || {
+        runtime.block_on(proxy.serve(async {
+            let _ = stopped.await;
+        }))
+    });
+    for (i, name) in names.iter().enumerate() {
+        ask(dns, &query(i as u16, &format!("{name}."), RecordType::A));
+    }
+    stop.send(()).unwrap();
+    let summary = server.join().unwrap();
+
+    assert_eq!(EVENTS_ON_EXIT, 20);
+    assert_eq!(summary.stats.dns_blocked, 25);
+    let hosts: Vec<&str> = summary.events.iter().map(|e| e.host.as_str()).collect();
+    let expected: Vec<&str> = names.iter().rev().take(20).map(String::as_str).collect();
+    assert_eq!(hosts, expected);
+}
+
+#[test]
+fn the_config_allowlist_applies_to_dns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hosts = tmp.path().join("hosts");
+    std::fs::write(&hosts, "0.0.0.0 ads.example\n0.0.0.0 tracker.example\n").unwrap();
+    // Nothing listens on the upstream port, so a forwarded query gets SERVFAIL.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let config = tmp.path().join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"allowlist":["ads.example"],"doh_upstreams":[{{"ip":"127.0.0.1","port":{port},"tls_name":"doh.test"}}]}}"#
+        ),
+    )
+    .unwrap();
+    let mut args = args(tmp.path(), vec![list(ListKind::Hosts, &hosts)]);
+    args.config = Some(config);
+    let runtime = runtime();
+    let proxy = runtime.block_on(DevProxy::prepare(&args)).unwrap();
+    let dns = proxy.dns_addr();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = std::thread::spawn(move || {
+        runtime.block_on(proxy.serve(async {
+            let _ = stopped.await;
+        }))
+    });
+    let allowed = ask(dns, &query(1, "ads.example.", RecordType::A));
+    assert_eq!(allowed.metadata.response_code, ResponseCode::ServFail);
+    let blocked = ask(dns, &query(2, "tracker.example.", RecordType::A));
+    assert_eq!(blocked.answers[0].data, RData::A(A(Ipv4Addr::UNSPECIFIED)));
+    stop.send(()).unwrap();
+    let summary = server.join().unwrap();
+    assert_eq!(summary.stats.dns_blocked, 1);
+    let hosts: Vec<&str> = summary.events.iter().map(|e| e.host.as_str()).collect();
+    assert_eq!(hosts, ["tracker.example"]);
+}
+
+#[test]
+fn events_are_printed_one_per_line() {
+    assert_eq!(format_events(&[]), "No blocks recorded.\n");
+    let events = [
+        BlockEvent {
+            unix_secs: 1_790_000_001,
+            kind: EventKind::Request,
+            host: "ads.example".into(),
+            url: Some("https://ads.example/a.js".into()),
+            source_host: Some("news.test".into()),
+        },
+        BlockEvent {
+            unix_secs: 1_790_000_000,
+            kind: EventKind::Request,
+            host: "ads.example".into(),
+            url: Some("https://ads.example/b.js".into()),
+            source_host: None,
+        },
+        BlockEvent {
+            unix_secs: 1_789_999_999,
+            kind: EventKind::Dns,
+            host: "tracker.example".into(),
+            url: None,
+            source_host: None,
+        },
+    ];
+    assert_eq!(
+        format_events(&events),
+        "\
+Last 3 blocks, newest first:
+  1790000001  request  https://ads.example/a.js  (page news.test)
+  1790000000  request  https://ads.example/b.js
+  1789999999  dns      tracker.example
+"
+    );
 }

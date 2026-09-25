@@ -1,5 +1,6 @@
 //! Preparing the data directory and running the DNS responder and the proxy.
 
+use std::fmt::Write as _;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -9,6 +10,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, UdpSocket};
+use tollgate_common::events::{BlockEvent, EventKind, EventLog};
 use tollgate_common::stats::{Stats, StatsSnapshot};
 use tollgate_dns::{DnsHandler, DohResolver};
 use tollgate_ffi::{
@@ -17,11 +19,22 @@ use tollgate_ffi::{
 };
 use tollgate_filter::{DOMAINS_FILE, DomainSet, ENGINE_FILE, FilterEngine, FilterError};
 use tollgate_mitm::ProxyContext;
-use tollgate_policy::{Config, Policy};
+use tollgate_policy::{Config, HostPattern, Policy};
 
 use crate::args::{Args, ListKind};
 use crate::fetch::{Fetcher, load_source};
 use crate::udp::{PayloadHandler, serve_dns};
+
+/// Blocks printed when devproxy exits.
+pub const EVENTS_ON_EXIT: usize = 20;
+
+/// What [`DevProxy::serve`] returns: the final counters and the last blocks.
+#[derive(Debug)]
+pub struct Summary {
+    pub stats: StatsSnapshot,
+    /// At most [`EVENTS_ON_EXIT`] blocks, newest first.
+    pub events: Vec<BlockEvent>,
+}
 
 /// Everything bound and loaded, ready to serve.
 pub struct DevProxy {
@@ -128,7 +141,15 @@ impl DevProxy {
         };
         let pins = std::fs::read_to_string(dir.join(LEARNED_PINS_FILE)).ok();
         let policy = Policy::new(&policy_config, pins.as_deref()).map_err(|e| e.to_string())?;
+        let allowlist = config
+            .allowlist
+            .iter()
+            .map(|p| HostPattern::parse(p))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         let stats = Arc::new(Stats::default());
+        // One blocked log for the proxy and the DNS responder, like the tunnel.
+        let events = Arc::new(EventLog::new());
         let ctx = Arc::new(ProxyContext {
             policy: Arc::new(policy),
             filter: ArcSwapOption::new(filter.map(Arc::new)),
@@ -136,9 +157,11 @@ impl DevProxy {
             stats: stats.clone(),
             max_intercepted: config.max_intercepted_connections as usize,
             available_memory: || None,
-            events: None,
+            events: Some(events.clone()),
         });
         let dns = Arc::new(DnsHandler::new(domains.map(Arc::new), stats));
+        dns.set_allowlist(allowlist);
+        dns.set_events(Some(events));
         let dns_socket = bind_udp(args.dns).map_err(text(format!("DNS listener {}", args.dns)))?;
         let proxy_listener = TcpListener::bind(args.proxy)
             .await
@@ -166,8 +189,8 @@ impl DevProxy {
     }
 
     /// Serves until `shutdown` resolves, then saves the learned pins and returns the
-    /// final counters. Must run on a current-thread runtime.
-    pub async fn serve(self, shutdown: impl Future<Output = ()>) -> StatsSnapshot {
+    /// final counters and the last blocks. Must run on a current-thread runtime.
+    pub async fn serve(self, shutdown: impl Future<Output = ()>) -> Summary {
         let DevProxy {
             data_dir,
             dns_socket,
@@ -183,8 +206,37 @@ impl DevProxy {
         if let Err(e) = std::fs::write(&pins, ctx.policy.learned_pins_json()) {
             log::warn!("{}: {e}", pins.display());
         }
-        ctx.stats.snapshot()
+        Summary {
+            stats: ctx.stats.snapshot(),
+            events: ctx
+                .events
+                .as_ref()
+                .map(|events| events.recent(EVENTS_ON_EXIT))
+                .unwrap_or_default(),
+        }
     }
+}
+
+/// The blocks as printed on exit: time, kind, then the URL for requests (with the page
+/// host when known) or the name for DNS, one per line.
+pub fn format_events(events: &[BlockEvent]) -> String {
+    if events.is_empty() {
+        return "No blocks recorded.\n".to_string();
+    }
+    let mut out = format!("Last {} blocks, newest first:\n", events.len());
+    for event in events {
+        let kind = match event.kind {
+            EventKind::Dns => "dns",
+            EventKind::Request => "request",
+        };
+        let what = event.url.as_deref().unwrap_or(&event.host);
+        let _ = write!(out, "  {}  {kind:<7}  {what}", event.unix_secs);
+        if let Some(page) = &event.source_host {
+            let _ = write!(out, "  (page {page})");
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// What to do in Firefox, printed once everything listens.
