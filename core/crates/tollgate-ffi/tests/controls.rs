@@ -360,3 +360,17 @@ fn concurrent_forget_stored_pins_lose_no_removal() {
         );
     }
 }
+
+#[test]
+fn forget_stored_pins_leaves_the_file_alone_when_nothing_is_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(LEARNED_PINS_FILE);
+    // An unreadable file holds no pins; it is not replaced by an empty list.
+    std::fs::write(&file, "not json").unwrap();
+    assert_eq!(forget_stored_pins(path(&dir), hosts(&["a.example"])), Ok(0));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "not json");
+    // Nor is a file whose pins are all kept rewritten.
+    std::fs::write(&file, PINS).unwrap();
+    assert_eq!(forget_stored_pins(path(&dir), hosts(&["x.example"])), Ok(0));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), PINS);
+}
