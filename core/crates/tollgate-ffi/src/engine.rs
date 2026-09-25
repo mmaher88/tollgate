@@ -2,22 +2,45 @@
 //! forwarder on one runtime thread.
 
 use std::io::ErrorKind;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
+use tokio::net::TcpListener;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tollgate_common::clock;
 use tollgate_common::stats::{Stats as Counters, StatsSnapshot};
-use tollgate_dns::{DnsHandler, DohError, Outcome};
+use tollgate_dns::{DnsHandler, DohError, DohResolver, ForwardJob, Outcome};
 use tollgate_filter::{DOMAINS_FILE, DomainSet, ENGINE_FILE, FilterEngine, FilterError};
 use tollgate_mitm::{CertAuthority, ProxyContext};
 use tollgate_policy::{Config, Policy};
 
-use crate::ca::load_ca;
-use crate::error::{TollgateError, catch_panic};
+use crate::ca::{load_ca, write_private};
+use crate::error::{TollgateError, catch_panic, panic_message};
 
-/// Learned certificate pins, read by `Engine::new`.
+/// Name of the thread that runs the proxy and the DNS forwarder.
+pub const RUNTIME_THREAD: &str = "tollgate-core";
+/// Learned certificate pins, read by `Engine::new` and written by `Engine::stop`.
 pub const LEARNED_PINS_FILE: &str = "learned-pins.json";
+/// Forwarded queries waiting for the runtime; when full, new ones get SERVFAIL at once.
+pub const FORWARD_QUEUE: usize = 256;
+/// Threads tokio may start for blocking work (the proxy's `getaddrinfo` calls).
+const MAX_BLOCKING_THREADS: usize = 4;
+/// How long `stop` waits for blocking work such as a hung `getaddrinfo`.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Implemented in Swift over `NEPacketTunnelFlow.writePackets`. Called on the runtime
+/// thread with the answers to forwarded DNS queries, so it must only hand the packets off.
+#[uniffi::export(foreign)]
+pub trait PacketSink: Send + Sync {
+    fn write_packets(&self, packets: Vec<Vec<u8>>);
+}
 
 /// Counters since the engine was created. Mirrors `tollgate_common::stats::StatsSnapshot`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Record)]
@@ -55,14 +78,33 @@ impl From<StatsSnapshot> for Stats {
     }
 }
 
+struct Running {
+    port: u16,
+    jobs: mpsc::Sender<ForwardJob>,
+    shutdown: oneshot::Sender<()>,
+    thread: JoinHandle<()>,
+}
+
+/// What the runtime thread needs.
+struct Work {
+    proxy: Arc<ProxyContext>,
+    dns: Arc<DnsHandler>,
+    resolver: DohResolver,
+    sink: Arc<dyn PacketSink>,
+    queue: mpsc::Receiver<ForwardJob>,
+    in_flight: usize,
+}
+
 /// The tunnel's Rust side: DNS answers, the DNS forwarder and the HTTPS proxy.
 #[derive(uniffi::Object)]
 pub struct Engine {
     data_dir: PathBuf,
+    config: Config,
     mitm_active: bool,
     stats: Arc<Counters>,
     dns: Arc<DnsHandler>,
     proxy: Arc<ProxyContext>,
+    running: Mutex<Option<Running>>,
 }
 
 #[uniffi::export]
@@ -76,9 +118,25 @@ impl Engine {
         catch_panic(|| Engine::open(&config_json, Path::new(&data_dir)))
     }
 
+    /// Starts the runtime thread with the proxy on `127.0.0.1` and returns the proxy's port
+    /// once it is listening. Answers to forwarded DNS queries go to `sink`.
+    pub fn start(&self, sink: Arc<dyn PacketSink>) -> Result<u16, TollgateError> {
+        catch_panic(|| self.start_runtime(sink))
+    }
+
+    /// Stops the proxy and the forwarder, joins the runtime thread and saves the learned
+    /// pins. Does nothing when not running. Queries still queued are dropped.
+    pub fn stop(&self) {
+        let _ = catch_panic(|| {
+            self.stop_runtime();
+            Ok(())
+        });
+    }
+
     /// Handles raw IP packets from the tunnel without waiting on the network. Returns the
-    /// replies it can give at once: blocked names, HTTPS and SVCB queries, cache hits and
-    /// errors. Until the engine has a runtime, queries that need the upstream get SERVFAIL.
+    /// replies it can give at once (blocked names, HTTPS and SVCB queries, cache hits,
+    /// errors, and SERVFAIL when stopped or when the queue is full); the answers to
+    /// forwarded queries arrive later through the `PacketSink`.
     pub fn handle_packets(&self, packets: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, TollgateError> {
         catch_panic(|| Ok(self.answer(&packets)))
     }
@@ -117,6 +175,11 @@ impl Engine {
     /// `engine.dat` were all present when the engine was created.
     pub fn mitm_active(&self) -> bool {
         self.mitm_active
+    }
+
+    /// The proxy port while running.
+    pub fn port(&self) -> Option<u16> {
+        catch_panic(|| Ok(self.running().as_ref().map(|r| r.port))).unwrap_or_default()
     }
 }
 
@@ -177,14 +240,22 @@ impl Engine {
         let dns = Arc::new(DnsHandler::new(domains, stats.clone()));
         Ok(Arc::new(Engine {
             data_dir: data_dir.to_path_buf(),
+            config,
             mitm_active,
             stats,
             dns,
             proxy,
+            running: Mutex::new(None),
         }))
     }
 
+    fn running(&self) -> MutexGuard<'_, Option<Running>> {
+        self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn answer(&self, packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        // Clone the sender and release the lock at once, so stop() never waits on us.
+        let jobs = self.running().as_ref().map(|r| r.jobs.clone());
         let now = clock::now_secs();
         let mut replies = Vec::new();
         for packet in packets {
@@ -192,11 +263,102 @@ impl Engine {
                 Outcome::Reply(reply) => replies.push(reply),
                 Outcome::Drop => {}
                 Outcome::Forward(job) => {
-                    replies.push(self.dns.complete(job, Err(DohError::Stopped), now));
+                    let failed = match &jobs {
+                        None => Some((job, DohError::Stopped)),
+                        Some(jobs) => match jobs.try_send(job) {
+                            Ok(()) => None,
+                            Err(TrySendError::Full(job)) => Some((job, DohError::Busy)),
+                            Err(TrySendError::Closed(job)) => Some((job, DohError::Stopped)),
+                        },
+                    };
+                    if let Some((job, error)) = failed {
+                        replies.push(self.dns.complete(job, Err(error), now));
+                    }
                 }
             }
         }
         replies
+    }
+
+    fn start_runtime(&self, sink: Arc<dyn PacketSink>) -> Result<u16, TollgateError> {
+        let mut running = self.running();
+        if running.is_some() {
+            return Err(TollgateError::AlreadyRunning);
+        }
+        let (jobs, queue) = mpsc::channel(FORWARD_QUEUE);
+        let work = Work {
+            proxy: self.proxy.clone(),
+            dns: self.dns.clone(),
+            resolver: DohResolver::new(self.config.doh_upstreams.clone()),
+            sink,
+            queue,
+            in_flight: tollgate_dns::MAX_IN_FLIGHT,
+        };
+        let (shutdown, stopped) = oneshot::channel();
+        let (ready_tx, ready) = std::sync::mpsc::sync_channel(1);
+        let thread = thread::Builder::new()
+            .name(RUNTIME_THREAD.to_string())
+            .spawn(move || run(work, stopped, ready_tx))
+            .map_err(TollgateError::io)?;
+        match ready.recv() {
+            Ok(Ok(port)) => {
+                log::info!("proxy listening on 127.0.0.1:{port}");
+                *running = Some(Running {
+                    port,
+                    jobs,
+                    shutdown,
+                    thread,
+                });
+                Ok(port)
+            }
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err(TollgateError::Internal {
+                    message: "the runtime thread ended while starting".to_string(),
+                })
+            }
+        }
+    }
+
+    fn stop_runtime(&self) {
+        let Some(running) = self.running().take() else {
+            return;
+        };
+        let Running {
+            port,
+            jobs,
+            shutdown,
+            thread,
+        } = running;
+        let _ = shutdown.send(());
+        drop(jobs);
+        if thread.thread().id() == thread::current().id() {
+            // Called from a callback on the runtime thread (for example the last Engine
+            // reference dropped inside PacketSink.write_packets). Joining would deadlock;
+            // the thread ends by itself once the callback returns.
+            log::warn!("stop() ran on the runtime thread; not joining it");
+        } else if thread.join().is_err() {
+            log::error!("the runtime thread panicked");
+        }
+        self.save_pins();
+        log::info!("engine stopped, proxy port {port} closed");
+    }
+
+    fn save_pins(&self) {
+        let path = self.data_dir.join(LEARNED_PINS_FILE);
+        if let Err(e) = write_private(&path, &self.proxy.policy.learned_pins_json()) {
+            log::warn!("could not save learned pins: {e}");
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -248,4 +410,138 @@ fn available_memory() -> Option<u64> {
 #[cfg(not(target_os = "ios"))]
 fn available_memory() -> Option<u64> {
     None
+}
+
+/// Body of the runtime thread. Reports the port (or why there is none) through `ready`.
+fn run(work: Work, stopped: oneshot::Receiver<()>, ready: SyncSender<Result<u16, TollgateError>>) {
+    let outcome = catch_unwind(AssertUnwindSafe(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(MAX_BLOCKING_THREADS)
+            .thread_name("tollgate-blocking")
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                let _ = ready.send(Err(TollgateError::io(e)));
+                return;
+            }
+        };
+        runtime.block_on(serve(work, stopped, ready));
+        runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+    }));
+    if let Err(payload) = outcome {
+        log::error!(
+            "the runtime thread panicked: {}",
+            panic_message(payload.as_ref())
+        );
+    }
+}
+
+async fn serve(
+    work: Work,
+    stopped: oneshot::Receiver<()>,
+    ready: SyncSender<Result<u16, TollgateError>>,
+) {
+    // A SocketAddr, not a host name, so binding never resolves anything.
+    let listener = match TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            let _ = ready.send(Err(TollgateError::io(e)));
+            return;
+        }
+    };
+    let port = match listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(e) => {
+            let _ = ready.send(Err(TollgateError::io(e)));
+            return;
+        }
+    };
+    let _ = ready.send(Ok(port));
+    let Work {
+        proxy,
+        dns,
+        resolver,
+        sink,
+        queue,
+        in_flight,
+    } = work;
+    let forwarding = tokio::spawn(forward(queue, resolver, dns, sink, in_flight));
+    tollgate_mitm::serve(listener, proxy, async move {
+        let _ = stopped.await;
+    })
+    .await;
+    forwarding.abort();
+}
+
+/// Resolves queued queries, at most `in_flight` at once, one task each.
+async fn forward(
+    mut queue: mpsc::Receiver<ForwardJob>,
+    resolver: DohResolver,
+    dns: Arc<DnsHandler>,
+    sink: Arc<dyn PacketSink>,
+    in_flight: usize,
+) {
+    let permits = Arc::new(Semaphore::new(in_flight));
+    loop {
+        // Take the permit first, so a job waits in the queue, where it counts against the
+        // queue's capacity, not in this loop.
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            return;
+        };
+        let Some(job) = queue.recv().await else {
+            return;
+        };
+        let (resolver, dns, sink) = (resolver.clone(), dns.clone(), sink.clone());
+        tokio::spawn(async move {
+            let answer = resolver.resolve(job.query()).await;
+            let packet = dns.complete(job, answer, clock::now_secs());
+            drop(permit);
+            deliver(sink.as_ref(), vec![packet]);
+        });
+    }
+}
+
+fn deliver(sink: &dyn PacketSink, packets: Vec<Vec<u8>>) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| sink.write_packets(packets))) {
+        log::error!(
+            "PacketSink.write_packets panicked: {}",
+            panic_message(payload.as_ref())
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NullSink;
+
+    impl PacketSink for NullSink {
+        fn write_packets(&self, _packets: Vec<Vec<u8>>) {}
+    }
+
+    #[test]
+    fn a_poisoned_running_lock_is_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let engine = Engine::new("{}".to_string(), path).unwrap();
+        let poisoner = engine.clone();
+        let _ = thread::spawn(move || {
+            let _guard = poisoner.running.lock().unwrap();
+            panic!("poisoning the lock on purpose");
+        })
+        .join();
+        assert!(engine.running.is_poisoned());
+
+        assert_eq!(
+            engine.handle_packets(Vec::new()).unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+        let port = engine.start(Arc::new(NullSink)).unwrap();
+        assert_eq!(engine.port(), Some(port));
+        engine.stop();
+        assert_eq!(engine.port(), None);
+    }
 }

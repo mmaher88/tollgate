@@ -2,12 +2,15 @@
 #![allow(dead_code)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RecordType};
 use tempfile::TempDir;
 use tollgate_dns::packet::{build_udp, parse_udp};
-use tollgate_ffi::{ListFormat, ListInput, ListTarget, compile_lists};
+use tollgate_ffi::{ListFormat, ListInput, ListTarget, PacketSink, compile_lists};
 
 /// The address the phone's DNS queries come from.
 pub fn client() -> SocketAddr {
@@ -64,4 +67,39 @@ pub fn compile_into(dir: &TempDir, url_rules: &str, dns_rules: &str) {
 
 pub fn path(dir: &TempDir) -> String {
     dir.path().to_str().unwrap().to_string()
+}
+
+/// A config whose only DoH upstream is a local port where nothing listens, so forwarded
+/// queries fail at once.
+pub fn closed_upstream_config() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    format!(r#"{{"doh_upstreams":[{{"ip":"127.0.0.1","port":{port},"tls_name":"doh.test"}}]}}"#)
+}
+
+/// A PacketSink that sends every packet into a channel.
+pub struct ChannelSink(Mutex<Sender<Vec<u8>>>);
+
+impl PacketSink for ChannelSink {
+    fn write_packets(&self, packets: Vec<Vec<u8>>) {
+        let sender = self.0.lock().unwrap();
+        for packet in packets {
+            let _ = sender.send(packet);
+        }
+    }
+}
+
+pub fn sink() -> (Arc<ChannelSink>, Receiver<Vec<u8>>) {
+    let (tx, rx) = channel();
+    (Arc::new(ChannelSink(Mutex::new(tx))), rx)
+}
+
+/// Polls `condition` every millisecond for up to five seconds.
+pub fn wait_until(what: &str, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }

@@ -1638,6 +1638,7 @@ dependencies = [
  "ring",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "tollgate-common",
  "tollgate-dns",
  "tollgate-filter",
