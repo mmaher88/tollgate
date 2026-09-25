@@ -25,3 +25,6 @@ time = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 x509-parser = { workspace = true }
+
+[dev-dependencies]
+futures-core = { workspace = true }

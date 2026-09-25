@@ -1,17 +1,22 @@
 //! Local origin servers. Nothing here touches the network beyond 127.0.0.1.
 
 use std::convert::Infallible;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::Full;
-use hyper::body::Incoming;
+use futures_core::Stream;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::header::HOST;
 use hyper::service::service_fn;
-use hyper::{Request, Response};
+use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -24,6 +29,8 @@ pub struct Counters {
     pub live: AtomicUsize,
     pub max_live: AtomicUsize,
     pub requests: AtomicUsize,
+    /// Bytes of `/big` bodies handed to the server so far.
+    pub produced: AtomicUsize,
 }
 
 pub struct Origin {
@@ -51,6 +58,85 @@ impl Origin {
     pub fn requests(&self) -> usize {
         self.counters.requests.load(Ordering::SeqCst)
     }
+
+    pub fn produced(&self) -> usize {
+        self.counters.produced.load(Ordering::SeqCst)
+    }
+}
+
+/// Chunk size of `/big` bodies.
+pub const CHUNK: usize = 16 * 1024;
+
+/// The bytes of `/big` bodies: byte `i` is `i % 251`.
+pub fn pattern_byte(i: usize) -> u8 {
+    (i % 251) as u8
+}
+
+/// `len=<n> sha256=<hex>` for `data`, as `/echo` answers.
+pub fn digest_line(data: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, data);
+    let mut hex = String::new();
+    for byte in digest.as_ref() {
+        write!(hex, "{byte:02x}").unwrap();
+    }
+    format!("len={} sha256={hex}", data.len())
+}
+
+/// `/big` bodies: [`CHUNK`]-byte data frames made only when the server asks for the next
+/// one, each counted in `produced` as it is handed over.
+struct Chunks {
+    sent: usize,
+    total: usize,
+    counters: Arc<Counters>,
+}
+
+impl Stream for Chunks {
+    type Item = Result<Frame<Bytes>, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.sent >= self.total {
+            return Poll::Ready(None);
+        }
+        let len = CHUNK.min(self.total - self.sent);
+        let chunk: Vec<u8> = (self.sent..self.sent + len).map(pattern_byte).collect();
+        self.sent += len;
+        self.counters.produced.fetch_add(len, Ordering::SeqCst);
+        Poll::Ready(Some(Ok(Frame::data(Bytes::from(chunk)))))
+    }
+}
+
+type OriginBody = BoxBody<Bytes, Infallible>;
+
+fn full(text: impl Into<Bytes>) -> OriginBody {
+    Full::new(text.into()).boxed()
+}
+
+/// `/echo`: reads the whole request body and answers with its [`digest_line`].
+async fn echo(request: Request<Incoming>) -> Response<OriginBody> {
+    match request.into_body().collect().await {
+        Ok(body) => Response::new(full(digest_line(&body.to_bytes()))),
+        Err(e) => {
+            let mut response = Response::new(full(e.to_string()));
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            response
+        }
+    }
+}
+
+/// `/big?bytes=N`: `N` bytes of [`pattern_byte`] in [`CHUNK`]-byte frames.
+fn big(request: &Request<Incoming>, counters: Arc<Counters>) -> Response<OriginBody> {
+    let total = request
+        .uri()
+        .query()
+        .and_then(|q| q.strip_prefix("bytes="))
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let chunks = Chunks {
+        sent: 0,
+        total,
+        counters,
+    };
+    Response::new(StreamBody::new(chunks).boxed())
 }
 
 /// Decrements `live` when a connection ends.
@@ -71,15 +157,20 @@ impl Drop for Live {
     }
 }
 
-/// Answers every request with a line describing it:
-/// `GET /path?q authority=host:port version=HTTP/1.1 conn=1 cookie=a=1|b=2`.
+/// Answers `/echo` with [`echo`], `/big` with [`big`], and every other request with a line
+/// describing it: `GET /path?q authority=host:port version=HTTP/1.1 conn=1 cookie=a=1|b=2`.
 /// `?delay=<ms>` waits before answering.
 async fn handle(
     conn: usize,
     counters: Arc<Counters>,
     request: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<OriginBody>, Infallible> {
     counters.requests.fetch_add(1, Ordering::SeqCst);
+    match request.uri().path() {
+        "/echo" => return Ok(echo(request).await),
+        "/big" => return Ok(big(&request, counters)),
+        _ => {}
+    }
     if let Some(ms) = request
         .uri()
         .query()
@@ -113,7 +204,7 @@ async fn handle(
         request.uri().path_and_query().map_or("/", |pq| pq.as_str()),
         request.version(),
     );
-    Ok(Response::new(Full::new(Bytes::from(line))))
+    Ok(Response::new(full(line)))
 }
 
 /// Serves HTTP/1.1 or HTTP/2 on `io` with [`handle`].

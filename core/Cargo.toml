@@ -74,8 +74,9 @@ bytes = "1.12.1"
 env_logger = { version = "0.11.11", default-features = false }
 socket2 = "0.6.5"
 
-# Tests only.
+# Tests only. futures-core is already in the tree through http-body-util.
 tempfile = "3.27.0"
+futures-core = { version = "0.3.34", default-features = false }
 
 [profile.release]
 opt-level = "s"

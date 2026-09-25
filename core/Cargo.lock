@@ -1729,6 +1729,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bytes",
+ "futures-core",
  "http-body-util",
  "hyper",
  "hyper-util",
