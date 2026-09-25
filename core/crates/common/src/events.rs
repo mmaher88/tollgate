@@ -41,6 +41,8 @@ impl EventLog {
     /// URLs longer than this many bytes are cut at the last character boundary before it,
     /// and their allocation is shrunk to match.
     pub const MAX_URL_BYTES: usize = 512;
+    /// A DNS name is at most 253 bytes; anything longer came from a malformed request.
+    pub const MAX_HOST_BYTES: usize = 253;
 
     pub fn new() -> EventLog {
         EventLog::default()
@@ -50,6 +52,10 @@ impl EventLog {
     pub fn record(&self, mut event: BlockEvent) {
         if let Some(url) = event.url.as_mut() {
             truncate_at_char_boundary(url, Self::MAX_URL_BYTES);
+        }
+        truncate_at_char_boundary(&mut event.host, Self::MAX_HOST_BYTES);
+        if let Some(source) = event.source_host.as_mut() {
+            truncate_at_char_boundary(source, Self::MAX_HOST_BYTES);
         }
         let mut events = self.lock();
         if events.len() >= Self::CAPACITY {

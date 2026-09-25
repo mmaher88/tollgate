@@ -156,3 +156,22 @@ fn records_from_many_threads() {
         assert!(secs.windows(2).all(|w| w[0] > w[1]), "thread {t}: {secs:?}");
     }
 }
+
+#[test]
+fn long_hosts_are_truncated() {
+    let log = EventLog::new();
+    let long = "a".repeat(5000);
+    log.record(BlockEvent {
+        unix_secs: 1,
+        kind: EventKind::Request,
+        host: long.clone(),
+        url: None,
+        source_host: Some(long),
+    });
+    let event = &log.recent(1)[0];
+    assert_eq!(event.host.len(), EventLog::MAX_HOST_BYTES);
+    assert_eq!(
+        event.source_host.as_ref().unwrap().len(),
+        EventLog::MAX_HOST_BYTES
+    );
+}
