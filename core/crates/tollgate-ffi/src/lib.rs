@@ -15,7 +15,7 @@ mod logging;
 
 pub use ca::{
     CA_CERT_FILE, CA_COMMON_NAME, CA_KEY_FILE, CaInfo, PROFILE_DISPLAY_NAME, PROFILE_IDENTIFIER,
-    ca_mobileconfig, generate_ca, load_ca,
+    ca_mobileconfig, ca_test_leaf, generate_ca, load_ca,
 };
 pub use engine::{
     Engine, EngineOptions, FORWARD_QUEUE, LEARNED_PINS_FILE, PacketSink, RUNTIME_THREAD, Stats,

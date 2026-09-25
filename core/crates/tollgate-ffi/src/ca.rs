@@ -126,6 +126,23 @@ pub fn generate_ca(data_dir: String) -> Result<CaInfo, TollgateError> {
     catch_panic(|| generate_in(Path::new(&data_dir)))
 }
 
+/// A leaf certificate (DER) for `host`, issued by the stored CA exactly as the proxy issues
+/// leaves for intercepted sites. The app evaluates it with the TLS policy to learn whether
+/// iOS trusts the root for websites, which only holds once full trust is enabled in
+/// Certificate Trust Settings. Fails when no CA is stored or the host is invalid.
+#[uniffi::export]
+pub fn ca_test_leaf(data_dir: String, host: String) -> Result<Vec<u8>, TollgateError> {
+    catch_panic(|| {
+        let ca = load_ca(Path::new(&data_dir))?
+            .ok_or_else(|| ca_error("no CA in the data directory; call generate_ca first"))?;
+        let key = ca.leaf(&host).map_err(ca_error)?;
+        key.cert
+            .first()
+            .map(|der| der.as_ref().to_vec())
+            .ok_or_else(|| ca_error("issued leaf has no certificate"))
+    })
+}
+
 /// The iOS configuration profile (`.mobileconfig`) that installs the stored root. Fails
 /// when no CA is stored.
 #[uniffi::export]
