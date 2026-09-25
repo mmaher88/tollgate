@@ -9,7 +9,8 @@ web views and third-party apps.
 It is not distributed through the App Store. It is built and signed by GitHub Actions with
 the owner's Apple Developer account and installed from a Linux workstation.
 
-Status: M0, build pipeline and a first-light tunnel. See the
+Status: M1, the Rust core (DNS blocking, the HTTPS filtering proxy and the Swift-facing
+engine), tested on Linux; the tunnel still runs the M0 first-light code. See the
 [design](docs/superpowers/specs/2026-09-24-tollgate-design.md) and the
 [feasibility research](docs/research/2026-09-23-feasibility-brief.md).
 
@@ -17,6 +18,8 @@ Status: M0, build pipeline and a first-light tunnel. See the
 
 - `core/`: Rust workspace. Filtering, DNS and the HTTPS proxy live here and are developed and
   tested on Linux with `cargo test`. `tollgate-ffi` exposes them to Swift through uniffi.
+- `core/tools/devproxy`: runs the same DNS responder and proxy on the workstation for
+  Firefox; `devproxy --help` and [the checklist](docs/experiments/m1-devproxy.md).
 - `ios/`: a thin SwiftUI app and a `NEPacketTunnelProvider` extension. The Xcode project is
   generated from `ios/project.yml` with XcodeGen; nobody edits a `.xcodeproj`.
 - `.github/workflows/ios.yml`: on an Apple silicon runner, cross-compiles the Rust core for
