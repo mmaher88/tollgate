@@ -92,6 +92,14 @@ fn a_full_queue_answers_servfail_at_once() {
     for packet in &immediate {
         assert_eq!(reply(packet).metadata.response_code, ResponseCode::ServFail);
     }
+    // Only forward_in_flight queries reach the server while it holds them; the rest wait
+    // in the queue.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        server.requests(),
+        1,
+        "queries at the server while it holds them"
+    );
     server.open_gate();
     for _ in 0..6 - immediate.len() {
         let message = reply(&answers.recv_timeout(WAIT).unwrap());
