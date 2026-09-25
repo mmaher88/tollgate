@@ -1,0 +1,16 @@
+[package]
+name = "tollgate-mitm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+tollgate-common = { workspace = true }
+lru = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser"] }
+rustls = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+x509-parser = { workspace = true }

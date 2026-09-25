@@ -4,6 +4,7 @@ members = [
     "crates/common",
     "crates/policy",
     "crates/filter",
+    "crates/mitm",
     "crates/tollgate-ffi",
     "tools/uniffi-bindgen-swift",
 ]
@@ -20,6 +21,7 @@ publish = false
 tollgate-common = { path = "crates/common" }
 tollgate-policy = { path = "crates/policy" }
 tollgate-filter = { path = "crates/filter" }
+tollgate-mitm = { path = "crates/mitm" }
 
 # FFI. Default features are off so the runtime crate does not build cargo_metadata;
 # tools/uniffi-bindgen-swift turns on the features it needs.
@@ -42,8 +44,24 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"
 
-# Tests only.
+# Certificates. rcgen with ring only; tollgate-mitm adds the x509-parser feature so leaves
+# are issued from the stored CA certificate.
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
+x509-parser = "0.18.1"
+time = { version = "0.3.55", default-features = false, features = ["std"] }
+lru = { version = "0.18.5", default-features = false }
+
+# Proxy runtime. tokio-rustls needs default-features = false like rustls, or aws-lc-sys
+# comes back.
+tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "macros", "time", "sync"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
+hyper = { version = "1.11.1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "http1", "http2"] }
+http-body-util = "0.1.5"
+bytes = "1.12.1"
+arc-swap = "1.9.2"
+
+# Tests only.
 tempfile = "3.27.0"
 
 [profile.release]
