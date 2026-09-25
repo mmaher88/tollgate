@@ -27,6 +27,14 @@ pub enum TollgateError {
     Internal { message: String },
 }
 
+impl TollgateError {
+    pub(crate) fn io(e: impl std::fmt::Display) -> TollgateError {
+        TollgateError::Io {
+            message: e.to_string(),
+        }
+    }
+}
+
 /// The text of a panic payload: the message of `panic!("...")` with or without format
 /// arguments, or a fixed text for any other payload.
 pub fn panic_message(payload: &(dyn Any + Send)) -> String {

@@ -1634,7 +1634,9 @@ version = "0.1.0"
 dependencies = [
  "log",
  "ring",
+ "tempfile",
  "thiserror 2.0.21",
+ "tollgate-mitm",
  "uniffi",
 ]
 

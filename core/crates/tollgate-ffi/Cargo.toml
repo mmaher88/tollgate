@@ -14,4 +14,8 @@ crate-type = ["lib", "staticlib"]
 log = { workspace = true }
 ring = { workspace = true }
 thiserror = { workspace = true }
+tollgate-mitm = { workspace = true }
 uniffi = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
