@@ -14,6 +14,9 @@ pub struct ServeOptions {
     /// Roots for upstream TLS. ALPN is set by the proxy. Default: webpki roots through
     /// `tollgate_common::tls::client_config`. Tests use it to trust a local origin.
     pub upstream_tls: Arc<ClientConfig>,
+    /// Limit for reading the ClientHello and for the TLS handshake with the client.
+    /// Default 10 s.
+    pub handshake_timeout: Duration,
     /// Limit for reading HTTP/1.1 request headers. Default 30 s.
     pub header_read_timeout: Duration,
     /// Client connections without a request in flight for this long are closed; upstream
@@ -33,6 +36,7 @@ impl Default for ServeOptions {
     fn default() -> ServeOptions {
         ServeOptions {
             upstream_tls: tollgate_common::tls::client_config(&[b"h2", b"http/1.1"]),
+            handshake_timeout: Duration::from_secs(10),
             header_read_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(60),
             connect_timeout: Duration::from_secs(10),

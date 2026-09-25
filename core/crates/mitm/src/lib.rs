@@ -5,13 +5,18 @@
 
 mod body;
 mod ca;
+mod connect;
 mod filtering;
 mod forward;
+mod hello;
 mod http;
 mod idle;
+mod intercept;
 mod mobileconfig;
 mod options;
 mod proxy;
+mod request;
+mod rewind;
 mod shutdown;
 mod upstream;
 
@@ -34,6 +39,8 @@ pub mod limits {
     pub const H2_MAX_SEND_BUF: usize = 128 * 1024;
     /// HTTP/1.1 read buffer, client and server side.
     pub const H1_MAX_BUF: usize = 128 * 1024;
+    /// Below this much available memory new connections are passed through.
+    pub const LOW_MEMORY_BYTES: u64 = 8 * 1024 * 1024;
     /// Default for `ServeOptions::max_upstream_connections`.
     pub const MAX_UPSTREAM_CONNECTIONS: usize = 64;
     /// Default for `ServeOptions::max_h1_per_host`.

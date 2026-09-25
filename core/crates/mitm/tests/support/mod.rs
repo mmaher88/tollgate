@@ -6,3 +6,4 @@ pub mod client;
 pub mod origin;
 pub mod proxy;
 pub mod tls_origin;
+pub mod tunnel;
