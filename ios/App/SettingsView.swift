@@ -3,6 +3,9 @@ import UIKit
 
 struct SettingsView: View {
     @EnvironmentObject private var lists: ListUpdater
+    @State private var allowCount = 0
+    @State private var passthroughCount = 0
+    @State private var enabledLists = 0
 
     var body: some View {
         NavigationStack {
@@ -11,7 +14,7 @@ struct SettingsView: View {
                     NavigationLink {
                         FilterListsView()
                     } label: {
-                        LabeledContent("Filter lists", value: listsSummary)
+                        LabeledContent("Filter lists", value: "\(enabledLists) enabled")
                     }
                     NavigationLink("My rules") { MyRulesView() }
                 } header: {
@@ -27,7 +30,7 @@ struct SettingsView: View {
                             explanation: "Nothing is blocked on these sites or for these domains. Use *.example.com for a site and all its subdomains.",
                             keyPath: \.allowlist)
                     } label: {
-                        LabeledContent("Allowed sites", value: "\(CoreConfig.load().allowlist.count)")
+                        LabeledContent("Allowed sites", value: "\(allowCount)")
                     }
                     NavigationLink {
                         HostListEditor(
@@ -35,7 +38,7 @@ struct SettingsView: View {
                             explanation: "HTTPS connections to these hosts are never decrypted. Apple services, banks and apps that pin certificates are already on a built-in list.",
                             keyPath: \.passthrough)
                     } label: {
-                        LabeledContent("Never filtered", value: "\(CoreConfig.load().passthrough.count)")
+                        LabeledContent("Never filtered", value: "\(passthroughCount)")
                     }
                     NavigationLink("Learned certificate pins") { PinsView() }
                 } header: {
@@ -43,13 +46,17 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            // On the List, so it also runs when a pushed editor pops back.
+            .onAppear(perform: reload)
         }
     }
 
-    private var listsSummary: String {
+    private func reload() {
+        let config = CoreConfig.load()
+        allowCount = config.allowlist.count
+        passthroughCount = config.passthrough.count
         let settings = ListSettings.load()
-        let count = FilterLists.defaults.filter(settings.isEnabled).count + settings.custom.count
-        return "\(count) enabled"
+        enabledLists = FilterLists.defaults.filter(settings.isEnabled).count + settings.custom.count
     }
 }
 
@@ -60,7 +67,7 @@ struct FilterListsView: View {
     @EnvironmentObject private var tunnel: TunnelController
     @State private var settings = ListSettings.load()
     @State private var adding = false
-    @State private var dirty = false
+    @State private var saveError: String?
 
     var body: some View {
         List {
@@ -97,16 +104,26 @@ struct FilterListsView: View {
                 Button("Add a list") { adding = true }
             }
             Section {
-                Button(dirty ? "Apply changes now" : "Update now") {
+                Button(lists.pendingSettingsChange ? "Apply changes now" : "Update now") {
                     Task {
-                        if await lists.update() {
-                            dirty = false
-                            await tunnel.listsUpdated()
+                        // Changes compile from the cached lists; "Update now" downloads.
+                        let compiled: Bool
+                        if lists.pendingSettingsChange {
+                            compiled = await lists.applySettings()
+                        } else {
+                            compiled = await lists.update()
                         }
+                        if compiled { await tunnel.listsUpdated() }
                     }
                 }
                 .disabled(lists.isBusy)
                 Text(statusText).font(.footnote).foregroundStyle(.secondary)
+                ForEach(lists.warnings, id: \.self) { warning in
+                    Text(warning).font(.footnote).foregroundStyle(.orange)
+                }
+                if let saveError {
+                    Text("Not saved: \(saveError)").font(.footnote).foregroundStyle(.red)
+                }
             }
         }
         .navigationTitle("Filter lists")
@@ -124,7 +141,7 @@ struct FilterListsView: View {
         case .compiling: return "Compiling"
         case let .failed(message): return "Update failed: \(message)"
         case .idle:
-            if dirty { return "Changes apply at the next update." }
+            if lists.pendingSettingsChange { return "Changes are not applied yet." }
             if let date = lists.lastUpdated {
                 return "Updated \(date.formatted(date: .abbreviated, time: .shortened))"
             }
@@ -133,8 +150,13 @@ struct FilterListsView: View {
     }
 
     private func save() {
-        try? settings.save()
-        dirty = true
+        do {
+            try settings.save()
+            saveError = nil
+            lists.settingsChanged()
+        } catch {
+            saveError = error.localizedDescription
+        }
     }
 }
 
@@ -147,7 +169,7 @@ struct AddListView: View {
 
     private var valid: Bool {
         guard let parsed = URL(string: url.trimmingCharacters(in: .whitespaces)) else { return false }
-        return (parsed.scheme == "https" || parsed.scheme == "http") && parsed.host != nil
+        return parsed.scheme?.lowercased() == "https" && parsed.host != nil
     }
 
     var body: some View {
@@ -187,6 +209,7 @@ struct MyRulesView: View {
     @EnvironmentObject private var tunnel: TunnelController
     @State private var text = ListSettings.load().myRules
     @State private var saved = true
+    @State private var saveError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -199,20 +222,50 @@ struct MyRulesView: View {
                 .autocorrectionDisabled()
                 .padding(.horizontal, 12)
                 .onChange(of: text) { _, _ in saved = false }
+            Text(status)
+                .font(.footnote)
+                .foregroundStyle(saveError != nil || lists.state.isFailure ? .red : .secondary)
+                .padding(.horizontal)
+                .padding(.bottom, 8)
         }
         .navigationTitle("My rules")
         .toolbar {
-            Button("Save") {
+            Button(saved && lists.pendingSettingsChange ? "Retry" : "Save") {
                 var settings = ListSettings.load()
                 settings.myRules = text
-                try? settings.save()
+                do {
+                    try settings.save()
+                } catch {
+                    saveError = error.localizedDescription
+                    return
+                }
+                saveError = nil
                 saved = true
+                lists.settingsChanged()
                 Task {
-                    if await lists.update() { await tunnel.listsUpdated() }
+                    if await lists.applySettings() { await tunnel.listsUpdated() }
                 }
             }
-            .disabled(saved || lists.isBusy)
+            .disabled((saved && !lists.pendingSettingsChange) || lists.isBusy)
         }
+    }
+
+    private var status: String {
+        if let saveError { return "Not saved: \(saveError)" }
+        switch lists.state {
+        case .downloading, .compiling: return "Applying"
+        case let .failed(message): return "Not applied yet: \(message)"
+        case .idle:
+            if !saved { return "Not saved" }
+            return lists.pendingSettingsChange ? "Saved, not applied yet" : "Active"
+        }
+    }
+}
+
+extension ListUpdater.State {
+    var isFailure: Bool {
+        if case .failed = self { return true }
+        return false
     }
 }
 
@@ -321,26 +374,40 @@ struct PinsView: View {
     }
 
     private func reload() async {
-        if let running = await tunnel.pins() {
+        switch await tunnel.pins() {
+        case let .engine(running):
             pins = running
-            return
-        }
-        guard let directory = AppGroup.coreDirectory else { return }
-        do {
-            pins = try storedLearnedPins(dataDir: directory.path).map { PinEntry(host: $0.host, learnedAt: $0.learnedAt) }
-        } catch {
-            self.error = "Could not read pins: \(error.localizedDescription)"
+            error = nil
+        case .storedFile:
+            guard let directory = AppGroup.coreDirectory else { return }
+            do {
+                pins = try storedLearnedPins(dataDir: directory.path)
+                    .map { PinEntry(host: $0.host, learnedAt: $0.learnedAt) }
+                error = nil
+            } catch {
+                self.error = "Could not read pins: \(error.localizedDescription)"
+            }
+        case .unavailable:
+            error = "Protection is restarting; pull to refresh in a moment."
         }
     }
 
     private func forget(_ hosts: [String]) {
         Task {
-            if !(await tunnel.forgetPins(hosts)), let directory = AppGroup.coreDirectory {
+            switch await tunnel.forgetPins(hosts) {
+            case .done:
+                error = nil
+            case .editStoredFile:
+                guard let directory = AppGroup.coreDirectory else { return }
                 do {
                     _ = try forgetStoredPins(dataDir: directory.path, hosts: hosts)
+                    error = nil
                 } catch {
                     self.error = "Could not update pins: \(error.localizedDescription)"
                 }
+            case .unavailable:
+                error = "Protection is restarting; try again in a moment."
+                return
             }
             await reload()
         }

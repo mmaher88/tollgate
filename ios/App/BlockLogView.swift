@@ -33,6 +33,28 @@ struct BlockLogView: View {
         }
     }
 
+    /// Identical events (A and AAAA blocks of one name in the same second, repeated requests)
+    /// collapse into one row, which also keeps the list's ids unique.
+    private struct Row: Identifiable {
+        let event: TunnelEvent
+        var count: Int
+        var id: String { event.id }
+    }
+
+    private var rows: [Row] {
+        var index: [String: Int] = [:]
+        var out: [Row] = []
+        for event in shown {
+            if let i = index[event.id] {
+                out[i].count += 1
+            } else {
+                index[event.id] = out.count
+                out.append(Row(event: event, count: 1))
+            }
+        }
+        return out
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -48,12 +70,12 @@ struct BlockLogView: View {
                 if tunnel.status != .connected {
                     ContentUnavailableView("Protection is off", systemImage: "shield.slash",
                                            description: Text("Blocks appear here while Tollgate is on."))
-                } else if shown.isEmpty {
+                } else if rows.isEmpty {
                     ContentUnavailableView("Nothing blocked yet", systemImage: "checkmark.shield",
                                            description: Text("Browse a site with ads and come back."))
                 } else {
-                    ForEach(shown) { event in
-                        Button { selected = event } label: { EventRow(event: event) }
+                    ForEach(rows) { row in
+                        Button { selected = row.event } label: { EventRow(event: row.event, count: row.count) }
                             .buttonStyle(.plain)
                     }
                 }
@@ -79,8 +101,10 @@ struct BlockLogView: View {
                 get: { selected != nil }, set: { if !$0 { selected = nil } }
             ), titleVisibility: .visible) {
                 if let event = selected {
-                    Button("Never block \(event.host)") { allow(event.host) }
-                    if let page = event.sourceHost, page != event.host {
+                    if Self.allowable(event.host) {
+                        Button("Never block \(event.host)") { allow(event.host) }
+                    }
+                    if let page = event.sourceHost, page != event.host, Self.allowable(page) {
                         Button("Allow everything on \(page)") { allow(page) }
                     }
                     Button("Copy \(event.url == nil ? "domain" : "address")") {
@@ -91,10 +115,20 @@ struct BlockLogView: View {
         }
     }
 
+    /// Whether `*.host` is a pattern the core accepts; an invalid allowlist entry would stop
+    /// the tunnel from starting.
+    private static func allowable(_ host: String) -> Bool {
+        !host.isEmpty && (try? validateHostPattern(pattern: "*." + host.lowercased())) != nil
+    }
+
     /// Adds `*.host` (the host and its subdomains) to the allowlist and restarts the tunnel.
     private func allow(_ host: String) {
+        let pattern = "*." + host.lowercased()
+        guard Self.allowable(host) else {
+            message = "\(host) cannot be added to Allowed sites."
+            return
+        }
         var config = CoreConfig.load()
-        let pattern = "*." + host
         guard !config.allowlist.contains(pattern) else { return }
         config.allowlist.append(pattern)
         do {
@@ -109,6 +143,7 @@ struct BlockLogView: View {
 
 private struct EventRow: View {
     let event: TunnelEvent
+    let count: Int
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -124,6 +159,9 @@ private struct EventRow: View {
                     Text(event.date, style: .time)
                     if let page = event.sourceHost, page != event.host {
                         Text("on \(page)")
+                    }
+                    if count > 1 {
+                        Text("\(count) times")
                     }
                 }
                 .font(.caption2)

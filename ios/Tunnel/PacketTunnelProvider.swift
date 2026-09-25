@@ -70,11 +70,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             engine?.clearEvents()
             completionHandler?(Data("ok".utf8))
         case .pins:
-            let pins = (engine?.learnedPins() ?? []).map { PinEntry(host: $0.host, learnedAt: $0.learnedAt) }
+            // No engine yet (waiting for the first unlock): no answer, so the app does not
+            // mistake an empty list for the real one.
+            guard let engine else { completionHandler?(nil); return }
+            let pins = engine.learnedPins().map { PinEntry(host: $0.host, learnedAt: $0.learnedAt) }
             completionHandler?(try? JSONEncoder().encode(pins))
         case .forgetPins:
+            guard let engine else { completionHandler?(nil); return }
             let hosts = (try? JSONDecoder().decode([String].self, from: message.payload)) ?? []
-            let forgotten = engine?.forgetPins(hosts: hosts) ?? 0
+            let forgotten = engine.forgetPins(hosts: hosts)
             log.info("forgot \(forgotten, privacy: .public) learned pins")
             completionHandler?(Data(String(forgotten).utf8))
         case .probeMemory:
@@ -92,6 +96,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// after the first unlock on a tunnel that is already up with minimal settings.
     private func startCore(in directory: URL, completionHandler: @escaping (Error?) -> Void) {
         var config = CoreConfig.load()
+        // The core rejects the whole configuration when one pattern is invalid, which would
+        // keep protection off; drop such entries instead.
+        config.allowlist = validPatterns(config.allowlist, list: "allowlist")
+        config.passthrough = validPatterns(config.passthrough, list: "passthrough")
         if config.mitmEnabled, !RootTrust.isTrustedForTLS(coreDirectory: directory) {
             // Trust was never granted or was removed in Settings: intercepting now would
             // break every HTTPS site, so run DNS blocking only.
@@ -132,6 +140,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.reading.withLock { $0 = true }
             Self.readPackets(engine: engine, flow: self.packetFlow, reading: self.reading, log: self.log)
             completionHandler(nil)
+        }
+    }
+
+    private func validPatterns(_ patterns: [String], list: String) -> [String] {
+        patterns.filter { pattern in
+            do {
+                try validateHostPattern(pattern: pattern)
+                return true
+            } catch {
+                log.warning("ignoring invalid \(list, privacy: .public) entry \(pattern, privacy: .public)")
+                return false
+            }
         }
     }
 

@@ -184,16 +184,51 @@ final class TunnelController: ObservableObject {
         _ = await send(.clearEvents)
     }
 
-    /// Learned pins from the running engine; nil when the tunnel is not running.
-    func pins() async -> [PinEntry]? {
-        guard status == .connected, let data = await send(.pins) else { return nil }
-        return try? JSONDecoder().decode([PinEntry].self, from: data)
+    enum PinSource {
+        /// The running engine answered.
+        case engine([PinEntry])
+        /// No engine can be running: read or edit learned-pins.json directly.
+        case storedFile
+        /// The tunnel is starting or stopping; an engine may be alive and would overwrite a
+        /// file edit when it saves. Try again in a moment.
+        case unavailable
     }
 
-    /// Returns false when the tunnel is not running (the caller then edits the stored file).
-    func forgetPins(_ hosts: [String]) async -> Bool {
-        guard status == .connected, let payload = try? JSONEncoder().encode(hosts) else { return false }
-        return await send(.forgetPins, payload: payload) != nil
+    /// Learned pins, from the engine while it runs.
+    func pins() async -> PinSource {
+        switch status {
+        case .connected, .reasserting:
+            guard let data = await send(.pins),
+                  let pins = try? JSONDecoder().decode([PinEntry].self, from: data)
+            else { return .unavailable }
+            return .engine(pins)
+        case .disconnected, .invalid:
+            return .storedFile
+        default:
+            return .unavailable
+        }
+    }
+
+    enum PinEditResult {
+        case done
+        case editStoredFile
+        case unavailable
+    }
+
+    /// Forgets pins in the running engine, or tells the caller to edit the stored file when
+    /// no engine can be running.
+    func forgetPins(_ hosts: [String]) async -> PinEditResult {
+        switch status {
+        case .connected, .reasserting:
+            guard let payload = try? JSONEncoder().encode(hosts),
+                  await send(.forgetPins, payload: payload) != nil
+            else { return .unavailable }
+            return .done
+        case .disconnected, .invalid:
+            return .editStoredFile
+        default:
+            return .unavailable
+        }
     }
 
     private func send(_ command: TunnelCommand, payload: Data? = nil) async -> Data? {

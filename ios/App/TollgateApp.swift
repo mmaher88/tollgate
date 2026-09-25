@@ -10,11 +10,19 @@ final class AppModel {
     let lists = ListUpdater()
     let certificate = CertificateManager()
 
-    /// Updates the lists when they are missing or stale and hands them to the tunnel.
-    func refreshListsIfNeeded() async {
-        guard lists.isStale, !lists.isBusy else { return }
+    /// Refreshes stale or missing lists, or compiles pending settings changes, then hands
+    /// the result to the tunnel. A deadline keeps the uninterruptible compile from starting
+    /// when a background task is about to run out of time.
+    func refreshListsIfNeeded(deadline: Date? = nil) async {
+        guard lists.needsWork, !lists.isBusy else { return }
         if tunnel.status == .invalid { await tunnel.load() }
-        if await lists.update() { await tunnel.listsUpdated() }
+        let compiled: Bool
+        if lists.isStale {
+            compiled = await lists.update(deadline: deadline)
+        } else {
+            compiled = await lists.applySettings()
+        }
+        if compiled { await tunnel.listsUpdated() }
     }
 }
 
@@ -49,7 +57,7 @@ struct TollgateApp: App {
         }
         .backgroundTask(.appRefresh(ListRefresh.identifier)) {
             ListRefresh.schedule()
-            await AppModel.shared.refreshListsIfNeeded()
+            await AppModel.shared.refreshListsIfNeeded(deadline: Date().addingTimeInterval(20))
         }
     }
 }
