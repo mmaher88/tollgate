@@ -7,6 +7,7 @@ members = [
     "crates/dns",
     "crates/mitm",
     "crates/tollgate-ffi",
+    "tools/devproxy",
     "tools/uniffi-bindgen-swift",
 ]
 
@@ -24,6 +25,7 @@ tollgate-policy = { path = "crates/policy" }
 tollgate-filter = { path = "crates/filter" }
 tollgate-dns = { path = "crates/dns" }
 tollgate-mitm = { path = "crates/mitm" }
+tollgate-ffi = { path = "crates/tollgate-ffi" }
 
 # FFI. Default features are off so the runtime crate does not build cargo_metadata;
 # tools/uniffi-bindgen-swift turns on the features it needs.
@@ -66,6 +68,11 @@ hyper = { version = "1.11.1", features = ["http1", "http2", "server", "client"] 
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "http1", "http2"] }
 http-body-util = "0.1.5"
 bytes = "1.12.1"
+
+# tools/devproxy only. env_logger without regex, colors or timestamps; socket2 (already in
+# the tree through tokio) to share the DNS port with an mDNS responder.
+env_logger = { version = "0.11.11", default-features = false }
+socket2 = "0.6.5"
 
 # Tests only.
 tempfile = "3.27.0"
