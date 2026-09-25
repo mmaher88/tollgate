@@ -19,7 +19,7 @@ repo root and need the network. The data directory is `/tmp/tollgate-dev`.
 If step 2 fails with `DNS listener 127.0.0.1:5353: Address already in use`, another program
 holds 5353 without `SO_REUSEADDR`; add `--dns 127.0.0.1:5354` and use port 5354 below.
 
-Result:
+Result: pass (2026-09-25, m1d at 70f138a, release build; data directory under the repo's gitignored build/ instead of /tmp; ports 5354 and 18080). 114,319 network rules (engine.dat 5,040,405 bytes), 216,760 DNS names (domains.bin 1,734,112 bytes), new root CA; ca.key and ca.pem are -rw-------.
 
 ## 2. DNS
 
@@ -29,7 +29,7 @@ Result:
 4. Run step 3 again. Pass: the same addresses, answered at once (cache).
 5. `dig @127.0.0.1 -p 5353 example.com HTTPS`. Pass: `status: NOERROR` and `ANSWER: 0`.
 
-Result:
+Result: pass. doubleclick.net A 0.0.0.0, AAAA ::, stats.g.doubleclick.net 0.0.0.0; example.com resolved through DoH, the repeat answered from cache in 9 ms; example.com HTTPS NOERROR with ANSWER 0.
 
 ## 3. Proxy with curl
 
@@ -46,7 +46,7 @@ Result:
    16,000 on the workstation after three intercepted HTTPS pages; the phone's budget for the
    engine and the blocklist alone is about 10 MiB.
 
-Result:
+Result: pass. http://example.com 200; https://example.com intercepted (issuer CN=Tollgate Root CA; O=Tollgate) 200 over HTTP/2; gpt.js and adsbygoogle.js 403; www.apple.com passed through with Apple's own certificate. Memory, measured as RssAnon because RSS includes the 26 MB unstripped binary: 5.6 MB after loading the compiled lists, 7.0 MB after intercepting eight real sites over HTTP/2 (including a 6.4 MB page); peak VmHWM 17 MB. A run that also downloads and compiles the lists peaks higher (compile happens in the app on iOS, not in the tunnel).
 
 ## 4. Pin learning
 
@@ -62,7 +62,7 @@ Result:
    `tls_abandoned_after_handshake`. On the workstation used for this plan, curl 8.22 with
    OpenSSL 3.6 grew `tls_abandoned_after_handshake`, so curl alone never teaches a pin.
 
-Result:
+Result: pass. Runs 1 and 2: Verify return code 20; the log shows "learned certificate pin for example.net after UnknownCa"; run 3: Verify return code 0 (passthrough).
 
 ## 5. Firefox
 
