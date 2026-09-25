@@ -1,7 +1,7 @@
 # Tollgate: design
 
 Date: 2026-09-24
-Status: approved, M0 in progress
+Status: approved; M0 merged; M1 revisions below (2026-09-25)
 
 Tollgate is a personal, sideloaded iOS ad blocker. It runs as a local packet tunnel (a
 Network Extension "VPN" that never leaves the device), blocks ad and tracker domains at the
@@ -259,3 +259,273 @@ intercepting new connections (passthrough only) until memory recovers.
 - M2: DNS blocking on the phone; E3.
 - M3: CA setup flow and MITM in Safari, passthrough and pin learning; E4, E5.
 - M4: lists and log UI, memory tuning, E7, decide on netstack phase 2.
+
+## Revisions after the M1 prototypes (2026-09-25)
+
+Throwaway prototypes were built for every M1 component against the pinned crate versions,
+measured on Linux, and re-run by an independent reviewer. Where this section disagrees with
+the sections above, this section wins.
+
+### Measured
+
+| Item | Result |
+|---|---|
+| adblock engine, EasyList + EasyPrivacy + AdGuard Mobile Ads (114k network rules), network rules only, no debug info | `engine.dat` 4.8 MiB; 5.8 to 8 MiB resident after load; build 53 ms in the app |
+| Same with debug info (keeps rule text) | 11 MiB file, 12 to 13 MiB resident: too big for the extension |
+| DNS blocklist, AdGuard DNS filter + StevenBlack hosts (253k names) | `HashSet` 13 to 17 MiB (rejected); sorted 64-bit hashes 2 MiB |
+| DoH: tokio runtime + one HTTP/2 connection | about 0.1 MiB heap; 10 to 25 ms per query on a warm connection |
+| HTTPS proxy, 20 concurrent intercepted downloads | 52 MB with hyper defaults, 11 to 12 MB with tuned flow control |
+| Leaf certificate minting (ECDSA P-256) | about 50 microseconds |
+
+### Decisions that change the design
+
+**Crates.** A new `tollgate-common` crate holds the continuous clock, the shared rustls
+client configuration, statistics counters and the logging facade, so `dns` and `mitm` do not
+depend on each other.
+
+**filter.**
+- `adblock = "=0.13.3"` with `default-features = false` and features
+  `embedded-domain-resolver`, `full-regex-handling`. The default `single-thread` feature makes
+  the engine `!Send`, which uniffi objects cannot hold. The version is pinned exactly because
+  the app writes `engine.dat` and the extension reads it.
+- Lists are compiled with network rules only and without debug info. `Verdict::Block` carries
+  `rule: Option<String>`, which is `None` in the extension. The app can find the matching rule
+  for its log view by re-checking the URL against a debug engine it builds on demand.
+- `engine.dat` is loaded through `mmap` (`memmap2`), avoiding a transient peak of twice the
+  file size.
+- The regex cache discard policy is set to 10 s cleanup and 30 s unused lifetime.
+- Request types come from an explicit `Sec-Fetch-Dest` table (`style` to `stylesheet`,
+  `iframe`/`frame` to `sub_frame`, `empty` to `xmlhttprequest`, and so on), then `Accept`,
+  then the path extension.
+- Source URL: top-level document requests use their own URL; otherwise `Referer`, then
+  `Origin`, then empty. An empty source counts as third party, which is adblock's behavior.
+
+**DNS blocklist (`DomainSet`).** Names are stored as a sorted array of FNV-1a 64-bit hashes of
+the lowercased name in a binary file: magic `TGDS`, format version, entry counts, checksum,
+then block hashes, allow hashes and important hashes. The extension mmaps it and
+binary-searches the host and each parent label. Order of evaluation: important block, then
+allow, then block. The parser accepts `||name^`, `||name`, `.name^`, `@@||name^`, `$important`
+and `$badfilter` rules and hosts-format lines. It skips regex, wildcard and prefix rules, and
+drops redundant children of blocked parents. The false positive rate is about 5e-14 per lookup.
+
+**dns.**
+- Only UDP port 53 addressed to `198.18.0.1` or `fd00:7467::1` is handled. Everything else is
+  dropped and counted; undecodable queries of at least 12 bytes get FORMERR.
+- The cache stores upstream wire bytes plus the offsets of each TTL (about 0.5 MiB for 2,000
+  entries) and patches id, question case and TTLs on a hit.
+- The cache clock is a continuous clock that keeps counting while the device sleeps
+  (`CLOCK_MONOTONIC` on Apple platforms, `CLOCK_BOOTTIME` on Linux). `Instant` stops during
+  sleep on iOS.
+- DoH: one shared HTTP/2 connection per upstream; each query runs in its own task on that
+  connection. An attempt has a 2 s deadline on a cold connection and 1.5 s on a warm one. A
+  closed connection is retried once, then the next upstream is tried, then the answer is
+  SERVFAIL. At most 128 queries are in flight.
+- Responses are normalized to the requester: OPT is echoed only if the query had one, and
+  answers larger than the requester's UDP size are truncated with TC set.
+
+**mitm.**
+- Built directly on hyper, hyper-util, tokio-rustls, rustls (ring provider only) and rcgen, not
+  `hudsucker`. hudsucker always compiles aws-lc-sys, hides client TLS failures, and would need
+  its certificate authority replaced anyway.
+- After `CONNECT`, the first bytes are peeked through a rewindable reader. Non-TLS traffic is
+  tunneled with the peeked bytes replayed. For TLS, the host is classified from the `CONNECT`
+  target and again from the SNI; either one saying passthrough tunnels the connection with
+  the ClientHello replayed.
+- Flow control limits are mandatory: HTTP/2 stream window 128 KiB, connection window 256 KiB,
+  server send buffer 128 KiB, HTTP/1 read buffer 128 KiB.
+- At most 32 intercepted client connections (about 0.35 MiB each) instead of 64; above the cap,
+  or when less than 8 MiB of memory is available, new connections pass through. Upstream
+  connections are pooled per host and shared across client connections: at most 6 HTTP/1.1
+  connections per host and 64 upstream connections in total.
+- Timeouts: 10 s for the first bytes and for the TLS handshake, 30 s to read request headers,
+  HTTP/2 keep-alive pings, and idle connections are closed after 60 s without requests.
+- WebSockets over intercepted HTTPS are forwarded over a dedicated HTTP/1.1 upstream
+  connection.
+- HTTP/2 requests whose authority does not match the connection's SNI get `421 Misdirected
+  Request`.
+- The CA certificate and key are stored as PEM; leaves are issued from the stored certificate
+  (rcgen `x509-parser` feature), never from regenerated parameters.
+- Pin learning: only client TLS alerts that reject our certificate (`unknown_ca`,
+  `bad_certificate`, `certificate_unknown`, `decrypt_error`) count, two within 10 minutes.
+  Connections that finish the handshake and close without a request are counted as a
+  statistic only, until E4 shows how iOS clients actually fail.
+
+**ffi.**
+- Foreign traits use `#[uniffi::export(foreign)]`: `CoreLogger` (not `Logger`, which would
+  shadow `os.Logger` in Swift) and `PacketSink`.
+- `Engine.start(sink: PacketSink) -> UInt16`. `handle_packets` stays synchronous: it returns
+  answers it can produce immediately (blocked names, cache hits, type 65 and 64, SERVFAIL when
+  stopped) and queues the rest; forwarded answers arrive through `PacketSink.writePackets`.
+- Every exported function on the tunnel path returns `Result` and catches panics, so a Rust
+  bug becomes a Swift error instead of killing the extension. Poisoned locks are recovered.
+- Swift derives each packet's protocol family from the IP version nibble when writing packets.
+- `stopTunnel` always calls `engine.stop()`. The Swift `PacketSink` captures only the
+  `NEPacketTunnelFlow`, never the provider, so there is no reference cycle.
+- uniffi default features are off in the runtime crate; `cargo-metadata` is enabled only in
+  the bindgen tool.
+
+**CI.** A job checks the workspace with Rust 1.94, the declared minimum version.
+
+### Revised memory budget (extension)
+
+| Component | Budget |
+|---|---|
+| adblock engine | 8 MiB |
+| DNS blocklist (mmapped, clean pages) | 2 MiB |
+| DNS cache and DoH | 1 MiB |
+| intercepted connections (32 x 0.35 MiB) | 11 MiB |
+| runtime, TLS configuration, leaf cache, misc | 3 MiB |
+| total for Rust | about 25 MiB, leaving room for the Swift runtime and system frameworks |
+
+## M1 crate contracts
+
+These signatures are the interface between the M1 plans. A plan may add private items and
+extra public helpers, but must not change these.
+
+```rust
+// ---------- tollgate-common ----------
+pub mod clock {
+    /// Seconds from a clock that keeps counting while the device sleeps.
+    pub fn now_secs() -> u64;
+}
+pub mod tls {
+    /// rustls client configuration with the ring provider and webpki roots.
+    pub fn client_config(alpn: &[&[u8]]) -> std::sync::Arc<rustls::ClientConfig>;
+}
+pub mod stats {
+    /// Lock-free counters shared by dns, mitm and ffi.
+    #[derive(Default, Debug)]
+    pub struct Stats {
+        pub dns_queries: AtomicU64, pub dns_blocked: AtomicU64, pub dns_cache_hits: AtomicU64,
+        pub dns_forwarded: AtomicU64, pub dns_failed: AtomicU64, pub packets_dropped: AtomicU64,
+        pub http_requests: AtomicU64, pub http_blocked: AtomicU64,
+        pub connections_intercepted: AtomicU64, pub connections_passthrough: AtomicU64,
+        pub tls_client_rejections: AtomicU64, pub tls_abandoned_after_handshake: AtomicU64,
+    }
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct StatsSnapshot { /* same fields as u64 */ }
+    impl Stats { pub fn snapshot(&self) -> StatsSnapshot; }
+}
+// Logging goes through the `log` crate facade; ffi installs a `log::Log` that forwards to
+// the Swift CoreLogger, devproxy installs env_logger.
+
+// ---------- tollgate-policy ----------
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DohUpstream { pub ip: std::net::IpAddr, pub port: u16, pub tls_name: String, pub path: String }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub doh_upstreams: Vec<DohUpstream>,     // default: Cloudflare 1.1.1.1, Quad9 9.9.9.9
+    pub passthrough: Vec<String>,            // user host patterns
+    pub mitm_enabled: bool,                  // default true
+    pub max_intercepted_connections: u32,    // default 32
+}
+impl Default for Config;
+impl Config { pub fn from_json(s: &str) -> Result<Config, PolicyError>; pub fn to_json(&self) -> String; }
+pub struct HostPattern; // "example.com" (exact) or "*.example.com" (the domain and all subdomains)
+impl HostPattern { pub fn parse(s: &str) -> Result<HostPattern, PolicyError>; pub fn matches(&self, host: &str) -> bool; }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision { Intercept, Passthrough(PassthroughReason) }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassthroughReason { MitmDisabled, User, Bundled, LearnedPin, NotTls, Capacity, LowMemory }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectionKind { UnknownCa, BadCertificate, CertificateUnknown, DecryptError }
+pub struct Policy; // Send + Sync, interior mutability
+impl Policy {
+    pub fn new(config: &Config, learned_pins_json: Option<&str>) -> Result<Policy, PolicyError>;
+    pub fn classify(&self, host: &str, now: u64) -> Decision;
+    /// Returns true when this rejection made the host a learned pin.
+    pub fn record_client_rejection(&self, host: &str, kind: RejectionKind, now: u64) -> bool;
+    pub fn learned_pins_json(&self) -> String;
+}
+pub fn bundled_passthrough() -> &'static [&'static str]; // compiled-in patterns
+
+// ---------- tollgate-filter ----------
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListFormat { Adblock, Hosts }
+pub struct ListSource<'a> { pub name: &'a str, pub text: &'a str, pub format: ListFormat }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict { Allow, Block { rule: Option<String> } }
+pub struct FilterEngine; // Send + Sync
+impl FilterEngine {
+    pub fn from_lists(lists: &[ListSource], debug: bool) -> FilterEngine;
+    pub fn serialize(&self) -> Vec<u8>;
+    pub fn load(path: &std::path::Path) -> Result<FilterEngine, FilterError>; // mmap
+    pub fn check(&self, url: &str, source_url: &str, request_type: &str) -> Verdict;
+}
+/// Maps Sec-Fetch-Dest, then Accept, then path extension to an adblock request type string.
+pub fn request_type(sec_fetch_dest: Option<&str>, accept: Option<&str>, path: &str) -> &'static str;
+pub struct DomainSet; // Send + Sync, mmapped
+impl DomainSet {
+    pub fn build(lists: &[ListSource]) -> Vec<u8>;                 // file bytes
+    pub fn load(path: &std::path::Path) -> Result<DomainSet, FilterError>;
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<DomainSet, FilterError>; // tests, devproxy
+    pub fn is_blocked(&self, host: &str) -> bool;
+    pub fn len(&self) -> usize;
+}
+pub const ENGINE_FILE: &str = "engine.dat";
+pub const DOMAINS_FILE: &str = "domains.bin";
+#[derive(Clone, Debug)]
+pub struct CompileReport { pub network_rules: u64, pub domain_entries: u64, pub engine_bytes: u64, pub domains_bytes: u64 }
+/// Writes ENGINE_FILE and DOMAINS_FILE atomically into dir.
+pub fn compile(lists: &[ListSource], dir: &std::path::Path) -> Result<CompileReport, FilterError>;
+
+// ---------- tollgate-dns ----------
+pub const TUNNEL_DNS_V4: std::net::Ipv4Addr; // 198.18.0.1
+pub const TUNNEL_DNS_V6: std::net::Ipv6Addr; // fd00:7467::1
+pub struct DnsHandler; // Send + Sync
+pub enum Outcome { Reply(Vec<u8>), Forward(ForwardJob), Drop }
+pub struct ForwardJob; // opaque: query wire bytes plus what is needed to build the reply packet
+impl DnsHandler {
+    pub fn new(blocklist: Option<std::sync::Arc<tollgate_filter::DomainSet>>, stats: std::sync::Arc<tollgate_common::stats::Stats>) -> DnsHandler;
+    pub fn set_blocklist(&self, blocklist: Option<std::sync::Arc<tollgate_filter::DomainSet>>);
+    /// Never blocks or awaits.
+    pub fn handle_packet(&self, packet: &[u8], now: u64) -> Outcome;
+    /// Builds the reply packet for a forwarded query; caches successful answers.
+    pub fn complete(&self, job: ForwardJob, answer: Result<Vec<u8>, DohError>, now: u64) -> Vec<u8>;
+}
+pub struct DohResolver; // Clone, used on one tokio runtime
+impl DohResolver {
+    pub fn new(upstreams: Vec<tollgate_policy::DohUpstream>) -> DohResolver;
+    pub async fn resolve(&self, query: &[u8]) -> Result<Vec<u8>, DohError>;
+}
+impl ForwardJob { pub fn query(&self) -> &[u8]; }
+
+// ---------- tollgate-mitm ----------
+pub struct CertAuthority; // Send + Sync
+impl CertAuthority {
+    pub fn generate(common_name: &str) -> Result<CertAuthority, MitmError>;
+    pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<CertAuthority, MitmError>;
+    pub fn cert_pem(&self) -> String;
+    pub fn key_pem(&self) -> String;
+    pub fn cert_der(&self) -> Vec<u8>;
+    /// iOS configuration profile containing only the root certificate.
+    pub fn mobileconfig(&self, display_name: &str, identifier: &str) -> Vec<u8>;
+}
+pub struct ProxyContext {
+    pub policy: std::sync::Arc<tollgate_policy::Policy>,
+    pub filter: arc_swap::ArcSwapOption<tollgate_filter::FilterEngine>,
+    pub ca: std::sync::Arc<CertAuthority>,
+    pub stats: std::sync::Arc<tollgate_common::stats::Stats>,
+    pub max_intercepted: usize,
+    /// Returns available memory in bytes; `None` where unknown (Linux dev runs).
+    pub available_memory: fn() -> Option<u64>,
+}
+/// Serves until `shutdown` resolves. Must be spawned on a current-thread tokio runtime.
+pub async fn serve(listener: tokio::net::TcpListener, ctx: std::sync::Arc<ProxyContext>,
+                   shutdown: impl std::future::Future<Output = ()>);
+
+// ---------- tollgate-ffi (Swift-facing) ----------
+// #[uniffi::export(foreign)] trait CoreLogger: Send + Sync { fn log(&self, level: LogLevel, target: String, message: String); }
+// #[uniffi::export(foreign)] trait PacketSink: Send + Sync { fn write_packets(&self, packets: Vec<Vec<u8>>); }
+// #[derive(uniffi::Object)] struct Engine;
+//   #[uniffi::constructor] fn new(config_json: String, data_dir: String) -> Result<Arc<Engine>, TollgateError>
+//   fn start(&self, sink: Arc<dyn PacketSink>) -> Result<u16, TollgateError>
+//   fn stop(&self)
+//   fn handle_packets(&self, packets: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, TollgateError>
+//   fn reload_lists(&self) -> Result<(), TollgateError>
+//   fn stats(&self) -> Stats            (uniffi::Record mirroring StatsSnapshot)
+//   fn learned_pins_json(&self) -> String
+// free functions: set_logger(Arc<dyn CoreLogger>, LogLevel), generate_ca(data_dir) -> Result<CaInfo>,
+//   ca_mobileconfig(data_dir) -> Result<Vec<u8>>, compile_lists(sources: Vec<ListInput>, data_dir) -> Result<CompileReport>
+```
