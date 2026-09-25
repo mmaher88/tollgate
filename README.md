@@ -33,9 +33,16 @@ Status: M0, build pipeline and a first-light tunnel. See the
 3. With the iPhone connected over USB:
 
    ```bash
-   export ASC_KEY_ID=... ASC_ISSUER_ID=... ASC_KEY_PATH=~/.config/tollgate/AuthKey_XXXX.p8
+   cat > ~/.config/tollgate/asc.env <<EOF
+   ASC_KEY_ID="XXXX"
+   ASC_ISSUER_ID="your-issuer-id"
+   ASC_KEY_PATH="~/.config/tollgate/AuthKey_XXXX.p8"
+   EOF
    tooling/asc/provision.py setup
    ```
+
+   The tool reads `~/.config/tollgate/asc.env` for any of the three variables not set in the
+   environment.
 
    This registers the phone, creates both App IDs with the Network Extensions and App Groups
    capabilities, creates an Apple Development certificate and the development profiles.
