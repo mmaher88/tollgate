@@ -9,8 +9,11 @@ web views and third-party apps.
 It is not distributed through the App Store. It is built and signed by GitHub Actions with
 the owner's Apple Developer account and installed from a Linux workstation.
 
-Status: M1, the Rust core (DNS blocking, the HTTPS filtering proxy and the Swift-facing
-engine), tested on Linux; the tunnel still runs the M0 first-light code. See the
+Status: M2, the first testable app. The tunnel runs the Rust core (DNS blocking with DNS
+over HTTPS, and HTTPS filtering through a local proxy once the certificate is trusted); the
+app downloads and compiles the filter lists, installs the certificate and shows activity.
+The core is verified on Linux with `devproxy`; the on-device checks are in
+[docs/experiments/m2.md](docs/experiments/m2.md). See the
 [design](docs/superpowers/specs/2026-09-24-tollgate-design.md) and the
 [feasibility research](docs/research/2026-09-23-feasibility-brief.md).
 
@@ -65,6 +68,13 @@ tooling/scripts/logs.sh tunnel    # stream the extension's logs
 
 The first install of a development-signed app asks for Developer Mode on the phone
 (Settings, Privacy & Security, Developer Mode), followed by a reboot.
+
+In the app: tap Turn on (allow the VPN configuration), let the filter lists download, then
+follow the Setup steps to install and trust the certificate before switching on HTTPS
+filtering. `tooling/scripts/logs.sh` streams the app, the tunnel and the Rust core together.
+
+To try the core on Linux without a phone, run `devproxy` (see
+[docs/experiments/m1-devproxy.md](docs/experiments/m1-devproxy.md)).
 
 ## License
 
