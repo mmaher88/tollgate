@@ -10,6 +10,7 @@ mod wire;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+pub use answer::{BLOCK_TTL, MAX_UDP_PAYLOAD};
 pub use handler::{DnsHandler, ForwardJob, Outcome};
 
 /// The tunnel's IPv4 DNS server address.

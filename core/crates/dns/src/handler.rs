@@ -8,10 +8,13 @@ use hickory_proto::op::{Message, OpCode};
 use tollgate_common::stats::Stats;
 use tollgate_filter::DomainSet;
 
-use crate::answer::{self, FORMERR, NOTIMP};
+use crate::answer::{self, FORMERR, NOERROR, NOTIMP, Requester};
 use crate::packet::{build_udp, parse_udp};
 use crate::wire::{self, HEADER_LEN};
 use crate::{TUNNEL_DNS_V4, TUNNEL_DNS_V6};
+
+const TYPE_SVCB: u16 = 64;
+const TYPE_HTTPS: u16 = 65;
 
 /// What to do with one packet from the tunnel.
 #[derive(Debug)]
@@ -70,6 +73,13 @@ impl DnsHandler {
         self.blocklist.store(blocklist);
     }
 
+    fn is_blocked(&self, name: &str) -> bool {
+        self.blocklist
+            .load()
+            .as_ref()
+            .is_some_and(|set| set.is_blocked(name))
+    }
+
     /// Handles one raw IP packet from the tunnel. `now` is
     /// [`tollgate_common::clock::now_secs`]. Never blocks or awaits.
     pub fn handle_packet(&self, packet: &[u8], _now: u64) -> Outcome {
@@ -95,8 +105,18 @@ impl DnsHandler {
         if message.metadata.op_code != OpCode::Query {
             return reply(answer::header_only(query, NOTIMP));
         }
-        if wire::question_end(query).is_none() {
+        let Some(question_end) = wire::question_end(query) else {
             return reply(answer::header_only(query, FORMERR));
+        };
+        let requester = Requester::from_query(query, &message, question_end);
+        let question = &message.queries[0];
+
+        if matches!(u16::from(question.query_type()), TYPE_SVCB | TYPE_HTTPS) {
+            return reply(requester.empty(NOERROR));
+        }
+        if self.is_blocked(&question.name().to_ascii()) {
+            Stats::inc(&self.stats.dns_blocked);
+            return reply(requester.blocked());
         }
         Stats::inc(&self.stats.dns_forwarded);
         Outcome::Forward(ForwardJob {
