@@ -14,6 +14,7 @@ crate-type = ["lib", "staticlib"]
 log = { workspace = true }
 ring = { workspace = true }
 thiserror = { workspace = true }
+tollgate-filter = { workspace = true }
 tollgate-mitm = { workspace = true }
 uniffi = { workspace = true }
 

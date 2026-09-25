@@ -9,6 +9,7 @@ uniffi::setup_scaffolding!();
 
 mod ca;
 mod error;
+mod lists;
 mod logging;
 
 pub use ca::{
@@ -16,6 +17,7 @@ pub use ca::{
     ca_mobileconfig, generate_ca, load_ca,
 };
 pub use error::{TollgateError, catch_panic, panic_message};
+pub use lists::{CompileReport, ListFormat, ListInput, ListTarget, compile_lists};
 pub use logging::{CoreLogger, LogLevel, set_logger};
 
 /// Version of the Rust core, shown in the app and logged by the tunnel.
