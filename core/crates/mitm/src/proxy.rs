@@ -17,6 +17,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::server::{ServerSessionMemoryCache, StoresServerSessions};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use tollgate_common::events::EventLog;
 use tollgate_common::stats::Stats;
 use tollgate_filter::FilterEngine;
 use tollgate_policy::Policy;
@@ -42,6 +43,8 @@ pub struct ProxyContext {
     pub max_intercepted: usize,
     /// Returns available memory in bytes; `None` where unknown (Linux dev runs).
     pub available_memory: fn() -> Option<u64>,
+    /// Where blocked requests are recorded; `None` records nothing.
+    pub events: Option<Arc<EventLog>>,
 }
 
 /// Shared by every task of one `serve` call.

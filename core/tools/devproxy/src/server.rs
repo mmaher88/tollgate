@@ -136,6 +136,7 @@ impl DevProxy {
             stats: stats.clone(),
             max_intercepted: config.max_intercepted_connections as usize,
             available_memory: || None,
+            events: None,
         });
         let dns = Arc::new(DnsHandler::new(domains.map(Arc::new), stats));
         let dns_socket = bind_udp(args.dns).map_err(text(format!("DNS listener {}", args.dns)))?;

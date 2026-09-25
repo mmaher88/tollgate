@@ -278,6 +278,7 @@ impl Engine {
             stats: stats.clone(),
             max_intercepted: config.max_intercepted_connections as usize,
             available_memory,
+            events: None,
         });
         let dns = Arc::new(DnsHandler::new(domains, stats.clone()));
         let pins = Arc::new(PinsFile::new(

@@ -32,7 +32,7 @@ impl TestProxy {
 }
 
 /// A context with a fresh policy for `config`, and a filter engine when `rules` is given.
-/// Memory is unknown and 32 connections may be intercepted.
+/// Memory is unknown, 32 connections may be intercepted and no events are recorded.
 pub fn context(ca: Arc<CertAuthority>, config: &Config, rules: Option<&str>) -> ProxyContext {
     let filter = rules.map(|text| {
         let list = ListSource {
@@ -49,6 +49,7 @@ pub fn context(ca: Arc<CertAuthority>, config: &Config, rules: Option<&str>) -> 
         stats: Arc::new(Stats::default()),
         max_intercepted: config.max_intercepted_connections as usize,
         available_memory: || None,
+        events: None,
     }
 }
 
