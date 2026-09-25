@@ -41,6 +41,7 @@ jobs:
       - name: Generate Xcode project
         run: |
           brew install xcodegen
+          xcodegen --version
           cd ios && xcodegen generate
 
       - name: Detect signing secrets
@@ -54,7 +55,9 @@ jobs:
         if: steps.signing.outputs.enabled != 'true'
         run: |
           xcodebuild -project ios/Tollgate.xcodeproj -scheme Tollgate -configuration Release \
-            -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
+            -destination 'generic/platform=iOS' -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO build
+          tooling/ci/check-app-icon.sh build/DerivedData/Build/Products/Release-iphoneos/Tollgate.app
 
       - name: Install signing certificate and profiles
         if: steps.signing.outputs.enabled == 'true'
@@ -73,6 +76,7 @@ jobs:
           xcodebuild -project ios/Tollgate.xcodeproj -scheme Tollgate -configuration Release \
             -destination 'generic/platform=iOS' -archivePath build/Tollgate.xcarchive \
             DEVELOPMENT_TEAM="$TEAM_ID" OTHER_CODE_SIGN_FLAGS="--keychain $SIGNING_KEYCHAIN" archive
+          tooling/ci/check-app-icon.sh build/Tollgate.xcarchive/Products/Applications/Tollgate.app
 
       - name: Export .ipa
         if: steps.signing.outputs.enabled == 'true'
