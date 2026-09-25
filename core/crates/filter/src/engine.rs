@@ -80,7 +80,9 @@ impl FilterEngine {
     /// `request_type` is an adblock type string, see [`crate::request_type`]. A URL the
     /// engine cannot parse is allowed: filtering fails open.
     pub fn check(&self, url: &str, source_url: &str, request_type: &str) -> Verdict {
-        let request = match Request::new(url, source_url, request_type, "GET") {
+        let url = lowercase_authority(url);
+        let source_url = lowercase_authority(source_url);
+        let request = match Request::new(&url, &source_url, request_type, "GET") {
             Ok(request) => request,
             Err(e) => {
                 log::debug!("not filtering unparseable request {url:?}: {e:?}");
@@ -124,4 +126,23 @@ pub fn network_rule_count(lists: &[ListSource]) -> u64 {
                 .count() as u64
         })
         .sum()
+}
+
+/// Lowercases the scheme and authority of `url`, leaving the path untouched. adblock matches
+/// hosts as given, and apps with their own HTTP stack can send uppercase hosts that would
+/// otherwise slip past `||host^` rules.
+fn lowercase_authority(url: &str) -> std::borrow::Cow<'_, str> {
+    let Some(scheme_end) = url.find("://") else {
+        return std::borrow::Cow::Borrowed(url);
+    };
+    let start = scheme_end + 3;
+    let end = url[start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| start + i);
+    if !url[..end].bytes().any(|b| b.is_ascii_uppercase()) {
+        return std::borrow::Cow::Borrowed(url);
+    }
+    let mut lowered = url[..end].to_ascii_lowercase();
+    lowered.push_str(&url[end..]);
+    std::borrow::Cow::Owned(lowered)
 }

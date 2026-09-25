@@ -318,3 +318,34 @@ fn engine_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<FilterEngine>();
 }
+
+#[test]
+fn hosts_match_case_insensitively() {
+    let e = engine("||ads.tollgate.test^\n||tracker.test^$third-party");
+    assert!(blocked(
+        &e,
+        "http://ADS.Tollgate.Test/banner.js",
+        "https://news.example/",
+        "script"
+    ));
+    assert!(blocked(&e, "https://Ads.tollgate.test:8443/x", "", "image"));
+    assert!(!blocked(
+        &e,
+        "https://example.com/ADS.tollgate.test/",
+        "",
+        "image"
+    ));
+    // The page host is compared case-insensitively too: $third-party depends on it.
+    assert!(!blocked(
+        &e,
+        "https://tracker.test/x.js",
+        "https://TRACKER.Test/page",
+        "script"
+    ));
+    assert!(blocked(
+        &e,
+        "https://Tracker.test/x.js",
+        "https://News.Example/",
+        "script"
+    ));
+}
