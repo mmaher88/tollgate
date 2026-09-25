@@ -3,3 +3,4 @@
 //! tunnel.
 
 pub mod args;
+pub mod fetch;
