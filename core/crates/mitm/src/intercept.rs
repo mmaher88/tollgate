@@ -1,16 +1,20 @@
 //! Terminating TLS for an intercepted connection and serving its HTTP requests.
 
+use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use rustls::ServerConfig;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use rustls::{AlertDescription, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_rustls::TlsAcceptor;
+use tollgate_common::clock::unix_secs;
 use tollgate_common::stats::Stats;
+use tollgate_policy::RejectionKind;
 
 use crate::http::{authority, bare_host};
 use crate::idle::{self, Activity};
@@ -21,7 +25,7 @@ use crate::upstream::Target;
 /// The site an intercepted connection talks to.
 pub(crate) struct Origin {
     /// The SNI, or the `CONNECT` host when the client sent none. Used for the leaf, the
-    /// URL and the upstream TLS name.
+    /// URL, the upstream TLS name and pin learning.
     pub(crate) name: String,
     /// The `CONNECT` host, which is dialed.
     pub(crate) host: String,
@@ -88,26 +92,74 @@ pub(crate) async fn intercept<C>(
         tokio::time::timeout(state.options.handshake_timeout, acceptor.accept(client)).await;
     let tls = match handshake {
         Err(_) => return log::debug!("TLS handshake for {} timed out", origin.name),
-        Ok(Err(e)) => return log::debug!("TLS handshake for {} failed: {e}", origin.name),
+        Ok(Err(e)) => return report_handshake_failure(&state, &origin.name, &e),
         Ok(Ok(tls)) => tls,
     };
 
     let activity = Activity::new();
+    let requests = Arc::new(AtomicU64::new(0));
     let origin = Arc::new(origin);
     let service = {
         let state = state.clone();
         let origin = origin.clone();
         let activity = activity.clone();
-        service_fn(move |req| request::handle(state.clone(), origin.clone(), activity.start(), req))
+        let requests = requests.clone();
+        service_fn(move |req| {
+            requests.fetch_add(1, Ordering::Relaxed);
+            request::handle(state.clone(), origin.clone(), activity.start(), req)
+        })
     };
     let conn = state
         .server
         .serve_connection_with_upgrades(TokioIo::new(tls), service);
-    let (result, _) = idle::serve(conn, &activity, state.options.idle_timeout, |conn| {
+    let (result, closed_idle) = idle::serve(conn, &activity, state.options.idle_timeout, |conn| {
         conn.graceful_shutdown()
     })
     .await;
+    if requests.load(Ordering::Relaxed) == 0 && !closed_idle {
+        // A statistic only, until E4 shows how iOS clients fail: trusted clients that
+        // preconnect and never use the connection look the same.
+        Stats::inc(&state.ctx.stats.tls_abandoned_after_handshake);
+        log::debug!(
+            "{} closed after the handshake without a request",
+            origin.name
+        );
+    }
     if let Err(e) = result {
         log::debug!("intercepted connection to {}: {e}", origin.name);
+    }
+}
+
+/// Only alerts that reject our certificate feed pin learning. Anything else (no shared
+/// cipher suite, a reset, garbage) is our problem or noise, and is only logged.
+fn report_handshake_failure(state: &State, name: &str, error: &io::Error) {
+    let Some(kind) = rejection_kind(error) else {
+        return log::debug!("TLS handshake for {name} failed: {error}");
+    };
+    Stats::inc(&state.ctx.stats.tls_client_rejections);
+    if state
+        .ctx
+        .policy
+        .record_client_rejection(name, kind, unix_secs())
+    {
+        log::info!("{name} rejects our certificate; passing it through from now on");
+    } else {
+        log::debug!("client rejected our certificate for {name}: {kind:?}");
+    }
+}
+
+fn rejection_kind(error: &io::Error) -> Option<RejectionKind> {
+    match error.get_ref()?.downcast_ref::<rustls::Error>()? {
+        rustls::Error::AlertReceived(AlertDescription::UnknownCA) => Some(RejectionKind::UnknownCa),
+        rustls::Error::AlertReceived(AlertDescription::BadCertificate) => {
+            Some(RejectionKind::BadCertificate)
+        }
+        rustls::Error::AlertReceived(AlertDescription::CertificateUnknown) => {
+            Some(RejectionKind::CertificateUnknown)
+        }
+        rustls::Error::AlertReceived(AlertDescription::DecryptError) => {
+            Some(RejectionKind::DecryptError)
+        }
+        _ => None,
     }
 }
