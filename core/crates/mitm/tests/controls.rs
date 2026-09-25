@@ -201,3 +201,19 @@ async fn intercepted_requests_are_recorded_and_allowlisted_by_host() {
         proxy.stop().await;
     }
 }
+
+#[tokio::test]
+async fn recorded_request_hosts_are_lowercase() {
+    let (proxy, events) = start(&[]).await;
+    // Blocked by the path rule before any upstream is contacted, so the name need not
+    // resolve.
+    let url = "http://ADS.Tollgate.Test./ads/banner.js";
+
+    let reply = proxy_get(proxy.addr, url, &[("referer", "https://News.Test./a")]).await;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let recorded = events.recent(10);
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].host, "ads.tollgate.test");
+    assert_eq!(recorded[0].source_host.as_deref(), Some("news.test"));
+}
