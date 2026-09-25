@@ -529,3 +529,87 @@ pub async fn serve(listener: tokio::net::TcpListener, ctx: std::sync::Arc<ProxyC
 // free functions: set_logger(Arc<dyn CoreLogger>, LogLevel), generate_ca(data_dir) -> Result<CaInfo>,
 //   ca_mobileconfig(data_dir) -> Result<Vec<u8>>, compile_lists(sources: Vec<ListInput>, data_dir) -> Result<CompileReport>
 ```
+
+## M3: user controls (2026-09-25)
+
+Adds the blocked log, the allowlist, the passthrough editor, learned pin management, custom
+lists and rules, and automatic list updates. Where this section disagrees with earlier
+sections, this section wins.
+
+### Behavior
+
+- **Blocked log.** The tunnel keeps the last 500 block events in memory: DNS blocks (the
+  queried name) and request blocks (host, URL truncated to 512 bytes, and the page's host).
+  The app polls them while the Activity screen is visible. Nothing is written to disk.
+- **Allowlist.** Host patterns (same syntax as passthrough) where Tollgate blocks nothing:
+  DNS names matching a pattern are resolved normally, and a request is allowed when either
+  its own host or its page's host matches. From the log, "Allow" adds `*.host`.
+- **Passthrough editor.** The user edits `Config.passthrough`; entries are validated with the
+  core's own pattern parser before they are saved.
+- **Learned pins.** The app lists learned pins and can forget them. While the tunnel runs it
+  asks the tunnel (the engine owns the pins and saves them periodically); while it is off
+  the app edits `learned-pins.json` through the core.
+- **Custom lists and rules.** The default lists can be switched off individually; the user
+  can add list URLs of three kinds (request rules, DNS rules in adblock syntax, hosts files)
+  and type their own rules, which go into both the request engine and the DNS blocklist.
+  Settings live in the App Group as `lists.json`, owned by the app.
+- **Automatic updates.** A background app refresh task (`dev.tollgate.lists-refresh`) runs
+  about daily; the app also updates on launch and on returning to the foreground when the
+  lists are more than 24 hours old. After an update the tunnel reloads the lists.
+- Config changes (allowlist, passthrough) are saved to `config.json` and applied by
+  restarting the tunnel.
+
+### Contracts
+
+```rust
+// ---------- tollgate-common::events ----------
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventKind { Dns, Request }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockEvent { pub unix_secs: u64, pub kind: EventKind, pub host: String,
+                        pub url: Option<String>, pub source_host: Option<String> }
+pub struct EventLog; // Send + Sync, bounded ring buffer
+impl EventLog {
+    pub const CAPACITY: usize = 500;
+    pub const MAX_URL_BYTES: usize = 512;
+    pub fn new() -> EventLog;
+    pub fn record(&self, event: BlockEvent);           // truncates url, drops oldest
+    pub fn recent(&self, limit: usize) -> Vec<BlockEvent>; // newest first
+    pub fn clear(&self);
+}
+
+// ---------- tollgate-policy ----------
+// Config gains `pub allowlist: Vec<String>` (serde default: empty).
+impl Policy {
+    pub fn is_allowlisted(&self, host: &str) -> bool;
+    /// Forgets learned pins (and pending rejections) for these hosts; returns how many pins.
+    pub fn forget_pins(&self, hosts: &[String]) -> usize;
+    /// (host, learned_at unix seconds), sorted by host.
+    pub fn learned_pins(&self) -> Vec<(String, u64)>;
+}
+
+// ---------- tollgate-dns ----------
+impl DnsHandler {
+    pub fn set_allowlist(&self, patterns: Vec<tollgate_policy::HostPattern>);
+    pub fn set_events(&self, events: Option<std::sync::Arc<tollgate_common::events::EventLog>>);
+}
+
+// ---------- tollgate-mitm ----------
+// ProxyContext gains `pub events: Option<Arc<EventLog>>`. Requests are allowed when
+// ctx.policy.is_allowlisted(request host) or is_allowlisted(page host); blocks are recorded.
+
+// ---------- tollgate-ffi (Swift-facing) ----------
+// #[derive(uniffi::Enum)] enum EventKind { Dns, Request }
+// #[derive(uniffi::Record)] struct BlockEvent { unix_secs: u64, kind: EventKind, host: String,
+//                                               url: Option<String>, source_host: Option<String> }
+// #[derive(uniffi::Record)] struct LearnedPin { host: String, learned_at: u64 }
+// impl Engine {
+//   fn recent_events(&self, limit: u32) -> Vec<BlockEvent>
+//   fn clear_events(&self)
+//   fn learned_pins(&self) -> Vec<LearnedPin>
+//   fn forget_pins(&self, hosts: Vec<String>) -> u32
+// }
+// free: validate_host_pattern(pattern: String) -> Result<(), TollgateError>
+//       stored_learned_pins(data_dir: String) -> Result<Vec<LearnedPin>, TollgateError>
+//       forget_stored_pins(data_dir: String, hosts: Vec<String>) -> Result<u32, TollgateError>
+```
