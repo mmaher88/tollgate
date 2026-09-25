@@ -10,7 +10,12 @@ import os
 /// which filters requests and passes pinned and Apple hosts through untouched.
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let log = Logger(subsystem: "dev.tollgate.tunnel", category: "provider")
-    private var engine: Engine?
+    /// Read from the packet-flow callback queue and written from the provider queue.
+    private let engineState = OSAllocatedUnfairLock<Engine?>(initialState: nil)
+    /// Ends the packet read loop when the tunnel stops.
+    private let reading = OSAllocatedUnfairLock(initialState: false)
+
+    private var engine: Engine? { engineState.withLock { $0 } }
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         setLogger(logger: OSLogCoreLogger(subsystem: "dev.tollgate.core"), maxLevel: .info)
@@ -20,49 +25,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler(TunnelError.appGroupUnavailable)
             return
         }
-
-        let engine: Engine
-        let port: UInt16
-        do {
-            engine = try Engine(configJson: CoreConfig.json(), dataDir: directory.path)
-            port = try engine.start(sink: FlowSink(flow: packetFlow))
-        } catch {
-            log.error("engine start failed: \(String(describing: error), privacy: .public)")
-            completionHandler(error)
+        guard Self.protectedDataReadable(in: directory) else {
+            // Started by on-demand after a reboot, before the first unlock: the shared files
+            // cannot be read yet. Bring the tunnel up without redirecting DNS and start the
+            // core once they can, so it never runs without its lists, CA and learned pins.
+            log.info("protected data unavailable, waiting for first unlock")
+            setTunnelNetworkSettings(NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")) { error in
+                completionHandler(error)
+            }
+            waitForProtectedData(in: directory)
             return
         }
-        self.engine = engine
-
-        let filtering = engine.mitmActive()
-        let version = coreVersion()
-        let available = os_proc_available_memory()
-        log.info("startTunnel core=\(version, privacy: .public) proxy=\(port, privacy: .public) https_filtering=\(filtering, privacy: .public) available=\(available, privacy: .public)")
-        try? TunnelHeartbeat(
-            startedAt: Date(), coreVersion: version,
-            sha256Probe: sha256Hex(data: Data("tollgate".utf8)), availableMemoryBytes: available
-        ).write()
-
-        setTunnelNetworkSettings(Self.networkSettings(proxyPort: filtering ? port : nil)) { [weak self] error in
-            guard let self else { return }
-            if let error {
-                self.log.error("setTunnelNetworkSettings failed: \(error.localizedDescription, privacy: .public)")
-                self.engine?.stop()
-                self.engine = nil
-                completionHandler(error)
-                return
-            }
-            self.log.info("tunnel up")
-            self.readPackets()
-            completionHandler(nil)
-        }
+        startCore(in: directory, completionHandler: completionHandler)
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         log.info("stopTunnel reason=\(reason.rawValue, privacy: .public)")
         // Always stop explicitly: the runtime thread holds the packet sink, so relying on
         // deinit would leave the core running.
-        engine?.stop()
-        engine = nil
+        takeAndStopEngine()
         completionHandler()
     }
 
@@ -91,22 +72,108 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    // MARK: - Core lifecycle
+
+    /// Creates and starts the engine, then applies the full network settings. Also used
+    /// after the first unlock on a tunnel that is already up with minimal settings.
+    private func startCore(in directory: URL, completionHandler: @escaping (Error?) -> Void) {
+        var config = CoreConfig.load()
+        if config.mitmEnabled, !RootTrust.isTrustedForTLS(coreDirectory: directory) {
+            // Trust was never granted or was removed in Settings: intercepting now would
+            // break every HTTPS site, so run DNS blocking only.
+            log.warning("HTTPS filtering is on but the certificate is not trusted; DNS only")
+            config.mitmEnabled = false
+        }
+
+        let engine: Engine
+        let port: UInt16
+        do {
+            engine = try Engine(configJson: config.json(), dataDir: directory.path)
+            port = try engine.start(sink: FlowSink(flow: packetFlow))
+        } catch {
+            log.error("engine start failed: \(String(describing: error), privacy: .public)")
+            completionHandler(error)
+            return
+        }
+        engineState.withLock { $0 = engine }
+
+        let filtering = engine.mitmActive()
+        let version = coreVersion()
+        let available = os_proc_available_memory()
+        log.info("startTunnel core=\(version, privacy: .public) proxy=\(port, privacy: .public) https_filtering=\(filtering, privacy: .public) available=\(available, privacy: .public)")
+        try? TunnelHeartbeat(
+            startedAt: Date(), coreVersion: version,
+            sha256Probe: sha256Hex(data: Data("tollgate".utf8)), availableMemoryBytes: available
+        ).write()
+
+        setTunnelNetworkSettings(Self.networkSettings(proxyPort: filtering ? port : nil)) { [weak self] error in
+            guard let self else { return }
+            if let error {
+                self.log.error("setTunnelNetworkSettings failed: \(error.localizedDescription, privacy: .public)")
+                self.takeAndStopEngine()
+                completionHandler(error)
+                return
+            }
+            self.log.info("tunnel up")
+            self.reading.withLock { $0 = true }
+            Self.readPackets(engine: engine, flow: self.packetFlow, reading: self.reading, log: self.log)
+            completionHandler(nil)
+        }
+    }
+
+    /// Clears the reference under the lock, then stops outside it (stop joins a thread).
+    private func takeAndStopEngine() {
+        reading.withLock { $0 = false }
+        let running = engineState.withLock { state -> Engine? in
+            defer { state = nil }
+            return state
+        }
+        running?.stop()
+    }
+
+    private func waitForProtectedData(in directory: URL) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self, self.engine == nil else { return }
+            guard Self.protectedDataReadable(in: directory) else {
+                self.waitForProtectedData(in: directory)
+                return
+            }
+            self.log.info("protected data available, starting the core")
+            self.startCore(in: directory) { [weak self] error in
+                if let error { self?.cancelTunnelWithError(error) }
+            }
+        }
+    }
+
+    /// Opening a file fails while its data protection class is locked; fileExists only reads
+    /// metadata and cannot tell.
+    private static func protectedDataReadable(in directory: URL) -> Bool {
+        for name in [CoreConfig.fileName, "ca.key", FilterLists.engineFile, FilterLists.domainsFile] {
+            let url = directory.appendingPathComponent(name)
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            return (try? FileHandle(forReadingFrom: url)) != nil
+        }
+        return true // nothing written yet: a fresh install has nothing to protect
+    }
+
     // MARK: - Packets
 
-    /// DNS packets go to the core. Answers it can give at once come back here; answers that
-    /// need an upstream lookup arrive later through `FlowSink`.
-    private func readPackets() {
-        packetFlow.readPackets { [weak self] packets, _ in
-            guard let self, let engine = self.engine else { return }
+    /// DNS packets go to the core. Answers it can give at once are written here; answers
+    /// that need an upstream lookup arrive later through `FlowSink`. The loop captures only
+    /// Sendable values, never the provider.
+    private static func readPackets(engine: Engine, flow: NEPacketTunnelFlow,
+                                    reading: OSAllocatedUnfairLock<Bool>, log: Logger) {
+        flow.readPackets { packets, _ in
+            guard reading.withLock({ $0 }) else { return }
             do {
                 let replies = try engine.handlePackets(packets: packets)
                 if !replies.isEmpty {
-                    self.packetFlow.writePackets(replies, withProtocols: replies.map(PacketFamily.of))
+                    flow.writePackets(replies, withProtocols: replies.map(PacketFamily.of))
                 }
             } catch {
-                self.log.error("handlePackets failed: \(String(describing: error), privacy: .public)")
+                log.error("handlePackets failed: \(String(describing: error), privacy: .public)")
             }
-            self.readPackets()
+            readPackets(engine: engine, flow: flow, reading: reading, log: log)
         }
     }
 

@@ -3,7 +3,7 @@ import Foundation
 /// The part of the Rust core's configuration the app edits. Keys that are not written here
 /// take the core's defaults (DoH upstreams, connection limits).
 struct CoreConfig: Codable, Equatable {
-    /// HTTPS filtering. Stays off until the user has installed and trusted the certificate.
+    /// HTTPS filtering. Stays off until the root certificate is trusted for TLS.
     var mitmEnabled = false
 
     enum CodingKeys: String, CodingKey {
@@ -28,9 +28,10 @@ struct CoreConfig: Codable, Equatable {
         try JSONEncoder().encode(self).write(to: url, options: .atomic)
     }
 
-    /// The JSON the tunnel hands to `Engine(configJson:dataDir:)`.
-    static func json() -> String {
-        guard let data = try? JSONEncoder().encode(load()) else { return "{}" }
+    /// The JSON for `Engine(configJson:dataDir:)`. Fails closed: the core's own default for
+    /// a missing key is HTTPS filtering on, so the key is always written.
+    func json() -> String {
+        guard let data = try? JSONEncoder().encode(self) else { return #"{"mitm_enabled":false}"# }
         return String(decoding: data, as: UTF8.self)
     }
 }

@@ -21,20 +21,26 @@ struct ContentView: View {
             }
             .navigationTitle("Tollgate")
             .task {
-                certificate.prepare()
                 await tunnel.load()
-                if !FilterLists.compiled, await lists.update() {
-                    await tunnel.reloadLists()
-                }
+                await certificate.prepare()
+                enforceTrust()
+                await updateListsIfMissing()
             }
             .task(id: tunnel.status) {
+                heartbeat = TunnelHeartbeat.read()
+                if tunnel.status == .connected { await updateListsIfMissing() }
                 while tunnel.status == .connected, !Task.isCancelled {
                     await tunnel.refreshStats()
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                 }
             }
             .onChange(of: scenePhase) { _, phase in
-                if phase == .active { certificate.refreshTrust() }
+                guard phase == .active else { return }
+                Task {
+                    await certificate.refreshTrust()
+                    enforceTrust()
+                    await updateListsIfMissing()
+                }
             }
         }
     }
@@ -67,12 +73,47 @@ struct ContentView: View {
     private var protectionDetail: String {
         switch tunnel.status {
         case .connected:
-            (tunnel.stats?.httpsFilteringActive ?? false)
+            if !lists.compiled { return "On, but the filter lists are not downloaded yet" }
+            return (tunnel.stats?.httpsFilteringActive ?? false)
                 ? "Blocking ad and tracker domains and requests"
                 : "Blocking ad and tracker domains"
-        case .connecting, .reasserting: "Starting"
-        case .disconnecting: "Stopping"
-        default: "Ads and trackers are not blocked"
+        case .connecting, .reasserting: return "Starting"
+        case .disconnecting: return "Stopping"
+        default: return "Ads and trackers are not blocked"
+        }
+    }
+
+    /// Downloads the lists when none are compiled yet (offline at first launch, or a failed
+    /// first attempt), then hands them to the tunnel.
+    private func updateListsIfMissing() async {
+        guard !lists.compiled, !lists.isBusy else { return }
+        if await lists.update() { await tunnel.listsUpdated() }
+    }
+
+    /// HTTPS filtering with an untrusted root breaks every intercepted site, so it is turned
+    /// off whenever trust is missing (the toggle's onChange saves and restarts the tunnel).
+    private func enforceTrust() {
+        if httpsFiltering, !certificate.trusted { httpsFiltering = false }
+    }
+
+    private func applyHttpsFiltering(_ enabled: Bool) {
+        var config = CoreConfig.load()
+        guard config.mitmEnabled != enabled else { return }
+        config.mitmEnabled = enabled
+        do {
+            try config.save()
+        } catch {
+            tunnel.showError("HTTPS filtering: \(error.localizedDescription)")
+            httpsFiltering = !enabled
+            return
+        }
+        Task {
+            await tunnel.restartIfRunning(clearingLearnedPins: enabled)
+            if enabled, tunnel.status == .connected,
+               await TunnelController.httpsBrokenByUntrustedCertificate() {
+                httpsFiltering = false
+                tunnel.showError("HTTPS filtering was turned off: iOS does not trust the Tollgate certificate for websites yet. Turn on full trust in Settings, General, About, Certificate Trust Settings.")
+            }
         }
     }
 
@@ -83,13 +124,10 @@ struct ContentView: View {
             listsRow
             certificateRows
             Toggle("HTTPS filtering", isOn: $httpsFiltering)
-                .disabled(certificate.info == nil)
-                .onChange(of: httpsFiltering) { _, enabled in
-                    var config = CoreConfig.load()
-                    config.mitmEnabled = enabled
-                    try? config.save()
-                    Task { await tunnel.restartIfRunning() }
-                }
+                // Can always be turned off; turning on needs a trusted root and compiled lists.
+                .disabled(!httpsFiltering && (!certificate.trusted || !lists.compiled))
+                .onChange(of: httpsFiltering) { _, enabled in applyHttpsFiltering(enabled) }
+                .onChange(of: certificate.trusted) { _, _ in enforceTrust() }
         } header: {
             Text("Setup")
         } footer: {
@@ -104,7 +142,7 @@ struct ContentView: View {
                 Spacer()
                 Button("Update") {
                     Task {
-                        if await lists.update() { await tunnel.reloadLists() }
+                        if await lists.update() { await tunnel.listsUpdated() }
                     }
                 }
                 .disabled(lists.isBusy)
@@ -125,7 +163,7 @@ struct ContentView: View {
             if let date = lists.lastUpdated {
                 return "Updated \(date.formatted(date: .abbreviated, time: .shortened))"
             }
-            return FilterLists.compiled ? "Installed" : "Not downloaded yet"
+            return lists.compiled ? "Installed" : "Not downloaded yet"
         }
     }
 
@@ -135,11 +173,11 @@ struct ContentView: View {
             HStack {
                 Label("Certificate", systemImage: certificate.trusted ? "checkmark.seal.fill" : "seal")
                 Spacer()
-                Text(certificate.trusted ? "Trusted" : "Not trusted")
+                Text(certificate.trusted ? "Trusted" : "Not trusted yet")
                     .foregroundStyle(certificate.trusted ? .green : .orange)
             }
             if !certificate.trusted {
-                Text("1. Tap Install profile and allow the download in Safari.\n2. Open Settings, tap Profile Downloaded, then Install.\n3. Open Settings, General, About, Certificate Trust Settings and turn on Tollgate Root CA.")
+                Text("1. Tap Install profile and allow the download in Safari. If another browser opens, use Share profile instead, save it to Files and open it there.\n2. Open Settings, tap Profile Downloaded, then Install.\n3. Open Settings, General, About, Certificate Trust Settings and turn on Tollgate Root CA.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -152,7 +190,12 @@ struct ContentView: View {
             if let url = certificate.profileURL {
                 ShareLink("Share profile instead", item: url)
             }
-            Button("Check trust again") { certificate.refreshTrust() }
+            Button("Check trust again") {
+                Task {
+                    await certificate.refreshTrust()
+                    enforceTrust()
+                }
+            }
         }
     }
 
@@ -192,7 +235,10 @@ struct ContentView: View {
             if let reply = tunnel.lastReply {
                 LabeledContent("Reply", value: reply)
             }
-            Button("Refresh") { heartbeat = TunnelHeartbeat.read() }
+            Button("Refresh") {
+                heartbeat = TunnelHeartbeat.read()
+                Task { await tunnel.refreshStats() }
+            }
         }
     }
 }

@@ -15,6 +15,8 @@ final class ListUpdater: ObservableObject {
     @Published private(set) var state: State = .idle
     @Published private(set) var lastReport: CompileReport?
     @Published private(set) var lastUpdated: Date?
+    /// Whether compiled lists exist, observable by the UI.
+    @Published private(set) var compiled = FilterLists.compiled
 
     private let log = Logger(subsystem: "dev.tollgate.app", category: "lists")
     private static let lastUpdatedKey = "lists.lastUpdated"
@@ -40,14 +42,20 @@ final class ListUpdater: ObservableObject {
         }
         let lists = FilterLists.defaults
         var inputs: [ListInput] = []
-        do {
-            for (index, list) in lists.enumerated() {
-                state = .downloading(done: index, total: lists.count)
+        for (index, list) in lists.enumerated() {
+            state = .downloading(done: index, total: lists.count)
+            do {
                 inputs.append(ListInput(
                     name: list.name, text: try await Self.download(list.url),
                     format: list.format, target: list.target))
+            } catch {
+                log.error("download \(list.name, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+                state = .failed("\(list.name): \(error.localizedDescription)")
+                return false
             }
-            state = .compiling
+        }
+        state = .compiling
+        do {
             let path = directory.path
             let sources = inputs
             let report = try await Task.detached(priority: .userInitiated) {
@@ -56,13 +64,14 @@ final class ListUpdater: ObservableObject {
             lastReport = report
             let now = Date()
             lastUpdated = now
+            compiled = true
             UserDefaults.standard.set(now, forKey: Self.lastUpdatedKey)
             log.info("lists compiled: \(report.networkRules, privacy: .public) rules, \(report.domainEntries, privacy: .public) domains")
             state = .idle
             return true
         } catch {
-            log.error("list update failed: \(String(describing: error), privacy: .public)")
-            state = .failed(String(describing: error))
+            log.error("list compile failed: \(String(describing: error), privacy: .public)")
+            state = .failed("Compile: \(error.localizedDescription)")
             return false
         }
     }
@@ -71,8 +80,12 @@ final class ListUpdater: ObservableObject {
         var request = URLRequest(url: url, timeoutInterval: 60)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw URLError(.badServerResponse, userInfo: [NSURLErrorFailingURLErrorKey: url])
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else {
+            throw URLError(.badServerResponse, userInfo: [
+                NSURLErrorFailingURLErrorKey: url,
+                NSLocalizedDescriptionKey: "HTTP \(code)",
+            ])
         }
         return String(decoding: data, as: UTF8.self)
     }
