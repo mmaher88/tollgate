@@ -2,12 +2,14 @@
 //! blocklist, and compiling both from filter lists.
 
 mod engine;
+mod request_type;
 
 use std::path::PathBuf;
 
 pub use engine::{
     FilterEngine, REGEX_CLEANUP_INTERVAL, REGEX_DISCARD_UNUSED, Verdict, network_rule_count,
 };
+pub use request_type::{request_type, source_url};
 
 /// How a list is written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
