@@ -16,6 +16,7 @@ const CLASSIC_UDP_PAYLOAD: u16 = 512;
 pub(crate) const NOERROR: u8 = 0;
 pub(crate) const FORMERR: u8 = 1;
 pub(crate) const SERVFAIL: u8 = 2;
+pub(crate) const NXDOMAIN: u8 = 3;
 pub(crate) const NOTIMP: u8 = 4;
 
 const TYPE_A: u16 = 1;
@@ -187,6 +188,20 @@ impl UpstreamAnswer {
             ttl_offsets: records.ttl_offsets.into_boxed_slice(),
             question_end: question_end as u16,
         })
+    }
+
+    /// NOERROR or NXDOMAIN, not truncated.
+    pub fn cacheable(&self) -> bool {
+        matches!(self.bytes[3] & 0x0f, NOERROR | NXDOMAIN) && self.bytes[2] & 0x02 == 0
+    }
+
+    /// Smallest TTL of any record, or 0 without records.
+    pub fn min_ttl(&self) -> u32 {
+        self.ttl_offsets
+            .iter()
+            .map(|&at| self.ttl_at(usize::from(at)))
+            .min()
+            .unwrap_or(0)
     }
 
     fn ttl_at(&self, at: usize) -> u32 {

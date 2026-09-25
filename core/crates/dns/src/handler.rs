@@ -1,7 +1,7 @@
 //! Turning query packets into reply packets or forwarding jobs.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwapOption;
 use hickory_proto::op::{Message, OpCode};
@@ -9,6 +9,7 @@ use tollgate_common::stats::Stats;
 use tollgate_filter::DomainSet;
 
 use crate::answer::{self, FORMERR, NOERROR, NOTIMP, Requester, SERVFAIL, UpstreamAnswer};
+use crate::cache::AnswerCache;
 use crate::doh::DohError;
 use crate::packet::{build_udp, parse_udp};
 use crate::wire::{self, HEADER_LEN};
@@ -50,6 +51,7 @@ impl ForwardJob {
 /// waiting on the network.
 pub struct DnsHandler {
     blocklist: ArcSwapOption<DomainSet>,
+    cache: Mutex<AnswerCache>,
     stats: Arc<Stats>,
 }
 
@@ -70,6 +72,7 @@ impl DnsHandler {
     pub fn new(blocklist: Option<Arc<DomainSet>>, stats: Arc<Stats>) -> DnsHandler {
         DnsHandler {
             blocklist: ArcSwapOption::new(blocklist),
+            cache: Mutex::new(AnswerCache::new()),
             stats,
         }
     }
@@ -86,9 +89,13 @@ impl DnsHandler {
             .is_some_and(|set| set.is_blocked(name))
     }
 
+    fn cache(&self) -> std::sync::MutexGuard<'_, AnswerCache> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Handles one raw IP packet from the tunnel. `now` is
     /// [`tollgate_common::clock::now_secs`]. Never blocks or awaits.
-    pub fn handle_packet(&self, packet: &[u8], _now: u64) -> Outcome {
+    pub fn handle_packet(&self, packet: &[u8], now: u64) -> Outcome {
         let Some(datagram) = parse_udp(packet) else {
             Stats::inc(&self.stats.packets_dropped);
             return Outcome::Drop;
@@ -125,6 +132,10 @@ impl DnsHandler {
             return reply(requester.blocked());
         }
         let key = wire::question_key(query, question_end);
+        if let Some((cached, elapsed)) = self.cache().get(&key, now) {
+            Stats::inc(&self.stats.dns_cache_hits);
+            return reply(cached.render(&requester, elapsed));
+        }
         Stats::inc(&self.stats.dns_forwarded);
         Outcome::Forward(ForwardJob {
             query: query.to_vec(),
@@ -136,13 +147,13 @@ impl DnsHandler {
     }
 
     /// Builds the reply packet for a forwarded query from the upstream result. A usable
-    /// answer is adapted to the client; an error or an unusable answer becomes SERVFAIL and
-    /// counts in `dns_failed`.
+    /// answer is adapted to the client and, if it is NOERROR or NXDOMAIN, cached; an error
+    /// or an unusable answer becomes SERVFAIL and counts in `dns_failed`.
     pub fn complete(
         &self,
         job: ForwardJob,
         answer: Result<Vec<u8>, DohError>,
-        _now: u64,
+        now: u64,
     ) -> Vec<u8> {
         let ForwardJob {
             client,
@@ -155,7 +166,13 @@ impl DnsHandler {
             .map_err(|e| e.to_string())
             .and_then(|wire| UpstreamAnswer::parse(&wire, &key).map_err(str::to_string));
         let payload = match checked {
-            Ok(upstream) => upstream.render(&requester, 0),
+            Ok(upstream) => {
+                let payload = upstream.render(&requester, 0);
+                if upstream.cacheable() {
+                    self.cache().insert(key, upstream, now);
+                }
+                payload
+            }
             Err(reason) => {
                 log::debug!("DNS query failed: {reason}");
                 Stats::inc(&self.stats.dns_failed);

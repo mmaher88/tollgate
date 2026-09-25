@@ -11,6 +11,7 @@ arc-swap = { workspace = true }
 etherparse = { workspace = true }
 hickory-proto = { workspace = true }
 log = { workspace = true }
+lru = { workspace = true }
 thiserror = { workspace = true }
 tollgate-common = { workspace = true }
 tollgate-filter = { workspace = true }

@@ -4,6 +4,7 @@
 //! [`DnsHandler::complete`].
 
 mod answer;
+mod cache;
 mod doh;
 mod handler;
 pub mod packet;
@@ -12,6 +13,7 @@ mod wire;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub use answer::{BLOCK_TTL, MAX_UDP_PAYLOAD};
+pub use cache::{CACHE_CAPACITY, MAX_CACHE_TTL, MIN_CACHE_TTL};
 pub use doh::DohError;
 pub use handler::{DnsHandler, ForwardJob, Outcome};
 
