@@ -355,6 +355,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "etherparse"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17304d06addb3283cdc4bd528e42dd95e73c8ee2d6492ffce415e93660885449"
+dependencies = [
+ "arrayvec",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1188,6 +1197,13 @@ dependencies = [
  "rcgen",
  "rustls",
  "webpki-roots",
+]
+
+[[package]]
+name = "tollgate-dns"
+version = "0.1.0"
+dependencies = [
+ "etherparse",
 ]
 
 [[package]]

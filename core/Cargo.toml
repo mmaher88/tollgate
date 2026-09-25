@@ -4,6 +4,7 @@ members = [
     "crates/common",
     "crates/policy",
     "crates/filter",
+    "crates/dns",
     "crates/tollgate-ffi",
     "tools/uniffi-bindgen-swift",
 ]
@@ -20,6 +21,7 @@ publish = false
 tollgate-common = { path = "crates/common" }
 tollgate-policy = { path = "crates/policy" }
 tollgate-filter = { path = "crates/filter" }
+tollgate-dns = { path = "crates/dns" }
 
 # FFI. Default features are off so the runtime crate does not build cargo_metadata;
 # tools/uniffi-bindgen-swift turns on the features it needs.
@@ -35,6 +37,19 @@ webpki-roots = "1.0.9"
 # default-features = false drops "single-thread", which would make the engine !Send.
 adblock = { version = "=0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
 memmap2 = "0.9.11"
+
+# DNS: packet parsing, DNS messages, the answer cache and DNS over HTTPS. tokio-rustls, like
+# rustls, needs default-features = false to keep aws-lc out.
+etherparse = "0.21.0"
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+lru = "0.18.5"
+arc-swap = "1.9.2"
+tokio = { version = "1.53.1", features = ["rt", "net", "time", "sync"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "logging", "tls12"] }
+hyper = { version = "1.11.1", features = ["client", "http2"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+http-body-util = "0.1.5"
+bytes = "1.12.1"
 
 libc = "0.2.189"
 log = "0.4.34"
