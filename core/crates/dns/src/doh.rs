@@ -194,10 +194,15 @@ impl Upstream {
         if !config.path.starts_with('/') {
             return Err(format!("path {:?} does not start with /", config.path));
         }
+        // An IPv6 literal needs brackets in a URI.
+        let host = match config.tls_name.parse::<std::net::Ipv6Addr>() {
+            Ok(_) => format!("[{}]", config.tls_name),
+            Err(_) => config.tls_name.clone(),
+        };
         let authority = if config.port == 443 {
-            config.tls_name.clone()
+            host
         } else {
-            format!("{}:{}", config.tls_name, config.port)
+            format!("{host}:{}", config.port)
         };
         let uri = format!("https://{authority}{}", config.path)
             .parse::<Uri>()

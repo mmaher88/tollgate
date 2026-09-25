@@ -1,5 +1,5 @@
 //! A local DNS-over-HTTPS server: HTTP/2 over rustls, with a leaf certificate for
-//! [`TLS_NAME`] issued by a certificate authority that rcgen makes for each server.
+//! [`TLS_NAME`] and `::1` issued by a certificate authority that rcgen makes for each server.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -84,7 +84,8 @@ fn certificates() -> (
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
     let issuer = Issuer::new(ca_params, ca_key);
     let leaf_key = KeyPair::generate().unwrap();
-    let leaf = CertificateParams::new(vec![TLS_NAME.to_string()])
+    // The IP address name lets tests use an IPv6 literal as the TLS name.
+    let leaf = CertificateParams::new(vec![TLS_NAME.to_string(), "::1".to_string()])
         .unwrap()
         .signed_by(&leaf_key, &issuer)
         .unwrap();

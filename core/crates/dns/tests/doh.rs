@@ -224,3 +224,16 @@ async fn rejects_short_queries_and_bad_roots() {
         Err(DohError::Config(_))
     ));
 }
+
+#[tokio::test]
+async fn an_ipv6_literal_tls_name_is_usable() {
+    let server = TestServer::start().await;
+    let resolver = trusting(vec![server.upstream_named("::1")], &[&server]);
+    let query = query(0x0606, "example.com.", RecordType::A, None);
+    let answer = resolver.resolve(&query).await.unwrap();
+    assert_eq!(decode(&answer).metadata.id, 0x0606);
+    assert_eq!(
+        server.seen()[0].uri,
+        format!("https://[::1]:{}/dns-query", server.addr.port())
+    );
+}
