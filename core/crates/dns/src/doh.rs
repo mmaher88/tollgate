@@ -17,6 +17,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tollgate_policy::DohUpstream;
@@ -25,6 +26,8 @@ use tollgate_policy::DohUpstream;
 pub const COLD_DEADLINE: Duration = Duration::from_millis(2000);
 /// Deadline for one attempt on an open connection.
 pub const WARM_DEADLINE: Duration = Duration::from_millis(1500);
+/// Queries resolving at once; above it `resolve` fails at once with [`DohError::Busy`].
+pub const MAX_IN_FLIGHT: usize = 128;
 
 const DNS_MESSAGE: &str = "application/dns-message";
 const MAX_ANSWER_LEN: usize = 65_535;
@@ -94,9 +97,10 @@ struct Upstream {
 struct Inner {
     upstreams: Vec<Upstream>,
     tls: TlsConnector,
+    in_flight: Semaphore,
 }
 
-/// DNS over HTTPS client. Cheap to clone; clones share connections.
+/// DNS over HTTPS client. Cheap to clone; clones share connections and the in-flight limit.
 /// `resolve` must run on a tokio runtime (it spawns each connection's driver task), and its
 /// future is `Send`, so callers can spawn one task per query.
 #[derive(Clone)]
@@ -148,6 +152,7 @@ impl DohResolver {
             inner: Arc::new(Inner {
                 upstreams,
                 tls: TlsConnector::from(tls),
+                in_flight: Semaphore::new(MAX_IN_FLIGHT),
             }),
         }
     }
@@ -158,6 +163,9 @@ impl DohResolver {
         if query.len() < DNS_HEADER_LEN {
             return Err(DohError::BadQuery);
         }
+        let Ok(_permit) = self.inner.in_flight.try_acquire() else {
+            return Err(DohError::Busy);
+        };
         // RFC 8484 section 4.1: the id is 0 on the wire, so answers can be cached by HTTP.
         let mut body = query.to_vec();
         body[..2].fill(0);
