@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -34,7 +34,8 @@ pub const LEARNED_PINS_FILE: &str = "learned-pins.json";
 pub const PINS_SAVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Forwarded queries waiting for the runtime; when full, new ones get SERVFAIL at once.
 pub const FORWARD_QUEUE: usize = 256;
-/// Threads tokio may start for blocking work (the proxy's `getaddrinfo` calls).
+/// Threads tokio may start for blocking work (the proxy's `getaddrinfo` calls, and writing
+/// the learned pins).
 const MAX_BLOCKING_THREADS: usize = 4;
 /// How long `stop` waits for blocking work such as a hung `getaddrinfo`.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -123,10 +124,8 @@ struct Work {
     sink: Arc<dyn PacketSink>,
     queue: mpsc::Receiver<ForwardJob>,
     in_flight: usize,
-    pins_file: PathBuf,
+    pins: Arc<PinsFile>,
     pins_save_interval: Duration,
-    /// The learned pins when `start` ran; the file holds these or equivalent ones.
-    pins_at_start: String,
 }
 
 /// The tunnel's Rust side: DNS answers, the DNS forwarder and the HTTPS proxy.
@@ -139,6 +138,7 @@ pub struct Engine {
     stats: Arc<Counters>,
     dns: Arc<DnsHandler>,
     proxy: Arc<ProxyContext>,
+    pins: Arc<PinsFile>,
     running: Mutex<Option<Running>>,
 }
 
@@ -280,6 +280,10 @@ impl Engine {
             available_memory,
         });
         let dns = Arc::new(DnsHandler::new(domains, stats.clone()));
+        let pins = Arc::new(PinsFile::new(
+            data_dir.join(LEARNED_PINS_FILE),
+            proxy.policy.clone(),
+        ));
         Ok(Arc::new(Engine {
             data_dir: data_dir.to_path_buf(),
             config,
@@ -288,6 +292,7 @@ impl Engine {
             stats,
             dns,
             proxy,
+            pins,
             running: Mutex::new(None),
         }))
     }
@@ -352,9 +357,8 @@ impl Engine {
             sink,
             queue,
             in_flight: self.options.forward_in_flight.max(1),
-            pins_file: self.data_dir.join(LEARNED_PINS_FILE),
+            pins: self.pins.clone(),
             pins_save_interval: self.options.pins_save_interval,
-            pins_at_start: self.proxy.policy.learned_pins_json(),
         };
         let (shutdown, stopped) = oneshot::channel();
         let (ready_tx, ready) = std::sync::mpsc::sync_channel(1);
@@ -406,13 +410,8 @@ impl Engine {
         } else if thread.join().is_err() {
             log::error!("the runtime thread panicked");
         }
-        self.save_pins();
+        self.pins.save(true);
         log::info!("engine stopped, proxy port {port} closed");
-    }
-
-    fn save_pins(&self) {
-        let path = self.data_dir.join(LEARNED_PINS_FILE);
-        save_pins(&path, &self.proxy.policy.learned_pins_json());
     }
 }
 
@@ -442,7 +441,62 @@ fn load_domains(dir: &Path) -> Result<Option<Arc<DomainSet>>, TollgateError> {
     }
 }
 
+/// The learned pins file. A save takes its snapshot of the pins while holding `saved`, so
+/// a save still running on the blocking pool when `stop` saves can never replace newer pins
+/// with older ones.
+struct PinsFile {
+    path: PathBuf,
+    policy: Arc<Policy>,
+    /// The pins the file holds: the ones written last, or the ones loaded at creation.
+    saved: Mutex<String>,
+}
+
+impl PinsFile {
+    fn new(path: PathBuf, policy: Arc<Policy>) -> PinsFile {
+        let saved = Mutex::new(policy.learned_pins_json());
+        PinsFile {
+            path,
+            policy,
+            saved,
+        }
+    }
+
+    /// Whether the pins differ from the ones last saved. `false` while a save is running;
+    /// a later check sees what it missed.
+    fn changed(&self) -> bool {
+        let saved = match self.saved.try_lock() {
+            Ok(saved) => saved,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        *saved != self.policy.learned_pins_json()
+    }
+
+    /// Writes the pins if they changed since the last save, or in any case when `always`.
+    /// Blocks on the file system.
+    fn save(&self, always: bool) {
+        let mut saved = self.saved.lock().unwrap_or_else(PoisonError::into_inner);
+        let json = self.policy.learned_pins_json();
+        if (always || json != *saved) && save_pins(&self.path, &json) {
+            log::debug!("saved learned pins");
+            *saved = json;
+        }
+    }
+}
+
+/// Where each `save_pins` call ran: the file and the name of the thread.
+#[cfg(test)]
+static PIN_SAVES: Mutex<Vec<(PathBuf, Option<String>)>> = Mutex::new(Vec::new());
+
 fn save_pins(path: &Path, json: &str) -> bool {
+    #[cfg(test)]
+    PIN_SAVES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((
+            path.to_path_buf(),
+            thread::current().name().map(String::from),
+        ));
     match write_private(path, json) {
         Ok(()) => true,
         Err(e) => {
@@ -536,45 +590,34 @@ async fn serve(
         sink,
         queue,
         in_flight,
-        pins_file,
+        pins,
         pins_save_interval,
-        pins_at_start,
     } = work;
     let forwarding = tokio::spawn(forward(queue, resolver, dns, sink, in_flight));
-    let saving = tokio::spawn(save_pins_periodically(
-        proxy.policy.clone(),
-        pins_file,
-        pins_save_interval,
-        pins_at_start,
-    ));
+    let saving = tokio::spawn(save_pins_periodically(pins, pins_save_interval));
     tollgate_mitm::serve(listener, proxy, async move {
         let _ = stopped.await;
     })
     .await;
     forwarding.abort();
-    // The write runs on this thread, so it has finished before `stop` joins the thread and
-    // saves the pins itself.
+    // A write already on the blocking pool keeps running; `stop` saves after it, on the
+    // same lock, with pins at least as new.
     saving.abort();
 }
 
-/// Saves the learned pins every `interval` if they differ from `saved`, the last pins
-/// written, so pins survive an extension that ends without `stop` (jetsam, a crash).
-async fn save_pins_periodically(
-    policy: Arc<Policy>,
-    path: PathBuf,
-    interval: Duration,
-    mut saved: String,
-) {
+/// Saves the learned pins every `interval` if they changed, so pins survive an extension
+/// that ends without `stop` (jetsam, a crash).
+async fn save_pins_periodically(pins: Arc<PinsFile>, interval: Duration) {
     let mut ticks = tokio::time::interval(interval.max(Duration::from_millis(1)));
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick completes at once.
     ticks.tick().await;
     loop {
         ticks.tick().await;
-        let json = policy.learned_pins_json();
-        if json != saved && save_pins(&path, &json) {
-            log::debug!("saved learned pins");
-            saved = json;
+        if pins.changed() {
+            let pins = pins.clone();
+            // The write ends with an fsync, too slow for the runtime's only thread.
+            let _ = tokio::task::spawn_blocking(move || pins.save(false)).await;
         }
     }
 }
@@ -628,21 +671,25 @@ mod tests {
         fn write_packets(&self, _packets: Vec<Vec<u8>>) {}
     }
 
-    #[test]
-    fn learned_pins_are_saved_while_running() {
-        let dir = tempfile::tempdir().unwrap();
+    /// Starts an engine in `dir` that saves pins every 50 ms, and makes it learn a pin for
+    /// `pinned.example`.
+    fn engine_learning_a_pin(dir: &Path) -> Arc<Engine> {
         let options = EngineOptions {
             pins_save_interval: Duration::from_millis(50),
             ..EngineOptions::default()
         };
-        let engine = Engine::with_options("{}", dir.path(), options).unwrap();
+        let engine = Engine::with_options("{}", dir, options).unwrap();
         engine.start(Arc::new(NullSink)).unwrap();
         let now = tollgate_common::clock::unix_secs();
         let policy = &engine.proxy.policy;
         assert!(!policy.record_client_rejection("pinned.example", RejectionKind::UnknownCa, now));
         assert!(policy.record_client_rejection("pinned.example", RejectionKind::UnknownCa, now));
+        engine
+    }
 
-        let path = dir.path().join(LEARNED_PINS_FILE);
+    /// Waits until the pins file in `dir` holds the pin for `pinned.example`.
+    fn wait_for_saved_pin(dir: &Path) {
+        let path = dir.join(LEARNED_PINS_FILE);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !std::fs::read_to_string(&path).is_ok_and(|json| json.contains("pinned.example")) {
             assert!(
@@ -651,6 +698,14 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn learned_pins_are_saved_while_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_learning_a_pin(dir.path());
+        wait_for_saved_pin(dir.path());
+        let path = dir.path().join(LEARNED_PINS_FILE);
         assert!(engine.port().is_some(), "saved while the engine runs");
         #[cfg(unix)]
         {
@@ -661,6 +716,29 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             engine.learned_pins_json()
+        );
+        engine.stop();
+    }
+
+    /// Writing the file ends with an fsync, which must not stall the proxy and the DNS
+    /// forwarder on the runtime's only thread.
+    #[test]
+    fn learned_pins_are_written_off_the_runtime_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_learning_a_pin(dir.path());
+        wait_for_saved_pin(dir.path());
+        let path = dir.path().join(LEARNED_PINS_FILE);
+        let threads: Vec<Option<String>> = PIN_SAVES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(saved, _)| *saved == path)
+            .map(|(_, thread)| thread.clone())
+            .collect();
+        assert!(!threads.is_empty());
+        assert!(
+            threads.iter().all(|t| t.as_deref() != Some(RUNTIME_THREAD)),
+            "saved on {threads:?}"
         );
         engine.stop();
     }
