@@ -151,8 +151,11 @@ async fn a_connection_idle_longer_than_max_idle_is_replaced_before_use() {
     let query = query(1, "example.com.", RecordType::A, None);
     resolver.resolve(&query).await.unwrap();
 
-    // Idle for less than MAX_IDLE: the connection is used again, and idle time counts
-    // from this request, not from when the connection opened.
+    // Idle for less than MAX_IDLE: the connection is used again.
+    now.fetch_add(MAX_IDLE.as_secs() - 1, Ordering::SeqCst);
+    resolver.resolve(&query).await.unwrap();
+    assert_eq!(server.connections(), 1);
+    // Idle time counts from the last request, not from when the connection opened.
     now.fetch_add(MAX_IDLE.as_secs() - 1, Ordering::SeqCst);
     resolver.resolve(&query).await.unwrap();
     assert_eq!(server.connections(), 1);
@@ -166,5 +169,5 @@ async fn a_connection_idle_longer_than_max_idle_is_replaced_before_use() {
     assert_eq!(decode(&answer).answers.len(), 1);
     assert_eq!(server.connections(), 2);
     // The dead connection never saw the query.
-    assert_eq!(server.requests(), 3);
+    assert_eq!(server.requests(), 4);
 }
