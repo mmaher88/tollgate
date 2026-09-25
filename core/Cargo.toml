@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/common",
     "crates/tollgate-ffi",
     "tools/uniffi-bindgen-swift",
 ]
@@ -13,6 +14,9 @@ rust-version = "1.94"
 publish = false
 
 [workspace.dependencies]
+# Internal crates.
+tollgate-common = { path = "crates/common" }
+
 # FFI. Default features are off so the runtime crate does not build cargo_metadata;
 # tools/uniffi-bindgen-swift turns on the features it needs.
 uniffi = { version = "0.32.2", default-features = false }
