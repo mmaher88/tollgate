@@ -10,6 +10,7 @@ publish.workspace = true
 tollgate-common = { workspace = true }
 lru = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser"] }
+ring = { workspace = true }
 rustls = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }

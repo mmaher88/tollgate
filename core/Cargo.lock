@@ -1221,6 +1221,7 @@ version = "0.1.0"
 dependencies = [
  "lru",
  "rcgen",
+ "ring",
  "rustls",
  "thiserror 2.0.21",
  "time",

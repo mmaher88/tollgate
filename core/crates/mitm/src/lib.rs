@@ -4,6 +4,7 @@
 //! Built directly on hyper, hyper-util, tokio-rustls and rustls with the ring provider.
 
 mod ca;
+mod mobileconfig;
 
 pub use ca::{
     CA_VALIDITY_DAYS, CertAuthority, LEAF_CACHE_SIZE, LEAF_REISSUE_SECS, LEAF_VALIDITY_DAYS,
