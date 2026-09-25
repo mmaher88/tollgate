@@ -7,12 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::{StatusCode, Version};
+use rustls::ClientConnection;
+use rustls::pki_types::ServerName;
 use tokio::io::AsyncWriteExt;
 use tollgate_mitm::CertAuthority;
 use tollgate_policy::Config;
 
 use support::client::{get, http1, read_to_close, send1, wait_for};
-use support::tunnel::{alpn, connect, http2, peer_issuer, send2, tls, tls_config};
+use support::tunnel::{alpn, connect, http2, issuer_via, peer_issuer, send2, tls, tls_config};
 use support::{proxy, tls_origin};
 
 const RULES: &str = "\
@@ -325,4 +327,51 @@ async fn incomplete_client_hello_times_out() {
     let closed = read_to_close(&mut tcp, Duration::from_secs(5)).await;
     assert_eq!(closed, Some(Vec::new()));
     assert_eq!(origin.connections(), 0);
+}
+
+#[tokio::test]
+async fn stalled_handshake_times_out_and_frees_the_slot() {
+    let ca = Arc::new(CertAuthority::generate("Tollgate Test CA").unwrap());
+    let origin_ca = Arc::new(CertAuthority::generate("Origin CA").unwrap());
+    let origin = tls_origin::https(origin_ca.clone(), &[b"h2"]).await;
+    let mut ctx = proxy::context(ca.clone(), &Config::default(), None);
+    ctx.max_intercepted = 1;
+    let mut options = tls_origin::trusting(&origin_ca);
+    options.handshake_timeout = Duration::from_secs(1);
+    let proxy = proxy::start(ctx, options).await;
+    let target = format!("127.0.0.1:{}", origin.port());
+
+    // A real ClientHello, then silence: the proxy answers with its flight and waits for a
+    // client Finished that never comes. Reading the ClientHello took no time at all, so
+    // only the limit on the handshake itself can end this.
+    let mut stalled = connect(proxy.addr, &target).await;
+    let name = ServerName::try_from("www.tollgate.test").unwrap();
+    let mut client = ClientConnection::new(tls_config(&[&ca], &[b"h2"]), name).unwrap();
+    let mut hello = Vec::new();
+    client.write_tls(&mut hello).unwrap();
+    stalled.write_all(&hello).await.unwrap();
+    wait_for("the stalled connection to be intercepted", || {
+        proxy.stats().connections_intercepted == 1
+    })
+    .await;
+
+    // The stalled handshake holds the only slot.
+    let issuer = issuer_via(
+        proxy.addr,
+        &target,
+        &[&ca, &origin_ca],
+        "full.tollgate.test",
+    )
+    .await;
+    assert_eq!(issuer, "CN=Origin CA, O=Tollgate");
+    assert_eq!(proxy.stats().connections_passthrough, 1);
+
+    let closed = read_to_close(&mut stalled, Duration::from_secs(5)).await;
+    assert!(closed.is_some(), "the stalled handshake was closed");
+    let issuer = issuer_via(proxy.addr, &target, &[&ca], "www.tollgate.test").await;
+    assert_eq!(issuer, "CN=Tollgate Test CA, O=Tollgate");
+    let stats = proxy.stats();
+    assert_eq!(stats.connections_intercepted, 2);
+    assert_eq!(stats.connections_passthrough, 1);
+    assert_eq!(stats.tls_client_rejections, 0);
 }
