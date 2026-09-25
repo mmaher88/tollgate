@@ -129,22 +129,21 @@ struct PinEntry {
 pub struct Policy {
     mitm_enabled: bool,
     user: PatternSet,
+    allowlist: PatternSet,
     learning: Mutex<Learning>,
 }
 
 impl Policy {
-    /// Fails if a user passthrough pattern is invalid. A learned pins file that cannot be
+    /// Fails if a user passthrough or allowlist pattern is invalid. A learned pins file that cannot be
     /// read is logged and ignored: it is a cache that rebuilds itself.
     pub fn new(config: &Config, learned_pins_json: Option<&str>) -> Result<Policy, PolicyError> {
-        let user: Vec<HostPattern> = config
-            .passthrough
-            .iter()
-            .map(|p| HostPattern::parse(p))
-            .collect::<Result<_, _>>()?;
+        let user = parse_patterns(&config.passthrough)?;
+        let allowlist = parse_patterns(&config.allowlist)?;
         let pins = learned_pins_json.map(parse_pins).unwrap_or_default();
         Ok(Policy {
             mitm_enabled: config.mitm_enabled,
             user: PatternSet::new(&user),
+            allowlist: PatternSet::new(&allowlist),
             learning: Mutex::new(Learning {
                 pins,
                 recent: HashMap::new(),
@@ -212,18 +211,48 @@ impl Policy {
         }
     }
 
-    /// `{"version":1,"pins":[{"host":"...","learned_at":...}]}`, sorted by host.
-    pub fn learned_pins_json(&self) -> String {
-        let mut pins: Vec<PinEntry> = self
+    /// True when `host` matches a user allowlist pattern, so nothing for it is blocked.
+    pub fn is_allowlisted(&self, host: &str) -> bool {
+        let key = lookup_key(host);
+        !key.is_empty() && self.allowlist.matches(&key)
+    }
+
+    /// Forgets learned pins, and pending single rejections, for these hosts. Hosts are
+    /// compared ignoring ASCII case and one trailing dot. Returns how many pins were removed.
+    pub fn forget_pins(&self, hosts: &[String]) -> usize {
+        let mut learning = self.lock();
+        let mut removed = 0;
+        for host in hosts {
+            let key = lookup_key(host);
+            if learning.pins.remove(&key).is_some() {
+                log::info!("forgot learned certificate pin for {key}");
+                removed += 1;
+            }
+            learning.recent.remove(&key);
+        }
+        removed
+    }
+
+    /// Every learned pin as (host, learned_at unix seconds), sorted by host. These are the
+    /// pins [`Policy::learned_pins_json`] saves.
+    pub fn learned_pins(&self) -> Vec<(String, u64)> {
+        let mut pins: Vec<(String, u64)> = self
             .lock()
             .pins
             .iter()
-            .map(|(host, at)| PinEntry {
-                host: host.clone(),
-                learned_at: *at,
-            })
+            .map(|(host, at)| (host.clone(), *at))
             .collect();
-        pins.sort_by(|a, b| a.host.cmp(&b.host));
+        pins.sort();
+        pins
+    }
+
+    /// `{"version":1,"pins":[{"host":"...","learned_at":...}]}`, sorted by host.
+    pub fn learned_pins_json(&self) -> String {
+        let pins = self
+            .learned_pins()
+            .into_iter()
+            .map(|(host, learned_at)| PinEntry { host, learned_at })
+            .collect();
         let file = PinsFile {
             version: PINS_FORMAT_VERSION,
             pins,
@@ -234,6 +263,10 @@ impl Policy {
     fn lock(&self) -> MutexGuard<'_, Learning> {
         self.learning.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+fn parse_patterns(patterns: &[String]) -> Result<Vec<HostPattern>, PolicyError> {
+    patterns.iter().map(|p| HostPattern::parse(p)).collect()
 }
 
 fn parse_pins(json: &str) -> HashMap<String, u64> {

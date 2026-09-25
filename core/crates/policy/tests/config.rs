@@ -24,6 +24,7 @@ fn defaults_match_the_spec() {
         ]
     );
     assert!(config.passthrough.is_empty());
+    assert!(config.allowlist.is_empty());
     assert!(config.mitm_enabled);
     assert_eq!(config.max_intercepted_connections, 32);
 }
@@ -39,6 +40,7 @@ fn default_json_has_stable_field_names() {
                 {"ip": "9.9.9.9", "port": 443, "tls_name": "dns.quad9.net", "path": "/dns-query"}
             ],
             "passthrough": [],
+            "allowlist": [],
             "mitm_enabled": true,
             "max_intercepted_connections": 32
         })
@@ -80,6 +82,14 @@ fn upstream_port_and_path_default() {
 }
 
 #[test]
+fn allowlist_defaults_to_empty_when_missing() {
+    let config = Config::from_json(r#"{"passthrough": ["a.example"]}"#).unwrap();
+    assert!(config.allowlist.is_empty());
+    let config = Config::from_json(r#"{"allowlist": ["*.a.example", "b.example"]}"#).unwrap();
+    assert_eq!(config.allowlist, ["*.a.example", "b.example"]);
+}
+
+#[test]
 fn unknown_fields_are_ignored() {
     let config =
         Config::from_json(r#"{"future_option": [1, 2], "max_intercepted_connections": 8}"#)
@@ -97,6 +107,7 @@ fn round_trip() {
             path: "/q".into(),
         }],
         passthrough: vec!["*.bank.example".into(), "pinned.example.org".into()],
+        allowlist: vec!["*.shop.example".into(), "cdn.example.net".into()],
         mitm_enabled: false,
         max_intercepted_connections: 5,
     };

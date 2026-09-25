@@ -57,6 +57,9 @@ pub struct Config {
     pub doh_upstreams: Vec<DohUpstream>,
     /// User host patterns that are never intercepted, see [`crate::HostPattern`].
     pub passthrough: Vec<String>,
+    /// User host patterns where nothing is blocked: DNS names matching one resolve normally,
+    /// and a request is allowed when its own host or its page's host matches.
+    pub allowlist: Vec<String>,
     /// When false every connection is passed through untouched. Default true.
     pub mitm_enabled: bool,
     /// Intercepted client connections allowed at once; above it new ones pass through.
@@ -69,6 +72,7 @@ impl Default for Config {
         Config {
             doh_upstreams: vec![DohUpstream::cloudflare(), DohUpstream::quad9()],
             passthrough: Vec::new(),
+            allowlist: Vec::new(),
             mitm_enabled: true,
             max_intercepted_connections: 32,
         }
