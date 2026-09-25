@@ -1632,7 +1632,9 @@ dependencies = [
 name = "tollgate-ffi"
 version = "0.1.0"
 dependencies = [
+ "log",
  "ring",
+ "thiserror 2.0.21",
  "uniffi",
 ]
 

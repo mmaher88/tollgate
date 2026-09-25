@@ -11,5 +11,7 @@ name = "tollgate_ffi"
 crate-type = ["lib", "staticlib"]
 
 [dependencies]
-uniffi = { workspace = true }
+log = { workspace = true }
 ring = { workspace = true }
+thiserror = { workspace = true }
+uniffi = { workspace = true }
