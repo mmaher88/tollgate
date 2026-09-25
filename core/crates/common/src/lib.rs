@@ -4,4 +4,5 @@
 //! Logging is not wrapped here: every crate logs through the `log` facade directly.
 
 pub mod clock;
+pub mod stats;
 pub mod tls;
