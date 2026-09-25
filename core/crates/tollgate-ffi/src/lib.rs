@@ -8,6 +8,7 @@
 uniffi::setup_scaffolding!();
 
 mod ca;
+mod controls;
 mod engine;
 mod error;
 mod lists;
@@ -16,6 +17,10 @@ mod logging;
 pub use ca::{
     CA_CERT_FILE, CA_COMMON_NAME, CA_KEY_FILE, CaInfo, PROFILE_DISPLAY_NAME, PROFILE_IDENTIFIER,
     ca_mobileconfig, ca_test_leaf, generate_ca, load_ca,
+};
+pub use controls::{
+    BlockEvent, EventKind, LearnedPin, forget_stored_pins, stored_learned_pins,
+    validate_host_pattern,
 };
 pub use engine::{
     Engine, EngineOptions, FORWARD_QUEUE, LEARNED_PINS_FILE, PINS_SAVE_INTERVAL, PacketSink,

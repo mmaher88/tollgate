@@ -16,13 +16,15 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tollgate_common::clock;
+use tollgate_common::events::EventLog;
 use tollgate_common::stats::{Stats as Counters, StatsSnapshot};
 use tollgate_dns::{DnsHandler, DohError, DohResolver, ForwardJob, Outcome};
 use tollgate_filter::{DOMAINS_FILE, DomainSet, ENGINE_FILE, FilterEngine, FilterError};
 use tollgate_mitm::{CertAuthority, ProxyContext};
-use tollgate_policy::{Config, Policy};
+use tollgate_policy::{Config, HostPattern, Policy};
 
 use crate::ca::{load_ca, write_private};
+use crate::controls::{BlockEvent, LearnedPin, count, learned_pins};
 use crate::error::{TollgateError, catch_panic, panic_message};
 
 /// Name of the thread that runs the proxy and the DNS forwarder.
@@ -136,6 +138,8 @@ pub struct Engine {
     options: EngineOptions,
     mitm_active: bool,
     stats: Arc<Counters>,
+    /// The blocked log, shared by the DNS handler and the proxy.
+    events: Arc<EventLog>,
     dns: Arc<DnsHandler>,
     proxy: Arc<ProxyContext>,
     pins: Arc<PinsFile>,
@@ -208,6 +212,44 @@ impl Engine {
         catch_panic(|| Ok(self.proxy.policy.learned_pins_json())).unwrap_or_default()
     }
 
+    /// Up to `limit` of the last 500 blocks, newest first.
+    pub fn recent_events(&self, limit: u32) -> Vec<BlockEvent> {
+        catch_panic(|| {
+            let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+            Ok(self
+                .events
+                .recent(limit)
+                .into_iter()
+                .map(BlockEvent::from)
+                .collect())
+        })
+        .unwrap_or_default()
+    }
+
+    /// Empties the blocked log. The counters are kept.
+    pub fn clear_events(&self) {
+        let _ = catch_panic(|| {
+            self.events.clear();
+            Ok(())
+        });
+    }
+
+    /// The learned pins, sorted by host.
+    pub fn learned_pins(&self) -> Vec<LearnedPin> {
+        catch_panic(|| Ok(learned_pins(&self.proxy.policy))).unwrap_or_default()
+    }
+
+    /// Forgets the learned pins (and pending rejections) for these hosts, then saves
+    /// `learned-pins.json` at once. Returns how many pins were removed.
+    pub fn forget_pins(&self, hosts: Vec<String>) -> u32 {
+        catch_panic(|| {
+            let removed = self.proxy.policy.forget_pins(&hosts);
+            self.pins.save(true);
+            Ok(count(removed))
+        })
+        .unwrap_or_default()
+    }
+
     /// Whether HTTPS connections can be intercepted: `mitm_enabled` in the config, a CA and
     /// `engine.dat` were all present when the engine was created.
     pub fn mitm_active(&self) -> bool {
@@ -270,7 +312,16 @@ impl Engine {
                 message: e.to_string(),
             })?,
         };
+        let allowlist = config
+            .allowlist
+            .iter()
+            .map(|p| HostPattern::parse(p))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| TollgateError::Config {
+                message: e.to_string(),
+            })?;
         let stats = Arc::new(Counters::default());
+        let events = Arc::new(EventLog::new());
         let proxy = Arc::new(ProxyContext {
             policy: Arc::new(policy),
             filter: ArcSwapOption::new(filter),
@@ -278,9 +329,11 @@ impl Engine {
             stats: stats.clone(),
             max_intercepted: config.max_intercepted_connections as usize,
             available_memory,
-            events: None,
+            events: Some(events.clone()),
         });
         let dns = Arc::new(DnsHandler::new(domains, stats.clone()));
+        dns.set_allowlist(allowlist);
+        dns.set_events(Some(events.clone()));
         let pins = Arc::new(PinsFile::new(
             data_dir.join(LEARNED_PINS_FILE),
             proxy.policy.clone(),
@@ -291,6 +344,7 @@ impl Engine {
             options,
             mitm_active,
             stats,
+            events,
             dns,
             proxy,
             pins,
