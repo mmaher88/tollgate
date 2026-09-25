@@ -4,6 +4,7 @@
 
 use std::io::ErrorKind;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 
 use tollgate_common::events;
 use tollgate_policy::{Config, HostPattern, Policy};
@@ -11,6 +12,10 @@ use tollgate_policy::{Config, HostPattern, Policy};
 use crate::ca::write_private;
 use crate::engine::LEARNED_PINS_FILE;
 use crate::error::{TollgateError, catch_panic};
+
+/// Serializes the read, change and rewrite of `learned-pins.json` in [`forget_stored_pins`],
+/// so concurrent calls do not bring back each other's forgotten pins.
+static STORED_PINS: Mutex<()> = Mutex::new(());
 
 /// What was blocked. Mirrors `tollgate_common::events::EventKind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -96,10 +101,14 @@ pub fn stored_learned_pins(data_dir: String) -> Result<Vec<LearnedPin>, Tollgate
 /// engine's format with the engine's private atomic writer. Returns how many pins were
 /// removed; the file is written only when that is more than zero, and a missing file
 /// stays missing.
+///
+/// Calls in one process run one at a time. While the tunnel runs the engine owns the pins
+/// and would write them back, so use [`crate::Engine::forget_pins`] then.
 #[uniffi::export]
 pub fn forget_stored_pins(data_dir: String, hosts: Vec<String>) -> Result<u32, TollgateError> {
     catch_panic(|| {
         let dir = Path::new(&data_dir);
+        let _serial = STORED_PINS.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(policy) = stored_policy(dir)? else {
             return Ok(0);
         };

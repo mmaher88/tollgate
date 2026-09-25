@@ -326,3 +326,37 @@ fn forget_stored_pins_reports_write_errors() {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
+
+#[test]
+fn concurrent_forget_stored_pins_lose_no_removal() {
+    const HOSTS: usize = 16;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(LEARNED_PINS_FILE);
+    for round in 0..10 {
+        let pins: Vec<String> = (0..HOSTS)
+            .map(|i| format!(r#"{{"host":"h{i}.example","learned_at":{round}}}"#))
+            .collect();
+        std::fs::write(
+            &file,
+            format!(r#"{{"version":1,"pins":[{}]}}"#, pins.join(",")),
+        )
+        .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(HOSTS));
+        let threads: Vec<_> = (0..HOSTS)
+            .map(|i| {
+                let (dir, barrier) = (path(&dir), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    forget_stored_pins(dir, vec![format!("h{i}.example")]).unwrap()
+                })
+            })
+            .collect();
+        let removed: u32 = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        assert_eq!(removed, HOSTS as u32, "round {round}");
+        assert_eq!(
+            stored_learned_pins(path(&dir)),
+            Ok(Vec::new()),
+            "round {round}: a forgotten pin came back"
+        );
+    }
+}
