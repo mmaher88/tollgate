@@ -256,3 +256,18 @@ fn least_recently_used_answer_is_evicted_at_capacity() {
         handler.handle_packet(&query_packet(1, "extra.example.", RecordType::A, None), T0),
     );
 }
+
+#[test]
+fn answers_too_big_for_any_reply_are_not_cached() {
+    let (handler, stats) = handler();
+    // 100 records: about 1,600 bytes, more than any requester accepts, so every reply is
+    // truncated. Keeping it would only spend memory (up to 64 KiB per entry).
+    fill(&handler, "huge.example.", RecordType::A, T0, |answer| {
+        for i in 0..100 {
+            answer.add_answer(a_record("huge.example.", 300, [10, 0, 0, i]));
+        }
+    });
+    let packet = query_packet(2, "huge.example.", RecordType::A, Some((4096, false)));
+    expect_forward(handler.handle_packet(&packet, T0 + 1));
+    assert_eq!(stats.snapshot().dns_cache_hits, 0);
+}

@@ -190,9 +190,13 @@ impl UpstreamAnswer {
         })
     }
 
-    /// NOERROR or NXDOMAIN, not truncated.
+    /// NOERROR or NXDOMAIN, not truncated, and small enough that some requester gets it
+    /// whole. Larger answers (up to 64 KiB from DoH) always render truncated, so keeping
+    /// them would only cost memory.
     pub fn cacheable(&self) -> bool {
-        matches!(self.bytes[3] & 0x0f, NOERROR | NXDOMAIN) && self.bytes[2] & 0x02 == 0
+        matches!(self.bytes[3] & 0x0f, NOERROR | NXDOMAIN)
+            && self.bytes[2] & 0x02 == 0
+            && self.bytes.len() + OPT_LEN <= usize::from(MAX_UDP_PAYLOAD)
     }
 
     /// Smallest TTL of any record, or 0 without records.
