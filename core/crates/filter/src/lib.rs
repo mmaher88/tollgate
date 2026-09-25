@@ -1,11 +1,13 @@
 //! Request filtering: the adblock engine for URLs seen by the proxy, the hashed DNS
 //! blocklist, and compiling both from filter lists.
 
+mod domain_rules;
 mod engine;
 mod request_type;
 
 use std::path::PathBuf;
 
+pub use domain_rules::DomainRules;
 pub use engine::{
     FilterEngine, REGEX_CLEANUP_INTERVAL, REGEX_DISCARD_UNUSED, Verdict, network_rule_count,
 };
