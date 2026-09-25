@@ -373,16 +373,24 @@ struct PinsView: View {
         .refreshable { await reload() }
     }
 
+    /// The core keeps a learned pin for 30 days; older entries are still stored but no longer
+    /// applied, so they are not shown.
+    private static let pinLifetime: TimeInterval = 30 * 24 * 60 * 60
+
+    private func show(_ entries: [PinEntry]) {
+        pins = entries.filter { Date().timeIntervalSince($0.date) < Self.pinLifetime }
+    }
+
     private func reload() async {
         switch await tunnel.pins() {
         case let .engine(running):
-            pins = running
+            show(running)
             error = nil
         case .storedFile:
             guard let directory = AppGroup.coreDirectory else { return }
             do {
-                pins = try storedLearnedPins(dataDir: directory.path)
-                    .map { PinEntry(host: $0.host, learnedAt: $0.learnedAt) }
+                show(try storedLearnedPins(dataDir: directory.path)
+                    .map { PinEntry(host: $0.host, learnedAt: $0.learnedAt) })
                 error = nil
             } catch {
                 self.error = "Could not read pins: \(error.localizedDescription)"
