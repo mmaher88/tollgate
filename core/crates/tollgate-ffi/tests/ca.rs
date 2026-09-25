@@ -114,3 +114,35 @@ fn the_profile_installs_the_stored_root() {
     // The same CA always gives the same profile.
     assert_eq!(ca_mobileconfig(path).unwrap(), profile.into_bytes());
 }
+
+#[test]
+fn concurrent_calls_store_one_matching_pair() {
+    // Several callers at once (a SwiftUI task that runs twice, the app and a test) must end
+    // with one CA whose certificate and key match, and all of them must report that CA.
+    for _ in 0..20 {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let callers: Vec<_> = (0..8)
+            .map(|_| {
+                let (path, barrier) = (path.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    generate_ca(path)
+                })
+            })
+            .collect();
+        let infos: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().unwrap().unwrap())
+            .collect();
+        let stored = load_ca(tmp.path()).unwrap().expect("a stored CA");
+        let fingerprint = sha256_hex(stored.cert_der());
+        assert_eq!(infos.iter().filter(|info| info.created).count(), 1);
+        assert!(
+            infos
+                .iter()
+                .all(|info| info.sha256_fingerprint == fingerprint)
+        );
+    }
+}

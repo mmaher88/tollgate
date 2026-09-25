@@ -7,6 +7,8 @@
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use tollgate_mitm::CertAuthority;
 
@@ -69,13 +71,21 @@ pub fn load_ca(dir: &Path) -> Result<Option<CertAuthority>, TollgateError> {
     }
 }
 
+/// Serializes `generate_ca` in this process, so concurrent callers cannot each write half
+/// of a different pair.
+static GENERATE: Mutex<()> = Mutex::new(());
+
+/// Makes temporary file names unique among the threads of this process.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Writes `text` to `path` through a temporary file created with mode 0600, then renames
 /// it into place, so the file is never readable by others and never half written.
 pub(crate) fn write_private(path: &Path, text: &str) -> Result<(), TollgateError> {
     let name = path
         .file_name()
         .map_or_else(|| "file".into(), |name| name.to_string_lossy().into_owned());
-    let tmp: PathBuf = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let unique = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp: PathBuf = path.with_file_name(format!(".{name}.{}.{unique}.tmp", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -95,6 +105,7 @@ pub(crate) fn write_private(path: &Path, text: &str) -> Result<(), TollgateError
 }
 
 fn generate_in(dir: &Path) -> Result<CaInfo, TollgateError> {
+    let _serial = GENERATE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(ca) = load_ca(dir)? {
         return Ok(info(&ca, false));
     }
