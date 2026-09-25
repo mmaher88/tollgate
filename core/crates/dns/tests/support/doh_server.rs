@@ -15,7 +15,7 @@ use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tollgate_dns::DohResolver;
 use tollgate_policy::DohUpstream;
@@ -31,6 +31,16 @@ pub enum Mode {
     Status(u16),
     /// Answers 200 with a 5-byte body.
     Short,
+    /// Never answers.
+    Hang,
+    /// Closes the connection carrying the request without answering, then switches back
+    /// to `Answer`.
+    DropOnce,
+    /// Closes the connection carrying every request without answering.
+    DropAlways,
+    /// Answers, then closes the connection gracefully (GOAWAY), as servers do with idle
+    /// connections.
+    AnswerThenGoAway,
     /// Answers once the test calls [`TestServer::open_gate`].
     Gated,
 }
@@ -159,14 +169,34 @@ async fn serve_connection(acceptor: TlsAcceptor, tcp: tokio::net::TcpStream, sta
     let Ok(tls) = acceptor.accept(tcp).await else {
         return;
     };
-    let service = service_fn(move |request| handle(state.clone(), request));
+    let signals = Arc::new(Signals::default());
+    let service = {
+        let signals = signals.clone();
+        service_fn(move |request| handle(state.clone(), signals.clone(), request))
+    };
     let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
     builder.max_concurrent_streams(256);
-    let _ = builder.serve_connection(TokioIo::new(tls), service).await;
+    let connection = builder.serve_connection(TokioIo::new(tls), service);
+    tokio::pin!(connection);
+    tokio::select! {
+        _ = connection.as_mut() => return,
+        // Dropping the connection future closes the socket at once.
+        _ = signals.drop_now.notified() => return,
+        _ = signals.go_away.notified() => connection.as_mut().graceful_shutdown(),
+    }
+    let _ = connection.await;
+}
+
+/// What a request asks of the connection that carries it.
+#[derive(Default)]
+struct Signals {
+    drop_now: Notify,
+    go_away: Notify,
 }
 
 async fn handle(
     state: Arc<State>,
+    signals: Arc<Signals>,
     request: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let (parts, body) = request.into_parts();
@@ -195,6 +225,15 @@ async fn handle(
                 .unwrap());
         }
         Mode::Short => return Ok(Response::new(Full::new(Bytes::from_static(b"short")))),
+        Mode::Hang => std::future::pending::<()>().await,
+        Mode::DropOnce | Mode::DropAlways => {
+            if mode == Mode::DropOnce {
+                *state.mode.lock().unwrap() = Mode::Answer;
+            }
+            signals.drop_now.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Mode::AnswerThenGoAway => signals.go_away.notify_one(),
         Mode::Gated => state.gate.acquire().await.unwrap().forget(),
     }
     Ok(Response::builder()
@@ -224,6 +263,19 @@ pub fn answer_for(query: &[u8]) -> Vec<u8> {
 pub fn trusting(upstreams: Vec<DohUpstream>, servers: &[&TestServer]) -> DohResolver {
     let roots: Vec<_> = servers.iter().map(|server| server.ca.clone()).collect();
     DohResolver::with_extra_roots(upstreams, &roots).unwrap()
+}
+
+/// A listener that completes TCP handshakes (in the kernel) and then never says anything.
+/// Keep it alive for as long as the upstream is used.
+pub async fn silent_upstream() -> (TcpListener, DohUpstream) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = DohUpstream {
+        ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port: listener.local_addr().unwrap().port(),
+        tls_name: TLS_NAME.to_string(),
+        path: "/dns-query".to_string(),
+    };
+    (listener, upstream)
 }
 
 /// An upstream on a local port where nothing listens, so connecting fails at once.
