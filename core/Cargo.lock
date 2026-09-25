@@ -377,6 +377,7 @@ name = "devproxy"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "hickory-proto",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -388,6 +389,9 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tollgate-common",
+ "tollgate-dns",
+ "tollgate-filter",
+ "tollgate-policy",
 ]
 
 [[package]]
