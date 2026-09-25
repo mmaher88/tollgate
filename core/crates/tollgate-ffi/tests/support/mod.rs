@@ -1,6 +1,8 @@
 //! Helpers shared by the integration tests; each test binary uses a different part.
 #![allow(dead_code)]
 
+pub mod doh;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};

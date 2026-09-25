@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
+use rustls::pki_types::CertificateDer;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -78,6 +79,28 @@ impl From<StatsSnapshot> for Stats {
     }
 }
 
+/// Settings Swift never changes; tests use them to reach a local DoH server and to make
+/// the forward queue small.
+#[derive(Clone, Debug)]
+pub struct EngineOptions {
+    /// DER certificates trusted for DoH upstreams in addition to the webpki roots.
+    pub doh_roots: Vec<Vec<u8>>,
+    /// Capacity of the queue between `handle_packets` and the runtime.
+    pub forward_queue: usize,
+    /// DoH queries resolving at once; further jobs wait in the queue.
+    pub forward_in_flight: usize,
+}
+
+impl Default for EngineOptions {
+    fn default() -> EngineOptions {
+        EngineOptions {
+            doh_roots: Vec::new(),
+            forward_queue: FORWARD_QUEUE,
+            forward_in_flight: tollgate_dns::MAX_IN_FLIGHT,
+        }
+    }
+}
+
 struct Running {
     port: u16,
     jobs: mpsc::Sender<ForwardJob>,
@@ -100,6 +123,7 @@ struct Work {
 pub struct Engine {
     data_dir: PathBuf,
     config: Config,
+    options: EngineOptions,
     mitm_active: bool,
     stats: Arc<Counters>,
     dns: Arc<DnsHandler>,
@@ -115,7 +139,9 @@ impl Engine {
     /// `engine.dat`; without them every connection is passed through.
     #[uniffi::constructor]
     pub fn new(config_json: String, data_dir: String) -> Result<Arc<Engine>, TollgateError> {
-        catch_panic(|| Engine::open(&config_json, Path::new(&data_dir)))
+        catch_panic(|| {
+            Engine::with_options(&config_json, Path::new(&data_dir), EngineOptions::default())
+        })
     }
 
     /// Starts the runtime thread with the proxy on `127.0.0.1` and returns the proxy's port
@@ -184,7 +210,12 @@ impl Engine {
 }
 
 impl Engine {
-    fn open(config_json: &str, data_dir: &Path) -> Result<Arc<Engine>, TollgateError> {
+    /// [`Engine::new`] with explicit options, for tests and tools.
+    pub fn with_options(
+        config_json: &str,
+        data_dir: &Path,
+        options: EngineOptions,
+    ) -> Result<Arc<Engine>, TollgateError> {
         let config = Config::from_json(config_json).map_err(|e| TollgateError::Config {
             message: e.to_string(),
         })?;
@@ -241,6 +272,7 @@ impl Engine {
         Ok(Arc::new(Engine {
             data_dir: data_dir.to_path_buf(),
             config,
+            options,
             mitm_active,
             stats,
             dns,
@@ -280,19 +312,35 @@ impl Engine {
         replies
     }
 
+    fn resolver(&self) -> Result<DohResolver, TollgateError> {
+        let upstreams = self.config.doh_upstreams.clone();
+        if self.options.doh_roots.is_empty() {
+            return Ok(DohResolver::new(upstreams));
+        }
+        let roots: Vec<CertificateDer<'static>> = self
+            .options
+            .doh_roots
+            .iter()
+            .map(|der| CertificateDer::from(der.clone()))
+            .collect();
+        DohResolver::with_extra_roots(upstreams, &roots).map_err(|e| TollgateError::Config {
+            message: e.to_string(),
+        })
+    }
+
     fn start_runtime(&self, sink: Arc<dyn PacketSink>) -> Result<u16, TollgateError> {
         let mut running = self.running();
         if running.is_some() {
             return Err(TollgateError::AlreadyRunning);
         }
-        let (jobs, queue) = mpsc::channel(FORWARD_QUEUE);
+        let (jobs, queue) = mpsc::channel(self.options.forward_queue.max(1));
         let work = Work {
             proxy: self.proxy.clone(),
             dns: self.dns.clone(),
-            resolver: DohResolver::new(self.config.doh_upstreams.clone()),
+            resolver: self.resolver()?,
             sink,
             queue,
-            in_flight: tollgate_dns::MAX_IN_FLIGHT,
+            in_flight: self.options.forward_in_flight.max(1),
         };
         let (shutdown, stopped) = oneshot::channel();
         let (ready_tx, ready) = std::sync::mpsc::sync_channel(1);

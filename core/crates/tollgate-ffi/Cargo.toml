@@ -14,6 +14,7 @@ crate-type = ["lib", "staticlib"]
 arc-swap = { workspace = true }
 log = { workspace = true }
 ring = { workspace = true }
+rustls = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tollgate-common = { workspace = true }
@@ -24,5 +25,11 @@ tollgate-policy = { workspace = true }
 uniffi = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
 hickory-proto = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+rcgen = { workspace = true }
 tempfile = { workspace = true }
+tokio-rustls = { workspace = true }
