@@ -3,10 +3,13 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use hickory_proto::op::{Message, OpCode};
+use tollgate_common::clock::unix_secs;
+use tollgate_common::events::{BlockEvent, EventKind, EventLog};
 use tollgate_common::stats::Stats;
 use tollgate_filter::DomainSet;
+use tollgate_policy::HostPattern;
 
 use crate::answer::{self, FORMERR, NOERROR, NOTIMP, Requester, SERVFAIL, UpstreamAnswer};
 use crate::cache::AnswerCache;
@@ -51,6 +54,9 @@ impl ForwardJob {
 /// waiting on the network.
 pub struct DnsHandler {
     blocklist: ArcSwapOption<DomainSet>,
+    /// Names matching one of these are never blocked.
+    allowlist: ArcSwap<Vec<HostPattern>>,
+    events: ArcSwapOption<EventLog>,
     cache: Mutex<AnswerCache>,
     stats: Arc<Stats>,
 }
@@ -72,6 +78,8 @@ impl DnsHandler {
     pub fn new(blocklist: Option<Arc<DomainSet>>, stats: Arc<Stats>) -> DnsHandler {
         DnsHandler {
             blocklist: ArcSwapOption::new(blocklist),
+            allowlist: ArcSwap::from_pointee(Vec::new()),
+            events: ArcSwapOption::empty(),
             cache: Mutex::new(AnswerCache::new()),
             stats,
         }
@@ -82,11 +90,36 @@ impl DnsHandler {
         self.blocklist.store(blocklist);
     }
 
+    /// Replaces the allowlist: names matching a pattern are resolved normally (forwarded or
+    /// answered from the cache) even when the blocklist has them.
+    pub fn set_allowlist(&self, patterns: Vec<HostPattern>) {
+        self.allowlist.store(Arc::new(patterns));
+    }
+
+    /// Where blocks are recorded; `None` records nothing.
+    pub fn set_events(&self, events: Option<Arc<EventLog>>) {
+        self.events.store(events);
+    }
+
     fn is_blocked(&self, name: &str) -> bool {
         self.blocklist
             .load()
             .as_ref()
             .is_some_and(|set| set.is_blocked(name))
+            && !self.allowlist.load().iter().any(|p| p.matches(name))
+    }
+
+    fn record_block(&self, name: &str) {
+        if let Some(events) = self.events.load().as_ref() {
+            let host = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+            events.record(BlockEvent {
+                unix_secs: unix_secs(),
+                kind: EventKind::Dns,
+                host,
+                url: None,
+                source_host: None,
+            });
+        }
     }
 
     fn cache(&self) -> std::sync::MutexGuard<'_, AnswerCache> {
@@ -127,8 +160,10 @@ impl DnsHandler {
         if matches!(u16::from(question.query_type()), TYPE_SVCB | TYPE_HTTPS) {
             return reply(requester.empty(NOERROR));
         }
-        if self.is_blocked(&question.name().to_ascii()) {
+        let name = question.name().to_ascii();
+        if self.is_blocked(&name) {
             Stats::inc(&self.stats.dns_blocked);
+            self.record_block(&name);
             return reply(requester.blocked());
         }
         let key = wire::question_key(query, question_end);
