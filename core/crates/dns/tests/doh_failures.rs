@@ -1,11 +1,13 @@
 mod support;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hickory_proto::rr::RecordType;
 use support::doh_server::{Mode, TestServer, silent_upstream, trusting};
 use support::{decode, query};
-use tollgate_dns::{COLD_DEADLINE, DohError, DohResolver, WARM_DEADLINE};
+use tollgate_dns::{COLD_DEADLINE, DohError, DohResolver, MAX_IDLE, WARM_DEADLINE};
 
 fn assert_between(elapsed: Duration, low: Duration, high: Duration) {
     assert!(
@@ -18,6 +20,7 @@ fn assert_between(elapsed: Duration, low: Duration, high: Duration) {
 fn deadlines() {
     assert_eq!(COLD_DEADLINE, Duration::from_millis(2000));
     assert_eq!(WARM_DEADLINE, Duration::from_millis(1500));
+    assert_eq!(MAX_IDLE, Duration::from_secs(30));
 }
 
 #[tokio::test]
@@ -136,4 +139,32 @@ async fn reconnects_after_the_server_closes_an_idle_connection() {
     resolver.resolve(&query).await.unwrap();
     assert_eq!(server.connections(), 2);
     assert_eq!(server.requests(), 2);
+}
+
+#[tokio::test]
+async fn a_connection_idle_longer_than_max_idle_is_replaced_before_use() {
+    let server = TestServer::start().await;
+    let now = Arc::new(AtomicU64::new(1_000));
+    let clock = now.clone();
+    let resolver = trusting(vec![server.upstream()], &[&server])
+        .with_clock(move || clock.load(Ordering::SeqCst));
+    let query = query(1, "example.com.", RecordType::A, None);
+    resolver.resolve(&query).await.unwrap();
+
+    // Idle for less than MAX_IDLE: the connection is used again, and idle time counts
+    // from this request, not from when the connection opened.
+    now.fetch_add(MAX_IDLE.as_secs() - 1, Ordering::SeqCst);
+    resolver.resolve(&query).await.unwrap();
+    assert_eq!(server.connections(), 1);
+
+    // The device slept: the first connection is dead, and has been idle too long.
+    server.set_mode(Mode::HangConnection(1));
+    now.fetch_add(MAX_IDLE.as_secs() + 1, Ordering::SeqCst);
+    let start = Instant::now();
+    let answer = resolver.resolve(&query).await.unwrap();
+    assert!(start.elapsed() < COLD_DEADLINE, "{:?}", start.elapsed());
+    assert_eq!(decode(&answer).answers.len(), 1);
+    assert_eq!(server.connections(), 2);
+    // The dead connection never saw the query.
+    assert_eq!(server.requests(), 3);
 }

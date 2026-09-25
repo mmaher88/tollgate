@@ -26,6 +26,10 @@ use tollgate_policy::DohUpstream;
 pub const COLD_DEADLINE: Duration = Duration::from_millis(2000);
 /// Deadline for one attempt on an open connection.
 pub const WARM_DEADLINE: Duration = Duration::from_millis(1500);
+/// A connection that has not completed a request for this long is not trusted to be
+/// alive (the device may have slept, and NAT or the server dropped it): the next query
+/// opens a new connection under the cold deadline instead of waiting out the warm one.
+pub const MAX_IDLE: Duration = Duration::from_secs(30);
 /// Queries resolving at once; above it `resolve` fails at once with [`DohError::Busy`].
 pub const MAX_IN_FLIGHT: usize = 128;
 
@@ -82,6 +86,8 @@ impl Failure {
 struct Slot {
     sender: Option<SendRequest<Full<Bytes>>>,
     generation: u64,
+    /// When the connection opened or last completed a request, from the resolver's clock.
+    last_used: u64,
 }
 
 struct Upstream {
@@ -100,12 +106,16 @@ struct Inner {
     in_flight: Semaphore,
 }
 
+/// Seconds from a clock that keeps counting while the device sleeps.
+type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 /// DNS over HTTPS client. Cheap to clone; clones share connections and the in-flight limit.
 /// `resolve` must run on a tokio runtime (it spawns each connection's driver task), and its
 /// future is `Send`, so callers can spawn one task per query.
 #[derive(Clone)]
 pub struct DohResolver {
     inner: Arc<Inner>,
+    clock: Clock,
 }
 
 impl DohResolver {
@@ -154,6 +164,17 @@ impl DohResolver {
                 tls: TlsConnector::from(tls),
                 in_flight: Semaphore::new(MAX_IN_FLIGHT),
             }),
+            clock: Arc::new(tollgate_common::clock::now_secs),
+        }
+    }
+
+    /// This resolver with `clock` (seconds, counting through sleep) in place of
+    /// `tollgate_common::clock::now_secs` for measuring how long connections were idle.
+    /// Clones made earlier keep their clock. For tests.
+    pub fn with_clock(self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> DohResolver {
+        DohResolver {
+            clock: Arc::new(clock),
+            ..self
         }
     }
 
@@ -172,7 +193,7 @@ impl DohResolver {
         let body = Bytes::from(body);
         let mut last = DohError::NoUpstream;
         for upstream in &self.inner.upstreams {
-            match upstream.query(&self.inner.tls, &body).await {
+            match upstream.query(&self.inner.tls, &body, &*self.clock).await {
                 Ok(mut answer) => {
                     answer[..2].copy_from_slice(&query[..2]);
                     return Ok(answer);
@@ -218,12 +239,21 @@ impl Upstream {
         })
     }
 
-    /// One query: an attempt on the open connection if there is one (retried once on a new
-    /// connection if that connection turns out to be closed), otherwise an attempt on a new
-    /// connection.
-    async fn query(&self, tls: &TlsConnector, body: &Bytes) -> Result<Vec<u8>, DohError> {
-        if let Some((generation, sender)) = self.open_sender() {
-            match timeout(WARM_DEADLINE, self.exchange(sender, body.clone())).await {
+    /// One query: an attempt on the open connection if there is one that was used within
+    /// [`MAX_IDLE`] (retried once on a new connection if that connection turns out to be
+    /// closed), otherwise an attempt on a new connection.
+    async fn query(
+        &self,
+        tls: &TlsConnector,
+        body: &Bytes,
+        now: &(dyn Fn() -> u64 + Send + Sync),
+    ) -> Result<Vec<u8>, DohError> {
+        if let Some((generation, sender)) = self.open_sender(now()) {
+            let result = timeout(WARM_DEADLINE, self.exchange(sender, body.clone())).await;
+            if let Ok(Ok(_) | Err(Failure::Answer(_))) = &result {
+                self.touch(generation, now());
+            }
+            match result {
                 Ok(Ok(answer)) => return Ok(answer),
                 Ok(Err(Failure::Answer(e))) => return Err(e),
                 Ok(Err(Failure::Connection(e))) => {
@@ -239,10 +269,12 @@ impl Upstream {
             }
         }
         let attempt = async {
-            let sender = self.connected_sender(tls).await?;
-            self.exchange(sender, body.clone())
-                .await
-                .map_err(Failure::into_error)
+            let (generation, sender) = self.connected_sender(tls, now).await?;
+            let result = self.exchange(sender, body.clone()).await;
+            if let Ok(_) | Err(Failure::Answer(_)) = &result {
+                self.touch(generation, now());
+            }
+            result.map_err(Failure::into_error)
         };
         timeout(COLD_DEADLINE, attempt)
             .await
@@ -253,10 +285,29 @@ impl Upstream {
         self.slot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn open_sender(&self) -> Option<(u64, SendRequest<Full<Bytes>>)> {
-        let slot = self.slot();
-        let sender = slot.sender.as_ref().filter(|s| !s.is_closed())?;
-        Some((slot.generation, sender.clone()))
+    /// The open connection, unless it has been idle for longer than [`MAX_IDLE`]: after the
+    /// device sleeps it is probably dead, and finding out would cost the warm deadline.
+    fn open_sender(&self, now: u64) -> Option<(u64, SendRequest<Full<Bytes>>)> {
+        let mut slot = self.slot();
+        let sender = slot.sender.as_ref().filter(|s| !s.is_closed())?.clone();
+        let idle = now.saturating_sub(slot.last_used);
+        if idle > MAX_IDLE.as_secs() {
+            log::debug!(
+                "DoH connection to {} was idle for {idle} s; reconnecting",
+                self.name
+            );
+            slot.sender = None;
+            return None;
+        }
+        Some((slot.generation, sender))
+    }
+
+    /// Records that the connection `generation` just completed a request.
+    fn touch(&self, generation: u64, now: u64) {
+        let mut slot = self.slot();
+        if slot.generation == generation {
+            slot.last_used = slot.last_used.max(now);
+        }
     }
 
     fn discard(&self, generation: u64) {
@@ -271,16 +322,18 @@ impl Upstream {
     async fn connected_sender(
         &self,
         tls: &TlsConnector,
-    ) -> Result<SendRequest<Full<Bytes>>, DohError> {
+        now: &(dyn Fn() -> u64 + Send + Sync),
+    ) -> Result<(u64, SendRequest<Full<Bytes>>), DohError> {
         let _connecting = self.connecting.lock().await;
-        if let Some((_, sender)) = self.open_sender() {
-            return Ok(sender);
+        if let Some(open) = self.open_sender(now()) {
+            return Ok(open);
         }
         let sender = self.connect(tls).await?;
         let mut slot = self.slot();
         slot.generation += 1;
         slot.sender = Some(sender.clone());
-        Ok(sender)
+        slot.last_used = now();
+        Ok((slot.generation, sender))
     }
 
     async fn connect(&self, tls: &TlsConnector) -> Result<SendRequest<Full<Bytes>>, DohError> {

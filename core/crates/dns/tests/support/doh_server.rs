@@ -43,6 +43,9 @@ pub enum Mode {
     AnswerThenGoAway,
     /// Answers once the test calls [`TestServer::open_gate`].
     Gated,
+    /// Never answers requests on the connection with this number (the first accepted is
+    /// 1), like a connection that died while the device slept; answers on the others.
+    HangConnection(usize),
 }
 
 /// One request as the server saw it.
@@ -121,8 +124,13 @@ impl TestServer {
                 let Ok((tcp, _)) = listener.accept().await else {
                     continue;
                 };
-                accepting.connections.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(serve_connection(acceptor.clone(), tcp, accepting.clone()));
+                let number = accepting.connections.fetch_add(1, Ordering::SeqCst) + 1;
+                tokio::spawn(serve_connection(
+                    acceptor.clone(),
+                    tcp,
+                    number,
+                    accepting.clone(),
+                ));
             }
         });
         TestServer { addr, ca, state }
@@ -166,14 +174,19 @@ impl TestServer {
     }
 }
 
-async fn serve_connection(acceptor: TlsAcceptor, tcp: tokio::net::TcpStream, state: Arc<State>) {
+async fn serve_connection(
+    acceptor: TlsAcceptor,
+    tcp: tokio::net::TcpStream,
+    number: usize,
+    state: Arc<State>,
+) {
     let Ok(tls) = acceptor.accept(tcp).await else {
         return;
     };
     let signals = Arc::new(Signals::default());
     let service = {
         let signals = signals.clone();
-        service_fn(move |request| handle(state.clone(), signals.clone(), request))
+        service_fn(move |request| handle(state.clone(), signals.clone(), number, request))
     };
     let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
     builder.max_concurrent_streams(256);
@@ -198,6 +211,7 @@ struct Signals {
 async fn handle(
     state: Arc<State>,
     signals: Arc<Signals>,
+    connection: usize,
     request: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let (parts, body) = request.into_parts();
@@ -236,6 +250,8 @@ async fn handle(
         }
         Mode::AnswerThenGoAway => signals.go_away.notify_one(),
         Mode::Gated => state.gate.acquire().await.unwrap().forget(),
+        Mode::HangConnection(hung) if hung == connection => std::future::pending::<()>().await,
+        Mode::HangConnection(_) => {}
     }
     Ok(Response::builder()
         .header("content-type", "application/dns-message")
