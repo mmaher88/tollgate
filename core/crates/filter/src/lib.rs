@@ -2,12 +2,14 @@
 //! blocklist, and compiling both from filter lists.
 
 mod domain_rules;
+mod domain_set;
 mod engine;
 mod request_type;
 
 use std::path::PathBuf;
 
 pub use domain_rules::DomainRules;
+pub use domain_set::{DomainSet, DomainSetError};
 pub use engine::{
     FilterEngine, REGEX_CLEANUP_INTERVAL, REGEX_DISCARD_UNUSED, Verdict, network_rule_count,
 };
@@ -40,4 +42,6 @@ pub enum FilterError {
     },
     #[error("engine data rejected: {0}")]
     Engine(String),
+    #[error("domain set rejected: {0}")]
+    DomainSet(#[from] DomainSetError),
 }
