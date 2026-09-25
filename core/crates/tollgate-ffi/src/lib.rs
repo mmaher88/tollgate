@@ -18,7 +18,8 @@ pub use ca::{
     ca_mobileconfig, ca_test_leaf, generate_ca, load_ca,
 };
 pub use engine::{
-    Engine, EngineOptions, FORWARD_QUEUE, LEARNED_PINS_FILE, PacketSink, RUNTIME_THREAD, Stats,
+    Engine, EngineOptions, FORWARD_QUEUE, LEARNED_PINS_FILE, PINS_SAVE_INTERVAL, PacketSink,
+    RUNTIME_THREAD, Stats,
 };
 pub use error::{TollgateError, catch_panic, panic_message};
 pub use lists::{CompileReport, ListFormat, ListInput, ListTarget, compile_lists};

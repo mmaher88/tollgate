@@ -27,8 +27,11 @@ use crate::error::{TollgateError, catch_panic, panic_message};
 
 /// Name of the thread that runs the proxy and the DNS forwarder.
 pub const RUNTIME_THREAD: &str = "tollgate-core";
-/// Learned certificate pins, read by `Engine::new` and written by `Engine::stop`.
+/// Learned certificate pins, read by `Engine::new`, written while the engine runs when they
+/// change and again by `Engine::stop`.
 pub const LEARNED_PINS_FILE: &str = "learned-pins.json";
+/// Default for [`EngineOptions::pins_save_interval`].
+pub const PINS_SAVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Forwarded queries waiting for the runtime; when full, new ones get SERVFAIL at once.
 pub const FORWARD_QUEUE: usize = 256;
 /// Threads tokio may start for blocking work (the proxy's `getaddrinfo` calls).
@@ -89,6 +92,9 @@ pub struct EngineOptions {
     pub forward_queue: usize,
     /// DoH queries resolving at once; further jobs wait in the queue.
     pub forward_in_flight: usize,
+    /// How often the running engine checks whether the learned pins changed and saves
+    /// them. `stop` saves them too, but jetsam or a crash ends the extension without it.
+    pub pins_save_interval: Duration,
 }
 
 impl Default for EngineOptions {
@@ -97,6 +103,7 @@ impl Default for EngineOptions {
             doh_roots: Vec::new(),
             forward_queue: FORWARD_QUEUE,
             forward_in_flight: tollgate_dns::MAX_IN_FLIGHT,
+            pins_save_interval: PINS_SAVE_INTERVAL,
         }
     }
 }
@@ -116,6 +123,10 @@ struct Work {
     sink: Arc<dyn PacketSink>,
     queue: mpsc::Receiver<ForwardJob>,
     in_flight: usize,
+    pins_file: PathBuf,
+    pins_save_interval: Duration,
+    /// The learned pins when `start` ran; the file holds these or equivalent ones.
+    pins_at_start: String,
 }
 
 /// The tunnel's Rust side: DNS answers, the DNS forwarder and the HTTPS proxy.
@@ -341,6 +352,9 @@ impl Engine {
             sink,
             queue,
             in_flight: self.options.forward_in_flight.max(1),
+            pins_file: self.data_dir.join(LEARNED_PINS_FILE),
+            pins_save_interval: self.options.pins_save_interval,
+            pins_at_start: self.proxy.policy.learned_pins_json(),
         };
         let (shutdown, stopped) = oneshot::channel();
         let (ready_tx, ready) = std::sync::mpsc::sync_channel(1);
@@ -398,9 +412,7 @@ impl Engine {
 
     fn save_pins(&self) {
         let path = self.data_dir.join(LEARNED_PINS_FILE);
-        if let Err(e) = write_private(&path, &self.proxy.policy.learned_pins_json()) {
-            log::warn!("could not save learned pins: {e}");
-        }
+        save_pins(&path, &self.proxy.policy.learned_pins_json());
     }
 }
 
@@ -427,6 +439,16 @@ fn load_domains(dir: &Path) -> Result<Option<Arc<DomainSet>>, TollgateError> {
         Err(e) => Err(TollgateError::Lists {
             message: e.to_string(),
         }),
+    }
+}
+
+fn save_pins(path: &Path, json: &str) -> bool {
+    match write_private(path, json) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("could not save learned pins: {e}");
+            false
+        }
     }
 }
 
@@ -514,13 +536,47 @@ async fn serve(
         sink,
         queue,
         in_flight,
+        pins_file,
+        pins_save_interval,
+        pins_at_start,
     } = work;
     let forwarding = tokio::spawn(forward(queue, resolver, dns, sink, in_flight));
+    let saving = tokio::spawn(save_pins_periodically(
+        proxy.policy.clone(),
+        pins_file,
+        pins_save_interval,
+        pins_at_start,
+    ));
     tollgate_mitm::serve(listener, proxy, async move {
         let _ = stopped.await;
     })
     .await;
     forwarding.abort();
+    // The write runs on this thread, so it has finished before `stop` joins the thread and
+    // saves the pins itself.
+    saving.abort();
+}
+
+/// Saves the learned pins every `interval` if they differ from `saved`, the last pins
+/// written, so pins survive an extension that ends without `stop` (jetsam, a crash).
+async fn save_pins_periodically(
+    policy: Arc<Policy>,
+    path: PathBuf,
+    interval: Duration,
+    mut saved: String,
+) {
+    let mut ticks = tokio::time::interval(interval.max(Duration::from_millis(1)));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick completes at once.
+    ticks.tick().await;
+    loop {
+        ticks.tick().await;
+        let json = policy.learned_pins_json();
+        if json != saved && save_pins(&path, &json) {
+            log::debug!("saved learned pins");
+            saved = json;
+        }
+    }
 }
 
 /// Resolves queued queries, at most `in_flight` at once, one task each.
@@ -562,12 +618,51 @@ fn deliver(sink: &dyn PacketSink, packets: Vec<Vec<u8>>) {
 
 #[cfg(test)]
 mod tests {
+    use tollgate_policy::RejectionKind;
+
     use super::*;
 
     struct NullSink;
 
     impl PacketSink for NullSink {
         fn write_packets(&self, _packets: Vec<Vec<u8>>) {}
+    }
+
+    #[test]
+    fn learned_pins_are_saved_while_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = EngineOptions {
+            pins_save_interval: Duration::from_millis(50),
+            ..EngineOptions::default()
+        };
+        let engine = Engine::with_options("{}", dir.path(), options).unwrap();
+        engine.start(Arc::new(NullSink)).unwrap();
+        let now = tollgate_common::clock::unix_secs();
+        let policy = &engine.proxy.policy;
+        assert!(!policy.record_client_rejection("pinned.example", RejectionKind::UnknownCa, now));
+        assert!(policy.record_client_rejection("pinned.example", RejectionKind::UnknownCa, now));
+
+        let path = dir.path().join(LEARNED_PINS_FILE);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&path).is_ok_and(|json| json.contains("pinned.example")) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pins were not saved"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(engine.port().is_some(), "saved while the engine runs");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            engine.learned_pins_json()
+        );
+        engine.stop();
     }
 
     #[test]
