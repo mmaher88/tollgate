@@ -9,11 +9,13 @@ web views and third-party apps.
 It is not distributed through the App Store. It is built and signed by GitHub Actions with
 the owner's Apple Developer account and installed from a Linux workstation.
 
-Status: M2, the first testable app. The tunnel runs the Rust core (DNS blocking with DNS
-over HTTPS, and HTTPS filtering through a local proxy once the certificate is trusted); the
-app downloads and compiles the filter lists, installs the certificate and shows activity.
-The core is verified on Linux with `devproxy`; the on-device checks are in
-[docs/experiments/m2.md](docs/experiments/m2.md). See the
+Status: M3. The tunnel runs the Rust core (DNS blocking with DNS over HTTPS, and HTTPS
+filtering through a local proxy once the certificate is trusted). The app downloads,
+caches and compiles the filter lists (daily, in the background), installs the certificate,
+and has an Activity tab with recent blocks and Settings for lists, your own rules, allowed
+sites, never-filtered hosts and learned certificate pins. The core is verified on Linux with
+`devproxy`; the on-device checks are in [docs/experiments/m2.md](docs/experiments/m2.md) and
+[docs/experiments/m3.md](docs/experiments/m3.md). See the
 [design](docs/superpowers/specs/2026-09-24-tollgate-design.md) and the
 [feasibility research](docs/research/2026-09-23-feasibility-brief.md).
 
