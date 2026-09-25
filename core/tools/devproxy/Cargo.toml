@@ -7,18 +7,23 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 bytes = { workspace = true }
+env_logger = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 log = { workspace = true }
 rustls = { workspace = true }
+socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 tokio-rustls = { workspace = true }
 tollgate-common = { workspace = true }
 tollgate-dns = { workspace = true }
+tollgate-ffi = { workspace = true }
 tollgate-filter = { workspace = true }
+tollgate-mitm = { workspace = true }
 tollgate-policy = { workspace = true }
 
 [dev-dependencies]

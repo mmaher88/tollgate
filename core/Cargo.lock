@@ -376,7 +376,9 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 name = "devproxy"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bytes",
+ "env_logger",
  "hickory-proto",
  "http-body-util",
  "hyper",
@@ -384,13 +386,16 @@ dependencies = [
  "log",
  "rcgen",
  "rustls",
+ "socket2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tollgate-common",
  "tollgate-dns",
+ "tollgate-ffi",
  "tollgate-filter",
+ "tollgate-mitm",
  "tollgate-policy",
 ]
 
@@ -410,6 +415,26 @@ name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
+
+[[package]]
+name = "env_filter"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217"
+dependencies = [
+ "log",
+ "regex",
+]
+
+[[package]]
+name = "env_logger"
+version = "0.11.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de671bd27a75a797dc9ae289ba1e77276e75e2026408aab65185384e2d5cd3f6"
+dependencies = [
+ "env_filter",
+ "log",
+]
 
 [[package]]
 name = "equivalent"
