@@ -6,6 +6,9 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TransportSlice};
+use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
+use hickory_proto::rr::{Name, RecordType};
+use tollgate_dns::{ForwardJob, Outcome};
 
 pub const CLIENT_V4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
 pub const CLIENT_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x7467, 0, 0, 0, 0, 0, 2);
@@ -112,5 +115,49 @@ pub fn checksums_valid(packet: &[u8]) -> bool {
             fold(acc) == 0xffff && udp[6..8] != [0, 0]
         }
         _ => false,
+    }
+}
+
+/// A recursion-desired query, with OPT when `edns` is `Some((udp payload size, DO bit))`.
+pub fn query(id: u16, name: &str, rtype: RecordType, edns: Option<(u16, bool)>) -> Vec<u8> {
+    let mut message = Message::new(id, MessageType::Query, OpCode::Query);
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(Name::from_ascii(name).unwrap(), rtype));
+    if let Some((size, dnssec_ok)) = edns {
+        let mut opt = Edns::new();
+        opt.set_max_payload(size).set_dnssec_ok(dnssec_ok);
+        message.set_edns(opt);
+    }
+    message.to_vec().unwrap()
+}
+
+/// `query` wrapped in an IPv4 packet from the client to the tunnel's DNS address.
+pub fn query_packet(id: u16, name: &str, rtype: RecordType, edns: Option<(u16, bool)>) -> Vec<u8> {
+    udp_packet(client_v4(), dns_v4(), &query(id, name, rtype, edns))
+}
+
+pub fn decode(payload: &[u8]) -> Message {
+    Message::from_vec(payload).expect("the reply decodes")
+}
+
+/// The reply packet of a `Reply` outcome, checked to go from the tunnel's DNS address back
+/// to the client with valid checksums.
+pub fn expect_reply(outcome: Outcome) -> Datagram {
+    let Outcome::Reply(packet) = outcome else {
+        panic!("expected a reply, got {outcome:?}");
+    };
+    checked_reply(&packet)
+}
+
+/// Reads a reply packet and checks its checksums.
+pub fn checked_reply(packet: &[u8]) -> Datagram {
+    assert!(checksums_valid(packet), "bad checksums: {packet:02x?}");
+    read_udp(packet)
+}
+
+pub fn expect_forward(outcome: Outcome) -> ForwardJob {
+    match outcome {
+        Outcome::Forward(job) => job,
+        other => panic!("expected a forward job, got {other:?}"),
     }
 }

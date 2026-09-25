@@ -7,4 +7,8 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 etherparse = { workspace = true }
+hickory-proto = { workspace = true }
+tollgate-common = { workspace = true }
+tollgate-filter = { workspace = true }
