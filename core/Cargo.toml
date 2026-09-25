@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/common",
     "crates/policy",
+    "crates/filter",
     "crates/tollgate-ffi",
     "tools/uniffi-bindgen-swift",
 ]
@@ -18,6 +19,7 @@ publish = false
 # Internal crates.
 tollgate-common = { path = "crates/common" }
 tollgate-policy = { path = "crates/policy" }
+tollgate-filter = { path = "crates/filter" }
 
 # FFI. Default features are off so the runtime crate does not build cargo_metadata;
 # tools/uniffi-bindgen-swift turns on the features it needs.
