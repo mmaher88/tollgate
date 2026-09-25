@@ -8,10 +8,23 @@ publish.workspace = true
 
 [dependencies]
 arc-swap = { workspace = true }
+bytes = { workspace = true }
 etherparse = { workspace = true }
 hickory-proto = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 log = { workspace = true }
 lru = { workspace = true }
+rustls = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tollgate-common = { workspace = true }
 tollgate-filter = { workspace = true }
+tollgate-policy = { workspace = true }
+
+[dev-dependencies]
+hyper = { workspace = true, features = ["server"] }
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }

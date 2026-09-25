@@ -3,6 +3,8 @@
 //! RFC 1071 checksum, never with the crate's own packet code.
 #![allow(dead_code)]
 
+pub mod doh_server;
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TransportSlice};
