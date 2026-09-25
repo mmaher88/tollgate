@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/tollgate-ffi", "tools/uniffi-bindgen-swift"]
+members = [
+    "crates/tollgate-ffi",
+    "tools/uniffi-bindgen-swift",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,8 +13,30 @@ rust-version = "1.94"
 publish = false
 
 [workspace.dependencies]
-uniffi = "0.32.2"
+# FFI. Default features are off so the runtime crate does not build cargo_metadata;
+# tools/uniffi-bindgen-swift turns on the features it needs.
+uniffi = { version = "0.32.2", default-features = false }
 ring = "0.17.14"
+
+# TLS with the ring provider only. Every rustls-based crate needs default-features = false,
+# or aws-lc-sys comes back.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+webpki-roots = "1.0.9"
+
+# Filtering. adblock is pinned exactly: the app writes engine.dat and the extension reads it.
+# default-features = false drops "single-thread", which would make the engine !Send.
+adblock = { version = "=0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
+memmap2 = "0.9.11"
+
+libc = "0.2.189"
+log = "0.4.34"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+
+# Tests only.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
+tempfile = "3.27.0"
 
 [profile.release]
 opt-level = "s"
