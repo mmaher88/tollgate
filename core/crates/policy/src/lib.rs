@@ -1,9 +1,11 @@
 //! Which connections the proxy may intercept: the configuration shared with Swift, host
 //! patterns, the bundled passthrough list and certificate pin learning.
 
+mod bundled;
 mod config;
 mod pattern;
 
+pub use bundled::bundled_passthrough;
 pub use config::{Config, DohUpstream};
 pub use pattern::HostPattern;
 
