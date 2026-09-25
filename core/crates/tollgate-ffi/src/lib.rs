@@ -8,8 +8,10 @@
 uniffi::setup_scaffolding!();
 
 mod error;
+mod logging;
 
 pub use error::{TollgateError, catch_panic, panic_message};
+pub use logging::{CoreLogger, LogLevel, set_logger};
 
 /// Version of the Rust core, shown in the app and logged by the tunnel.
 #[uniffi::export]
