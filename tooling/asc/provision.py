@@ -5,7 +5,7 @@
 # ///
 """Provision Tollgate's signing assets through the App Store Connect API.
 
-Environment:
+Environment (any variable not set is read from ~/.config/tollgate/asc.env, same KEY="value" format):
   ASC_KEY_ID     API key ID
   ASC_ISSUER_ID  issuer ID of the Team key (individual keys cannot use provisioning endpoints)
   ASC_KEY_PATH   path to AuthKey_<KEYID>.p8
@@ -43,6 +43,8 @@ from cryptography.x509.oid import NameOID
 ROOT = Path(__file__).resolve().parents[2]
 OUT = Path(__file__).resolve().parent / "out"
 API = "https://api.appstoreconnect.apple.com/v1"
+ASC_ENV_FILE = Path("~/.config/tollgate/asc.env").expanduser()
+ASC_VARIABLES = ("ASC_KEY_ID", "ASC_ISSUER_ID", "ASC_KEY_PATH")
 CAPABILITIES = ("NETWORK_EXTENSIONS", "APP_GROUPS")
 
 
@@ -55,6 +57,18 @@ def load_config(path: Path) -> dict[str, str]:
         if m:
             values[m.group(1)] = m.group(2)
     return values
+
+
+def asc_settings(environ, env_file: Path) -> dict[str, str]:
+    """API key settings from the environment, falling back to env_file for missing ones."""
+    from_file = load_config(env_file) if env_file.exists() else {}
+    settings = {}
+    for name in ASC_VARIABLES:
+        if name in environ:
+            settings[name] = environ[name]
+        elif name in from_file:
+            settings[name] = from_file[name]
+    return settings
 
 
 def make_token(key_id: str, issuer_id: str, private_key_pem: bytes, now: dt.datetime) -> str:
@@ -90,12 +104,13 @@ def profile_plist(profile_bytes: bytes) -> dict:
 
 class Client:
     def __init__(self) -> None:
+        settings = asc_settings(os.environ, ASC_ENV_FILE)
         try:
-            self.key_id = os.environ["ASC_KEY_ID"]
-            self.issuer_id = os.environ["ASC_ISSUER_ID"]
-            self.key_pem = Path(os.environ["ASC_KEY_PATH"]).expanduser().read_bytes()
+            self.key_id = settings["ASC_KEY_ID"]
+            self.issuer_id = settings["ASC_ISSUER_ID"]
+            self.key_pem = Path(settings["ASC_KEY_PATH"]).expanduser().read_bytes()
         except KeyError as missing:
-            sys.exit(f"missing environment variable {missing}")
+            sys.exit(f"{missing} is not set in the environment or in {ASC_ENV_FILE}")
         except OSError as err:
             sys.exit(f"cannot read ASC_KEY_PATH: {err}")
         if not self.issuer_id:

@@ -80,3 +80,15 @@ def test_load_config_reads_quoted_values(tmp_path):
     p.write_text('# comment\nTOLLGATE_BUNDLE_ID="io.example.app"\nTOLLGATE_APP_PROFILE="Tollgate App Dev"\n')
     assert provision.load_config(p) == {"TOLLGATE_BUNDLE_ID": "io.example.app",
                                         "TOLLGATE_APP_PROFILE": "Tollgate App Dev"}
+
+
+def test_asc_settings_fill_from_file_and_env_wins(tmp_path):
+    f = tmp_path / "asc.env"
+    f.write_text('ASC_KEY_ID="FROMFILE"\nASC_ISSUER_ID="issuer-from-file"\nASC_KEY_PATH="~/k.p8"\n')
+    settings = provision.asc_settings({"ASC_KEY_ID": "FROMENV"}, f)
+    assert settings == {"ASC_KEY_ID": "FROMENV", "ASC_ISSUER_ID": "issuer-from-file", "ASC_KEY_PATH": "~/k.p8"}
+
+
+def test_asc_settings_without_file_uses_env_only(tmp_path):
+    settings = provision.asc_settings({"ASC_KEY_ID": "K", "OTHER": "x"}, tmp_path / "missing.env")
+    assert settings == {"ASC_KEY_ID": "K"}
