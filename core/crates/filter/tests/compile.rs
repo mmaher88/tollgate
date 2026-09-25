@@ -159,3 +159,41 @@ fn compile_reports_io_errors() {
         "{err:?}"
     );
 }
+
+#[test]
+fn concurrent_compiles_into_one_directory_all_succeed() {
+    // Regression: every call used the same temporary name, so concurrent compiles
+    // truncated each other's file and all but one failed to rename it.
+    let dir = tempfile::tempdir().unwrap();
+    let texts: Vec<String> = (0..4)
+        .map(|i| (0..500).map(|n| format!("||h{n}-{i}.example^\n")).collect())
+        .collect();
+    for _ in 0..10 {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = texts
+                .iter()
+                .map(|text| {
+                    let dir = dir.path();
+                    s.spawn(move || {
+                        let list = [ListSource {
+                            name: "list",
+                            text,
+                            format: ListFormat::Adblock,
+                        }];
+                        compile(&list, dir)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(
+            file_names(dir.path()),
+            vec![DOMAINS_FILE.to_string(), ENGINE_FILE.to_string()]
+        );
+        FilterEngine::load(&dir.path().join(ENGINE_FILE)).unwrap();
+        let domains = DomainSet::load(&dir.path().join(DOMAINS_FILE)).unwrap();
+        assert_eq!(domains.len(), 500);
+    }
+}

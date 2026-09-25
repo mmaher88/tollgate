@@ -1,8 +1,9 @@
 //! Compiling filter lists into the two files the tunnel loads.
 
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::domain_set::HEADER_LEN;
 use crate::{DomainRules, FilterEngine, FilterError, ListFormat, ListSource, network_rule_count};
@@ -68,23 +69,44 @@ pub fn compile_split(
     Ok(report)
 }
 
+/// Distinguishes temporary files of concurrent `compile` calls in one process.
+static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
+/// Creates a temporary file next to `path` that did not exist before. A fresh name for
+/// every call keeps two concurrent compiles from truncating each other's file, or writing
+/// into one the other has already renamed into place (which a reader may have mapped).
+fn create_temp(path: &Path, file_name: &str) -> std::io::Result<(PathBuf, File)> {
+    loop {
+        let n = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_file_name(format!(".{file_name}.{}.{n}.tmp", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            // A leftover from an earlier process with the same pid: take the next name.
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), FilterError> {
+    let io = |source| FilterError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
     let file_name = path
         .file_name()
         .expect("compile passes a file name")
         .to_string_lossy();
-    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
-    let result = File::create(&tmp)
-        .and_then(|mut file| {
-            file.write_all(bytes)?;
-            file.sync_all()
-        })
-        .and_then(|()| fs::rename(&tmp, path));
+    let (tmp, mut file) = create_temp(path, &file_name).map_err(io)?;
+    let result = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            drop(file);
+            fs::rename(&tmp, path)
+        });
     result.map_err(|source| {
         let _ = fs::remove_file(&tmp);
-        FilterError::Io {
-            path: path.to_path_buf(),
-            source,
-        }
+        io(source)
     })
 }
