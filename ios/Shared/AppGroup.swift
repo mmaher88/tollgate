@@ -11,4 +11,13 @@ enum AppGroup {
         guard let identifier else { return nil }
         return FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier)
     }
+
+    /// Directory the Rust core reads and writes: config.json, ca.pem, ca.key, engine.dat,
+    /// domains.bin and learned-pins.json. Created on first use.
+    static var coreDirectory: URL? {
+        guard let base = containerURL else { return nil }
+        let directory = base.appendingPathComponent("core", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
 }
