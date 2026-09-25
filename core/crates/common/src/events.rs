@@ -38,7 +38,8 @@ pub struct EventLog {
 impl EventLog {
     /// Number of events kept; recording one more drops the oldest.
     pub const CAPACITY: usize = 500;
-    /// URLs longer than this many bytes are cut at the last character boundary before it.
+    /// URLs longer than this many bytes are cut at the last character boundary before it,
+    /// and their allocation is shrunk to match.
     pub const MAX_URL_BYTES: usize = 512;
 
     pub fn new() -> EventLog {
@@ -85,4 +86,6 @@ fn truncate_at_char_boundary(s: &mut String, max: usize) {
         end -= 1;
     }
     s.truncate(end);
+    // Truncating keeps the capacity: without this each event would hold the whole URL.
+    s.shrink_to_fit();
 }
