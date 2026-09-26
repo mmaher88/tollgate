@@ -380,9 +380,17 @@ struct PinsView: View {
     /// The core keeps a learned pin for 30 days; older entries are still stored but no longer
     /// applied, so they are not shown.
     private static let pinLifetime: TimeInterval = 30 * 24 * 60 * 60
+    /// The core also ignores a pin learned more than an hour ahead of its clock (one learned
+    /// while the date was set forward), so it is not shown either. Matches
+    /// CLOCK_TOLERANCE_SECS in core/crates/policy/src/policy.rs.
+    private static let clockTolerance: TimeInterval = 60 * 60
 
     private func show(_ entries: [PinEntry]) {
-        pins = entries.filter { Date().timeIntervalSince($0.date) < Self.pinLifetime }
+        let now = Date()
+        pins = entries.filter {
+            let age = now.timeIntervalSince($0.date)
+            return age >= -Self.clockTolerance && age < Self.pinLifetime
+        }
     }
 
     private func reload() async {
