@@ -176,8 +176,9 @@ the CA, exercises the whole filtering path without a phone.
    - `NEDNSSettings(servers: ["198.18.0.1", "fd00:7467::1"])` with `matchDomains = [""]`.
    - `NEProxySettings`: HTTP and HTTPS proxy `127.0.0.1:<port>`, `matchDomains = [""]`,
      `excludeSimpleHostnames = true`, exceptions for loopback, the private and link-local
-     IPv4 and IPv6 ranges, `*.local`, `*.lan`, `*.home.arpa`, `*.internal` and
-     `captive.apple.com`, so local network pages never go through the extension.
+     IPv4 and IPv6 ranges, `*.local`, `*.lan`, `*.home.arpa`, `*.internal`,
+     `*.localdomain`, `fritz.box`, `*.fritz.box` and `captive.apple.com`, so local network
+     pages never go through the extension.
    - MTU 1500.
 4. Loop `packetFlow.readPackets` into `engine.handlePackets` and write the results back.
 
@@ -608,6 +609,21 @@ sections, this section wins.
   lists are more than 24 hours old. After an update the tunnel reloads the lists.
 - Config changes (allowlist, passthrough) are saved to `config.json` and applied by
   restarting the tunnel.
+- **Local network names.** The tunnel is the resolver for every name, and the DoH upstreams
+  know nothing about the owner's LAN, so names only the network's own resolver knows are
+  never sent there (`tollgate_dns::is_local_name`): single-label names, names under `lan`,
+  `home.arpa`, `internal`, `localdomain`, `fritz.box`, `intranet`, `corp` and `private`, and
+  the reverse zones of 10/8, 172.16/12, 192.168/16, 169.254/16, fc00::/7 and fe80::/10.
+  They are never blocked. The handler returns `Outcome::Local`; the engine hands the
+  question to the Swift `LocalResolver` (one lookup per question, at most 64 waiting, 5 s
+  deadline), which runs `DNSServiceQueryRecord` scoped to the current physical interface
+  from `NWPathMonitor(prohibitedInterfaceTypes: [.other])`, so the network's DHCP resolver
+  answers, never the tunnel's. The records come back through `Engine::complete_local`;
+  a failure or 2 s without an answer is SERVFAIL. Answers with records are cached for at
+  most 60 s, and the cache is emptied when the interface or its gateways change
+  (`Engine::set_network`). The proxy's `HostResolver` leaves these names to
+  `getaddrinfo`. Names under other router domains still go to DoH and fail, and a bare
+  name is sent to the router as typed, without the network's search domain.
 
 ### Contracts
 

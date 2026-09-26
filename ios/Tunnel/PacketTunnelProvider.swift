@@ -5,7 +5,8 @@ import os
 /// Runs the Rust core inside the packet tunnel.
 ///
 /// Only the tunnel DNS addresses are routed into the tunnel. DNS queries arrive as packets
-/// and are answered by the core (blocked names, cache, DNS over HTTPS). When HTTPS filtering
+/// and are answered by the core (blocked names, cache, DNS over HTTPS; names only the local
+/// network knows go to its own resolver through `LocalNameResolver`). When HTTPS filtering
 /// is active, the system proxy settings point proxy-aware clients at the core's local proxy,
 /// which filters requests and passes pinned and Apple hosts through untouched.
 final class PacketTunnelProvider: NEPacketTunnelProvider {
@@ -17,6 +18,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var engine: Engine? { engineState.withLock { $0 } }
     /// Watches `defaultPath` while the core runs.
     private var pathObservation: NSKeyValueObservation?
+    /// Looks up local network names for the running engine.
+    private var localResolver: LocalNameResolver?
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         setLogger(logger: OSLogCoreLogger(subsystem: "dev.tollgate.core"), maxLevel: .info)
@@ -129,6 +132,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
         engineState.withLock { $0 = engine }
+        let local = LocalNameResolver(engineState: engineState, flow: packetFlow)
+        engine.setLocalResolver(resolver: local)
+        local.start()
+        localResolver = local
 
         let filtering = engine.mitmActive()
         let version = coreVersion()
@@ -187,6 +194,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Clears the reference under the lock, then stops outside it (stop joins a thread).
     private func takeAndStopEngine() {
+        localResolver?.stop()
+        localResolver = nil
         let running = engineState.withLock { state -> Engine? in
             defer { state = nil }
             return state
@@ -253,7 +262,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// portal check.
     static let proxyExceptions = [
         "localhost", "*.localhost", "127.0.0.1", "127.0.0.0/8", "127/8", "::1", "[::1]",
-        "*.local", "*.lan", "*.home.arpa", "*.internal",
+        "*.local", "*.lan", "*.home.arpa", "*.internal", "*.localdomain", "fritz.box", "*.fritz.box",
         "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
         "10/8", "172.16/12", "192.168/16", "169.254/16",
         "fe80::/10", "fc00::/7",
