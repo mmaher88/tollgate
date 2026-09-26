@@ -12,9 +12,9 @@ use rustls::version::{TLS12, TLS13};
 use tollgate_mitm::CertAuthority;
 use tollgate_policy::Config;
 
-use support::client::{get, proxy_get, proxy_get_raw};
+use support::client::{get, proxy_get, proxy_get_raw, wait_for};
 use support::tls_origin::{self, ClientAuth, HangUp};
-use support::tunnel::{connect, http2, peer_issuer, send2, tls, tls_config};
+use support::tunnel::{connect, http2, peer_issuer, reset_reason, tls, tls_config};
 use support::{origin, proxy};
 
 fn ca(name: &str) -> Arc<CertAuthority> {
@@ -128,13 +128,15 @@ async fn an_intercepted_request_to_a_server_requiring_a_client_certificate_is_le
         .await
         .unwrap();
     let mut sender = http2(tls).await;
-    let reply = send2(
-        &mut sender,
-        get(&format!("https://localhost:{}/", origin.port()), &[]),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    // No response: the stream is refused and the connection closes, so the client retries
+    // on a new CONNECT, which is passed through.
+    let error = sender
+        .send_request(get(&format!("https://localhost:{}/", origin.port()), &[]))
+        .await
+        .unwrap_err();
+    assert_eq!(reset_reason(&error), Some(h2::Reason::REFUSED_STREAM));
     assert_eq!(learned(&proxy), ["localhost"]);
+    wait_for("the connection to close", || sender.is_closed()).await;
 }
 
 #[tokio::test]

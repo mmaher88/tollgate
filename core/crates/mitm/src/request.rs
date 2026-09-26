@@ -15,23 +15,47 @@ use crate::idle::InFlight;
 use crate::intercept::Origin;
 use crate::proxy::State;
 use crate::upstream::{
-    UpstreamError, certificate_problem, closed_without_response, is_unreachable, learn_from_failure,
+    UpstreamError, certificate_problem, closed_without_response, is_unreachable,
+    is_unverified_certificate, learn_from_failure, needs_passthrough,
 };
 use crate::websocket;
 
-/// Ends a request without a response, for an upstream that could not be reached or that
-/// closed or reset the connection before any response. hyper closes an HTTP/1.1 connection
-/// and resets an HTTP/2 stream, so the client sees a connection failure, as it would
-/// without the proxy.
+/// Ends a request without a response. hyper closes an HTTP/1.1 connection and resets an
+/// HTTP/2 stream, so the client sees a connection failure, as it would without the proxy.
 #[derive(Debug, thiserror::Error)]
-#[error("no response: the upstream is unreachable or closed the connection")]
-pub(crate) struct NoResponse;
+pub(crate) enum NoResponse {
+    /// The upstream could not be reached, or closed or reset the connection before any
+    /// response. The HTTP/2 stream is reset with INTERNAL_ERROR.
+    #[error("no response: the upstream is unreachable or closed the connection")]
+    Closed,
+    /// The upstream failure made the host a learned pin (see
+    /// `upstream::learn_from_failure`). The client connection closes too (HTTP/2 GOAWAY),
+    /// and the HTTP/2 stream is reset with the reason carried here: REFUSED_STREAM, since
+    /// the upstream never processed the request, so the client may retry it on a new
+    /// connection, whose `CONNECT` is now passed through.
+    #[error("no response: the host is passed through from now on")]
+    PassedThrough(#[source] h2::Error),
+}
+
+impl NoResponse {
+    /// For a request whose failure made the host a learned pin; the HTTP/2 stream is reset
+    /// with `reason`.
+    pub(crate) fn passed_through(reason: h2::Reason) -> NoResponse {
+        NoResponse::PassedThrough(reason.into())
+    }
+
+    /// True when the client connection should close as well.
+    fn closes_connection(&self) -> bool {
+        matches!(self, NoResponse::PassedThrough(_))
+    }
+}
 
 /// The service for one request on an intercepted connection. An upstream that cannot be
-/// reached, or that hangs up without answering, gets [`NoResponse`] rather than a `502`:
-/// the proxy answered the `CONNECT` and the TLS handshake itself, so a `502` over its
-/// trusted leaf would be an ordinary server response to the browser, shown as an empty
-/// page, and would keep it from falling back from `https://` to `http://`.
+/// reached, that hangs up without answering, or whose TLS failure makes the host a learned
+/// pin, gets [`NoResponse`] rather than a `502`: the proxy answered the `CONNECT` and the
+/// TLS handshake itself, so a `502` over its trusted leaf would be an ordinary server
+/// response to the browser, shown as an empty page, and would keep it from falling back
+/// from `https://` to `http://`.
 pub(crate) async fn handle(
     state: Arc<State>,
     origin: Arc<Origin>,
@@ -42,6 +66,10 @@ pub(crate) async fn handle(
     let (mut response, close) = match respond(&state, &origin, request).await {
         Ok(answer) => answer,
         Err(e) => {
+            // HTTP/2 gets GOAWAY; HTTP/1.1 closes after any service error anyway.
+            if e.closes_connection() {
+                in_flight.request_close();
+            }
             drop(in_flight);
             return Err(e);
         }
@@ -75,8 +103,9 @@ async fn respond(
     Ok((response, passed_through || untrusted))
 }
 
-/// Filters and forwards one request. The flag is true when the upstream TLS failed in a way
-/// that makes the host a learned pin (see `upstream::needs_passthrough`).
+/// Filters and forwards one request. The flag is true when a WebSocket upstream's TLS
+/// failed in a way that makes the host a learned pin (see `upstream::needs_passthrough`);
+/// any other request that teaches a pin gets [`NoResponse::PassedThrough`].
 async fn forward(
     state: &State,
     origin: &Origin,
@@ -132,22 +161,26 @@ async fn forward(
 
 /// The answer to a request the upstream pool could not send. An upstream that cannot be
 /// reached at all, or that closes or resets the connection (or the HTTP/2 stream) before
-/// any response without a TLS error, gets no response; no free upstream connection `503`;
-/// anything else, TLS failures included, `502` (which may teach the proxy to pass the host
-/// through, see [`bad_gateway`]).
+/// any response without a TLS error, gets no response; no free upstream connection `503`.
+/// A TLS failure that makes the host a learned pin gets no response either, and closes the
+/// client connection, so the browser retries on a new `CONNECT` (now passed through), or
+/// shows its own error page and may fall back to `http://`. Anything else gets `502` (see
+/// [`bad_gateway`]).
 fn failure(
     state: &State,
     origin: &Origin,
     error: &UpstreamError,
 ) -> Result<(Response<Body>, bool), NoResponse> {
     if gets_no_response(error) {
-        return Err(NoResponse);
+        return Err(NoResponse::Closed);
     }
     if let UpstreamError::Exhausted = error {
         return Ok((status(StatusCode::SERVICE_UNAVAILABLE), false));
     }
-    let untrusted = learn_from_failure(&state.ctx, &origin.name, error);
-    Ok((bad_gateway(error), untrusted))
+    if learn_from_failure(&state.ctx, &origin.name, error) {
+        return Err(NoResponse::passed_through(h2::Reason::REFUSED_STREAM));
+    }
+    Ok((bad_gateway(error), false))
 }
 
 /// True for the failures [`failure`] answers with [`NoResponse`].
@@ -158,15 +191,33 @@ fn gets_no_response(error: &UpstreamError) -> bool {
 /// `502` for a failed upstream request. The client accepted the proxy's certificate (or,
 /// for an absolute-form `https://` request, left TLS to the proxy), so it cannot show its
 /// own warning for a server certificate that is expired or for another name; a short text
-/// says what is wrong instead of an empty page. Anything else gets an empty `502`.
+/// says what is wrong instead of an empty page. So does a failure that would make the host
+/// a learned pin when it was not learned (see `Policy::learn_upstream_untrusted`: many
+/// hosts failing at once look like a captive portal or a network that intercepts HTTPS).
+/// Anything else gets an empty `502`.
 pub(crate) fn bad_gateway(error: &UpstreamError) -> Response<Body> {
-    match certificate_problem(error) {
-        Some(problem) => text(
+    if let Some(problem) = certificate_problem(error) {
+        return text(
             StatusCode::BAD_GATEWAY,
             format!("Tollgate: the server's certificate {problem}, so this site was not loaded.\n"),
-        ),
-        None => status(StatusCode::BAD_GATEWAY),
+        );
     }
+    if needs_passthrough(error) {
+        let what = if is_unverified_certificate(error) {
+            "the server's certificate could not be verified"
+        } else {
+            "no secure connection to the server could be made"
+        };
+        return text(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Tollgate: {what}, so this site was not loaded. A Wi-Fi sign-in page \
+                 (captive portal) or a network filter that intercepts HTTPS can cause this; \
+                 if you just joined this network, sign in and reload.\n"
+            ),
+        );
+    }
+    status(StatusCode::BAD_GATEWAY)
 }
 
 #[cfg(test)]
@@ -290,7 +341,6 @@ mod tests {
 
     #[tokio::test]
     async fn tls_alerts_and_client_certificates_still_get_a_502() {
-        use crate::upstream::needs_passthrough;
         // A TLS alert after the handshake keeps its 502, and learns a pin when it says so.
         for (description, learned) in [
             (rustls::AlertDescription::InternalError, false),
@@ -310,11 +360,37 @@ mod tests {
         assert!(!gets_no_response(&UpstreamError::Exhausted));
     }
 
+    /// Failures that would make the host a learned pin, when the burst guard declined to
+    /// learn it (a captive portal or a network that intercepts HTTPS): a `502` that says so.
+    #[tokio::test]
+    async fn a_failure_that_was_not_learned_gets_a_502_that_says_so() {
+        for (error, says) in [
+            (
+                certificate(CertificateError::UnknownIssuer),
+                "certificate could not be verified",
+            ),
+            (
+                UpstreamError::Connect(alert(rustls::AlertDescription::ProtocolVersion)),
+                "no secure connection",
+            ),
+        ] {
+            let response = bad_gateway(&error);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+            let body = text(response).await;
+            assert!(body.starts_with("Tollgate: "), "{error}: {body}");
+            assert!(body.contains(says), "{error}: {body}");
+            assert!(body.contains("captive portal"), "{error}: {body}");
+        }
+    }
+
     #[tokio::test]
     async fn other_upstream_failures_get_an_empty_502() {
+        let garbled = io::Error::new(io::ErrorKind::InvalidData, "garbled");
         for error in [
-            certificate(CertificateError::UnknownIssuer),
             UpstreamError::Connect(io::Error::from(io::ErrorKind::ConnectionReset)),
+            UpstreamError::Connect(alert(rustls::AlertDescription::InternalError)),
+            http1_failure(Some(garbled)).await,
         ] {
             let response = bad_gateway(&error);
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);

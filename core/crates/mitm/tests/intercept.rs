@@ -258,8 +258,10 @@ async fn upstream_is_shared_across_client_connections_and_converted_to_http1() {
     assert_eq!(s.origin.connections(), 1);
 }
 
+/// The host is learned, so the request gets no response and the connection closes (see
+/// `upstream.rs` for the details).
 #[tokio::test]
-async fn untrusted_upstream_certificate_gets_502() {
+async fn untrusted_upstream_certificate_gets_no_response() {
     let s = setup().await;
     // An origin whose certificate comes from a CA the proxy does not trust.
     let rogue = tls_origin::https(
@@ -274,9 +276,10 @@ async fn untrusted_upstream_certificate_gets_502() {
     let mut h2 = http2(tls).await;
     let url = format!("https://www.tollgate.test:{}/", rogue.port());
 
-    let reply = send2(&mut h2, get(&url, &[])).await;
-    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    let result = h2.send_request(get(&url, &[])).await;
+    assert!(result.is_err(), "expected no response, got {result:?}");
     assert_eq!(rogue.requests(), 0);
+    wait_for("the connection to close", || h2.is_closed()).await;
 }
 
 #[tokio::test]

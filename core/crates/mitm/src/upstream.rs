@@ -146,6 +146,15 @@ fn client_rejects_too(error: &rustls::CertificateError) -> bool {
     )
 }
 
+/// True when the server's certificate could not be verified for a reason the client may
+/// not have (see [`needs_passthrough`]): an unknown issuer, a missing intermediate.
+pub(crate) fn is_unverified_certificate(error: &UpstreamError) -> bool {
+    matches!(
+        rustls_error(error),
+        Some(rustls::Error::InvalidCertificate(certificate)) if !client_rejects_too(certificate)
+    )
+}
+
 /// What is wrong with the server's certificate, for a failure the client would have too
 /// (see `client_rejects_too`), completing "the server's certificate ...".
 pub(crate) fn certificate_problem(error: &UpstreamError) -> Option<&'static str> {

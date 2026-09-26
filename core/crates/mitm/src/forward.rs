@@ -50,7 +50,7 @@ pub(crate) async fn forward(
         Err(e) => {
             state.log_upstream_failure(&target.authority(), &e);
             if is_unreachable(&e) {
-                return Err(NoResponse);
+                return Err(NoResponse::Closed);
             }
             if let UpstreamError::Exhausted = e {
                 return Ok(status(StatusCode::SERVICE_UNAVAILABLE));

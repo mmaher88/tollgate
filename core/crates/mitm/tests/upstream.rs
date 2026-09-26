@@ -10,7 +10,9 @@ use tollgate_mitm::{CertAuthority, ServeOptions};
 use tollgate_policy::Config;
 
 use support::client::{get, http1, proxy_get, proxy_get_raw, send1, wait_for};
-use support::tunnel::{connect, http2, issuer_via, peer_issuer, send2, tls, tls_config};
+use support::tunnel::{
+    connect, http2, issuer_via, peer_issuer, reset_reason, send2, tls, tls_config,
+};
 use support::{proxy, tls_origin};
 
 fn ca(name: &str) -> Arc<CertAuthority> {
@@ -130,6 +132,10 @@ async fn untrusted_origin_certificate_gets_502_and_the_host_is_passed_through_fr
     assert_eq!(issuer, "CN=Unknown CA, O=Tollgate");
 }
 
+/// The request that teaches the proxy to pass a host through gets no response: its stream
+/// is refused (the upstream never saw it) and the connection closes with GOAWAY, so the
+/// browser retries on a new `CONNECT`, which is passed through, or shows its own error
+/// page instead of an empty `502`.
 #[tokio::test]
 async fn an_intercepted_host_with_an_unverifiable_certificate_is_learned() {
     let tollgate_ca = ca("Tollgate Test CA");
@@ -145,16 +151,52 @@ async fn an_intercepted_host_with_an_unverifiable_certificate_is_learned() {
         .unwrap();
     assert_eq!(peer_issuer(&tls), "CN=Tollgate Test CA, O=Tollgate");
     let mut sender = http2(tls).await;
-    let reply = send2(
-        &mut sender,
-        get(&format!("https://localhost:{}/", origin.port()), &[]),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    let error = sender
+        .send_request(get(&format!("https://localhost:{}/", origin.port()), &[]))
+        .await
+        .expect_err("the request that teaches a pin gets no response");
+    assert_eq!(reset_reason(&error), Some(h2::Reason::REFUSED_STREAM));
     assert_eq!(proxy.ctx.policy.learned_pins().len(), 1);
+    wait_for("the HTTP/2 connection to close", || sender.is_closed()).await;
 
     let issuer = issuer_via(proxy.addr, &target, &[&origin_ca], "localhost").await;
     assert_eq!(issuer, "CN=Unknown CA, O=Tollgate");
+}
+
+/// When the burst guard declines to learn the host (the network looks like it intercepts
+/// HTTPS), the request gets a `502` that says what went wrong, and the connection stays.
+#[tokio::test]
+async fn an_unverifiable_certificate_the_burst_guard_declines_gets_a_502_that_says_so() {
+    let tollgate_ca = ca("Tollgate Test CA");
+    let origin_ca = ca("Unknown CA");
+    let origin = tls_origin::https(origin_ca.clone(), &[b"h2", b"http/1.1"]).await;
+    let ctx = proxy::context(tollgate_ca.clone(), &Config::default(), None);
+    let now = tollgate_common::clock::unix_secs();
+    assert!(ctx.policy.learn_upstream_untrusted("a.tollgate.test", now));
+    assert!(ctx.policy.learn_upstream_untrusted("b.tollgate.test", now));
+    let proxy = proxy::start(ctx, tls_origin::trusting(&ca("Some Other CA"))).await;
+    let target = format!("localhost:{}", origin.port());
+
+    let tcp = connect(proxy.addr, &target).await;
+    let tls = tls(tcp, tls_config(&[&tollgate_ca], &[b"h2"]), "localhost")
+        .await
+        .unwrap();
+    let mut sender = http2(tls).await;
+    let url = format!("https://localhost:{}/", origin.port());
+    for _ in 0..2 {
+        let reply = send2(&mut sender, get(&url, &[])).await;
+        assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(reply.headers["cache-control"], "no-store");
+        assert!(reply.body.starts_with("Tollgate: "), "{}", reply.body);
+        assert!(
+            reply.body.contains("could not be verified"),
+            "{}",
+            reply.body
+        );
+        assert!(reply.body.contains("captive portal"), "{}", reply.body);
+    }
+    assert!(proxy.ctx.policy.learned_pins().is_empty());
+    assert!(!sender.is_closed());
 }
 
 #[tokio::test]
@@ -198,24 +240,24 @@ async fn intercepted_connections_close_once_the_host_is_learned_as_untrusted_ups
         .unwrap();
     let mut other = http2(other_tls).await;
 
-    // The first request fails and teaches the proxy to pass the host through. The client
-    // connection is then closed (GOAWAY), so a reload opens a new CONNECT.
-    let reply = send2(&mut h2, get(&url, &[])).await;
-    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    // The first request fails and teaches the proxy to pass the host through. It gets no
+    // response, and the client connection is closed (GOAWAY), so a reload opens a new
+    // CONNECT.
+    let error = h2.send_request(get(&url, &[])).await.unwrap_err();
+    assert_eq!(reset_reason(&error), Some(h2::Reason::REFUSED_STREAM));
     assert_eq!(proxy.ctx.policy.learned_pins().len(), 1);
     wait_for("the HTTP/2 connection to close", || h2.is_closed()).await;
 
-    // A keep-alive HTTP/1.1 connection opened earlier: its next request is still answered
-    // (here with 502, since the upstream is not verifiable), then the connection closes.
-    let reply = send1(&mut h1, get(&url, &[("host", &target)])).await;
-    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
-    assert_eq!(reply.headers["connection"], "close");
+    // A keep-alive HTTP/1.1 connection opened earlier: its next request fails the same way
+    // (the upstream is not verifiable), and the connection closes without a response.
+    let result = h1.send_request(get(&url, &[("host", &target)])).await;
+    assert!(result.is_err(), "expected no response, got {result:?}");
     wait_for("the HTTP/1.1 connection to close", || h1.is_closed()).await;
 
     // Another HTTP/2 connection opened before the host was learned closes after its next
     // request as well.
-    let reply = send2(&mut other, get(&url, &[])).await;
-    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    let error = other.send_request(get(&url, &[])).await.unwrap_err();
+    assert_eq!(reset_reason(&error), Some(h2::Reason::REFUSED_STREAM));
     wait_for("the other HTTP/2 connection to close", || other.is_closed()).await;
 
     // A new CONNECT is passed through, and the client judges the certificate itself.

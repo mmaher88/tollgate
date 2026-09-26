@@ -400,8 +400,8 @@ about 5e-14 per lookup.
   `https://` to `http://`, as without the proxy. Plain absolute-form requests (`http://`
   through the system proxy) whose upstream cannot be reached get no response either: the
   client connection closes. An unreachable host is logged at info level, at most once a
-  minute. No free upstream connection gets `503`; upstream TLS failures and anything else
-  get `502` (see pin learning).
+  minute. No free upstream connection gets `503`; an upstream TLS failure that teaches a
+  pin gets no response (see pin learning); other TLS failures and anything else get `502`.
 - WebSockets over intercepted HTTPS are forwarded over a dedicated HTTP/1.1 upstream
   connection.
 - Passthrough tunnels and WebSocket relays outlive a wake or a path change unless their
@@ -437,8 +437,14 @@ about 5e-14 per lookup.
   TLS 1.2 handshake, or sent a fatal TLS 1.3 alert in place of the first response; any
   other failure after an optional request, such as a reset, teaches nothing) makes the SNI
   name a learned pin at once;
-  the request that failed gets `502`, its client connection is closed, and later
-  connections are passed through for the client to handle. A certificate for another name,
+  the request that failed gets no response (HTTP/1.1 closes the connection; HTTP/2 resets
+  the stream with REFUSED_STREAM, since the upstream never processed it, and sends GOAWAY),
+  so the browser retries on a new connection or shows its own error page (and may fall back
+  from `https://` to `http://`) instead of an empty `502`, and later connections are passed
+  through for the client to handle. When such a failure is not learned (the burst guard
+  below), the request gets a `502` with a short plain-text body that says the server's
+  certificate could not be verified (or no secure connection could be made) and names a
+  captive portal or a network filter as a likely cause. A certificate for another name,
   expired, not yet valid, revoked or for another purpose only gets `502`: the client would
   reject it too. The client accepted the proxy's leaf, so it cannot show its own
   certificate warning; the `502` carries a short plain-text body (`Cache-Control:

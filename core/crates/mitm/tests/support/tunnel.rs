@@ -116,3 +116,15 @@ where
 pub async fn send2(sender: &mut Sender2, request: Request<Empty<Bytes>>) -> Reply {
     read_reply(sender.send_request(request).await.unwrap()).await
 }
+
+/// The reason of the HTTP/2 stream reset or GOAWAY behind a failed request, if any.
+pub fn reset_reason(error: &hyper::Error) -> Option<h2::Reason> {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = next {
+        if let Some(h2) = error.downcast_ref::<h2::Error>() {
+            return h2.reason();
+        }
+        next = error.source();
+    }
+    None
+}
