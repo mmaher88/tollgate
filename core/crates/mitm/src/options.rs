@@ -6,7 +6,7 @@ use std::time::Duration;
 use rustls::ClientConfig;
 use tollgate_common::resolve::Resolve;
 
-use crate::limits::{MAX_H1_PER_HOST, MAX_UPSTREAM_CONNECTIONS};
+use crate::limits::{MAX_H1_PER_HOST, MAX_PASSTHROUGH, MAX_UPSTREAM_CONNECTIONS};
 
 /// Timeouts and limits for [`crate::serve_with_options`]. [`Default`] gives the production
 /// values.
@@ -34,6 +34,13 @@ pub struct ServeOptions {
     pub max_upstream_connections: usize,
     /// HTTP/1.1 upstream connections per origin. Default 6.
     pub max_h1_per_host: usize,
+    /// `CONNECT` tunnels passed through at once, each holding two sockets. Above it a
+    /// passthrough host gets `503`, and a connection passed through after its first bytes
+    /// were read is closed. Default 128.
+    pub max_passthrough: usize,
+    /// A passthrough tunnel that moves no bytes either way for this long is closed.
+    /// Default 5 minutes.
+    pub tunnel_idle_timeout: Duration,
     /// Seconds from a clock that keeps counting while the device sleeps, used to age pooled
     /// upstream connections. tokio's clock, like `Instant` on iOS, stops during sleep, so a
     /// connection pooled before hours of sleep would still look fresh. Default
@@ -57,6 +64,8 @@ impl Default for ServeOptions {
             keep_alive_interval: Duration::from_secs(30),
             max_upstream_connections: MAX_UPSTREAM_CONNECTIONS,
             max_h1_per_host: MAX_H1_PER_HOST,
+            max_passthrough: MAX_PASSTHROUGH,
+            tunnel_idle_timeout: Duration::from_secs(5 * 60),
             clock: tollgate_common::clock::now_secs,
             resolver: None,
         }

@@ -71,6 +71,9 @@ pub(crate) struct State {
     pub(crate) pool: Pool,
     pub(crate) shutdown: Shutdown,
     pub(crate) intercept_slots: Arc<Semaphore>,
+    /// One per passthrough tunnel, held from before dialing until the tunnel ends, so
+    /// overflow cannot take the file descriptors that DNS and the pool need.
+    pub(crate) passthrough_slots: Arc<Semaphore>,
     /// The intercepted connections past their TLS handshake, for reclaiming the slot of an
     /// idle one when the table is full.
     pub(crate) intercepted: Mutex<Vec<Weak<Activity>>>,
@@ -180,6 +183,7 @@ pub async fn serve_with_options(
         .keep_alive_timeout(KEEP_ALIVE_TIMEOUT);
     let state = Arc::new(State {
         intercept_slots: Arc::new(Semaphore::new(ctx.max_intercepted)),
+        passthrough_slots: Arc::new(Semaphore::new(options.max_passthrough)),
         intercepted: Mutex::new(Vec::new()),
         ctx,
         pool,

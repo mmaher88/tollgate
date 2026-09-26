@@ -18,6 +18,7 @@ mod proxy;
 mod request;
 mod rewind;
 mod shutdown;
+mod tunnel;
 mod upstream;
 mod websocket;
 
@@ -53,6 +54,10 @@ pub mod limits {
     pub const LOW_MEMORY_BYTES: u64 = 8 * 1024 * 1024;
     /// Default for `ServeOptions::max_upstream_connections`.
     pub const MAX_UPSTREAM_CONNECTIONS: usize = 64;
+    /// Default for `ServeOptions::max_passthrough`. A tunnel holds two sockets and about
+    /// 20 KiB, so 128 stay well inside the file descriptor limit the tunnel sets (2048) and
+    /// use under 3 MiB.
+    pub const MAX_PASSTHROUGH: usize = 128;
     /// Default for `ServeOptions::max_h1_per_host`.
     pub const MAX_H1_PER_HOST: usize = 6;
     /// An HTTP/2 connection whose keep-alive ping is not answered in time is closed.

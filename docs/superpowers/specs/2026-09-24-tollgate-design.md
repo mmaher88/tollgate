@@ -358,6 +358,10 @@ parents). The false positive rate is about 5e-14 per lookup.
   for 1 s) could hold half its 256 KiB window gets no new requests: the next request opens
   another connection, and the stalled one closes when its streams end. The 64-connection
   limit still bounds the windows at 16 MiB.
+- At most 128 passthrough tunnels at once (two sockets and about 20 KiB each). Over the cap
+  a passthrough `CONNECT` host gets `503`, and a connection passed through after its first
+  bytes were read is closed. A tunnel that moves no bytes for 5 minutes is closed. The
+  engine raises the soft open file limit from iOS's 256 to 2048 before opening any socket.
 - Timeouts: 10 s for the first bytes and for the TLS handshake, 30 s to read request headers,
   HTTP/2 keep-alive pings, and idle connections are closed after 60 s without requests.
   Pooled upstream connections are aged with the continuous clock (tokio's clock stops during
@@ -416,8 +420,9 @@ parents). The false positive rate is about 5e-14 per lookup.
 | DNS blocklist (mmapped, clean pages) | 2 MiB |
 | DNS cache and DoH | 1 MiB |
 | intercepted connections (32 x 0.35 MiB) | 11 MiB |
+| passthrough tunnels (128 x about 20 KiB) | 2.5 MiB |
 | runtime, TLS configuration, leaf cache, misc | 3 MiB |
-| total for Rust | about 25 MiB, leaving room for the Swift runtime and system frameworks |
+| total for Rust | about 28 MiB, leaving room for the Swift runtime and system frameworks |
 
 ## M1 crate contracts
 

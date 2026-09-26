@@ -10,6 +10,10 @@
 //! without an HTTP protocol, low memory and a full interception table also tunnel, with
 //! the ClientHello replayed. A full table first closes its longest idle connection, if one
 //! has been idle for a while, and takes over its slot.
+//!
+//! Passthrough tunnels are capped (`ServeOptions::max_passthrough`): over the cap a
+//! passthrough host gets `503` and a connection passed through after reading its first
+//! bytes is closed. A tunnel idle for `ServeOptions::tunnel_idle_timeout` is closed.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +37,7 @@ use crate::intercept::{self, Origin};
 use crate::limits::LOW_MEMORY_BYTES;
 use crate::proxy::State;
 use crate::rewind::Rewind;
+use crate::tunnel::{Ended, copy_until_idle};
 use crate::upstream::{UpstreamError, connect_tcp};
 
 /// How long a new connection waits for the slot of an idle one it asked to close.
@@ -49,6 +54,10 @@ pub(crate) async fn connect(state: &Arc<State>, request: Request<Incoming>) -> R
         return blocked();
     }
     if let Decision::Passthrough(reason) = state.ctx.policy.classify(&host, unix_secs()) {
+        let Some(slot) = passthrough_slot(state) else {
+            log::debug!("CONNECT {host}:{port}: too many passthrough tunnels");
+            return status(StatusCode::SERVICE_UNAVAILABLE);
+        };
         // Dial before answering, so an unreachable host gets 502 instead of a dead tunnel.
         let upstream = match dial(state, &host, port).await {
             Ok(upstream) => upstream,
@@ -59,9 +68,11 @@ pub(crate) async fn connect(state: &Arc<State>, request: Request<Incoming>) -> R
         };
         Stats::inc(&state.ctx.stats.connections_passthrough);
         log::debug!("passthrough {host}:{port} ({reason:?})");
+        let idle = state.options.tunnel_idle_timeout;
         state.shutdown.spawn(async move {
+            let _slot = slot;
             match hyper::upgrade::on(request).await {
-                Ok(client) => tunnel(TokioIo::new(client), upstream).await,
+                Ok(client) => tunnel(TokioIo::new(client), upstream, idle, &host, port).await,
                 Err(e) => log::debug!("CONNECT upgrade: {e}"),
             }
         });
@@ -195,16 +206,33 @@ async fn intercept_slot(state: &State) -> Option<OwnedSemaphorePermit> {
         .ok()
 }
 
-/// Tunnels `client`, whose replay buffer (if any) goes upstream first.
+/// A passthrough tunnel slot, if one is free.
+fn passthrough_slot(state: &State) -> Option<OwnedSemaphorePermit> {
+    state.passthrough_slots.clone().try_acquire_owned().ok()
+}
+
+/// Tunnels `client`, whose replay buffer (if any) goes upstream first. Over the cap the
+/// client is closed: it was already told `200`.
 async fn passthrough<C>(state: &State, client: C, host: &str, port: u16, why: &str)
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
+    let Some(_slot) = passthrough_slot(state) else {
+        log::debug!("passthrough {host}:{port} ({why}): too many tunnels, closing");
+        return;
+    };
     match dial(state, host, port).await {
         Ok(upstream) => {
             Stats::inc(&state.ctx.stats.connections_passthrough);
             log::debug!("passthrough {host}:{port} ({why})");
-            tunnel(client, upstream).await;
+            tunnel(
+                client,
+                upstream,
+                state.options.tunnel_idle_timeout,
+                host,
+                port,
+            )
+            .await;
         }
         Err(e) => log::debug!("passthrough {host}:{port} ({why}): {e}"),
     }
@@ -220,11 +248,13 @@ async fn dial(state: &State, host: &str, port: u16) -> Result<TcpStream, Upstrea
     .map_err(UpstreamError::from)
 }
 
-async fn tunnel<C>(mut client: C, mut upstream: TcpStream)
+async fn tunnel<C>(mut client: C, mut upstream: TcpStream, idle: Duration, host: &str, port: u16)
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
-        log::debug!("tunnel: {e}");
+    match copy_until_idle(&mut client, &mut upstream, idle).await {
+        Ok(Ended::Closed) => {}
+        Ok(Ended::Idle) => log::debug!("tunnel {host}:{port}: idle for {idle:?}, closing"),
+        Err(e) => log::debug!("tunnel {host}:{port}: {e}"),
     }
 }
