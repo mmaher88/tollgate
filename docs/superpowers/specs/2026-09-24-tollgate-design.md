@@ -398,7 +398,10 @@ about 5e-14 per lookup.
   connection before any response (or resets the HTTP/2 stream or sends GOAWAY), without a
   TLS error, the request gets no response: HTTP/1.1 closes the connection and HTTP/2
   resets the stream, so the browser shows its own error page or falls back from
-  `https://` to `http://`, as without the proxy. Plain absolute-form requests (`http://`
+  `https://` to `http://`, as without the proxy. An HTTPS origin that may speak HTTP/2 is
+  dialed by one request at a time; when that dial times out or cannot connect, the requests
+  that waited for it fail with it, so a page with many requests to a dead host fails them
+  together after one connect timeout rather than one timeout apart. Plain absolute-form requests (`http://`
   through the system proxy) whose upstream cannot be reached get no response either: the
   client connection closes. An unreachable host is logged at info level, at most once a
   minute. No free upstream connection gets `503`; an upstream TLS failure that teaches a

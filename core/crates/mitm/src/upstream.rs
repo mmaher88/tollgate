@@ -433,6 +433,38 @@ fn connect_failure(error: io::Error, client_cert_asked: bool) -> UpstreamError {
     error
 }
 
+/// A dial failure that says the origin cannot be reached now, rather than something about
+/// one request: requests that waited for that dial fail with it instead of dialing again.
+#[derive(Clone, Debug)]
+enum Unreachable {
+    Timeout,
+    Connect(io::ErrorKind, String),
+}
+
+impl Unreachable {
+    /// The failure of `result` worth sharing: a timeout, or a failure to connect that is not
+    /// about TLS. TLS and certificate failures (which may teach a pin) and a lack of permits
+    /// (which depends on the pool, not the origin) are not shared.
+    fn of<T>(result: &Result<T, UpstreamError>) -> Option<Unreachable> {
+        match result {
+            Err(UpstreamError::Timeout) => Some(Unreachable::Timeout),
+            Err(error @ UpstreamError::Connect(io)) if is_unreachable(error) => {
+                Some(Unreachable::Connect(io.kind(), io.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    fn error(&self) -> UpstreamError {
+        match self {
+            Unreachable::Timeout => UpstreamError::Timeout,
+            Unreachable::Connect(kind, message) => {
+                UpstreamError::Connect(io::Error::new(*kind, message.clone()))
+            }
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UpstreamError {
     #[error("connecting: {0}")]
@@ -596,6 +628,10 @@ struct Host {
     ready: Arc<Notify>,
     /// Held while dialing an origin whose protocol may be HTTP/2, so it gets one connection.
     dial: Arc<tokio::sync::Mutex<()>>,
+    /// Counts dials under `dial` that finished (a cancelled one does not count).
+    dials: u64,
+    /// How the last of them failed, when the origin could not be reached.
+    last_dial: Option<Unreachable>,
     /// Responses whose bodies are still streaming.
     active: Arc<AtomicUsize>,
     /// When a request last started on this origin (`PoolOptions::clock`).
@@ -611,6 +647,8 @@ impl Host {
             slots: Arc::new(Semaphore::new(max_h1)),
             ready: Arc::new(Notify::new()),
             dial: Arc::new(tokio::sync::Mutex::new(())),
+            dials: 0,
+            last_dial: None,
             active: Arc::new(AtomicUsize::new(0)),
             last_used: now,
         }
@@ -644,10 +682,12 @@ impl Host {
     }
 
     /// Drops every pooled connection. In-flight requests keep their connections, and the
-    /// slots and counters stay, since those connections still use them.
+    /// slots and counters stay, since those connections still use them. A dial failure on
+    /// the old path is not shared with requests on the new one.
     fn clear(&mut self) {
         self.h2 = None;
         self.idle.clear();
+        self.last_dial = None;
     }
 }
 
@@ -860,13 +900,21 @@ impl Pool {
         });
     }
 
+    /// A connection to `target`: a pooled one unless `fresh_only`, or a new one. An origin
+    /// that may speak HTTP/2 is dialed by one request at a time, so it gets one connection;
+    /// the requests that waited for a dial that found the origin unreachable fail with it
+    /// rather than each spending the connect timeout in turn.
     async fn checkout(
         &self,
         target: &Target,
         fresh_only: bool,
     ) -> Result<(Sender, Checkout), UpstreamError> {
+        // The origin's finished dials when this request first waited for its turn.
+        let mut dials_before = None;
+        // Taken before the dial lock, so one turn under it lasts one connect timeout at most.
+        let mut global = None;
         loop {
-            let (protocol, slots, ready, dial) = {
+            let (protocol, slots, ready, dial, dials) = {
                 let now = self.0.now();
                 let idle = self.0.options.idle_secs();
                 let max_h1 = self.0.options.max_h1_per_host;
@@ -890,18 +938,20 @@ impl Pool {
                     host.slots.clone(),
                     host.ready.clone(),
                     host.dial.clone(),
+                    host.dials,
                 )
             };
             if protocol == Some(Protocol::Http1) {
                 tokio::select! {
                     permit = slots.acquire_owned() => {
                         let permit = permit.expect("host slots are never closed");
-                        return self.connect(target, Some(permit)).await;
+                        return self.connect(target, Some(permit), global).await;
                     }
                     () = ready.notified(), if !fresh_only => continue,
                 }
             }
-            let _dialing = dial.lock().await;
+            let before = *dials_before.get_or_insert(dials);
+            let dialing = dial.lock().await;
             let now_protocol = {
                 let now = self.0.now();
                 let idle = self.0.options.idle_secs();
@@ -914,22 +964,57 @@ impl Pool {
                     host.last_used = now;
                     return Ok((sender, Checkout::Pooled));
                 }
+                if host.dials != before
+                    && let Some(unreachable) = &host.last_dial
+                {
+                    log::debug!(
+                        "upstream {}: failing with the dial this request waited for",
+                        target.authority()
+                    );
+                    return Err(unreachable.error());
+                }
                 host.protocol
             };
             if protocol.is_none() && now_protocol == Some(Protocol::Http1) {
                 continue;
             }
+            let global = match global.take() {
+                Some(global) => global,
+                None => match self.0.global.clone().try_acquire_owned() {
+                    Ok(global) => global,
+                    Err(_) => {
+                        // Waits for a permit without holding up the others waiting to dial.
+                        drop(dialing);
+                        global = Some(self.global_permit().await?);
+                        continue;
+                    }
+                },
+            };
             let permit = slots.try_acquire_owned().ok();
-            return self.connect(target, permit).await;
+            // Not recorded when this request is cancelled mid-dial, so the next one in line
+            // dials itself.
+            let result = self.connect(target, permit, Some(global)).await;
+            let unreachable = Unreachable::of(&result);
+            if let Some(host) = self.0.hosts().get_mut(target) {
+                host.dials += 1;
+                host.last_dial = unreachable;
+            }
+            drop(dialing);
+            return result;
         }
     }
 
+    /// A new connection to `target`, using `global` as its connection permit when given.
     async fn connect(
         &self,
         target: &Target,
         h1_permit: Option<OwnedSemaphorePermit>,
+        global: Option<OwnedSemaphorePermit>,
     ) -> Result<(Sender, Checkout), UpstreamError> {
-        let global = self.global_permit().await?;
+        let global = match global {
+            Some(global) => global,
+            None => self.global_permit().await?,
+        };
         tokio::time::timeout(
             self.0.options.connect_timeout,
             self.handshake(target, global, h1_permit),
