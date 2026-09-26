@@ -40,6 +40,13 @@ pub mod limits {
     pub const H2_MAX_SEND_BUF: usize = 128 * 1024;
     /// HTTP/1.1 read buffer, client and server side.
     pub const H1_MAX_BUF: usize = 128 * 1024;
+    /// Largest decoded HTTP/2 header block accepted, client and server side. hyper's
+    /// default of 16 KiB turns responses with several large cookies or a large
+    /// Content-Security-Policy into proxy failures that the browser would accept.
+    pub const MAX_HEADER_LIST: u32 = 64 * 1024;
+    /// Most HTTP/1.1 header lines accepted in one message, client and server side (hyper's
+    /// default is 100). Their bytes stay capped by [`H1_MAX_BUF`].
+    pub const MAX_HEADERS: usize = 256;
     /// Below this much available memory new connections are passed through.
     pub const LOW_MEMORY_BYTES: u64 = 8 * 1024 * 1024;
     /// Default for `ServeOptions::max_upstream_connections`.

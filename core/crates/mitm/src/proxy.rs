@@ -27,6 +27,7 @@ use crate::body::{Body, DoneBody};
 use crate::idle::{self, Activity, InFlight};
 use crate::limits::{
     H1_MAX_BUF, H2_CONNECTION_WINDOW, H2_MAX_SEND_BUF, H2_STREAM_WINDOW, KEEP_ALIVE_TIMEOUT,
+    MAX_HEADER_LIST, MAX_HEADERS,
 };
 use crate::shutdown::{self, Shutdown};
 use crate::upstream::{Pool, PoolOptions};
@@ -127,13 +128,15 @@ pub async fn serve_with_options(
         .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(options.header_read_timeout)
-        .max_buf_size(H1_MAX_BUF);
+        .max_buf_size(H1_MAX_BUF)
+        .max_headers(MAX_HEADERS);
     server
         .http2()
         .timer(TokioTimer::new())
         .initial_stream_window_size(H2_STREAM_WINDOW)
         .initial_connection_window_size(H2_CONNECTION_WINDOW)
         .max_send_buf_size(H2_MAX_SEND_BUF)
+        .max_header_list_size(MAX_HEADER_LIST)
         .keep_alive_interval(options.keep_alive_interval)
         .keep_alive_timeout(KEEP_ALIVE_TIMEOUT);
     let state = Arc::new(State {
@@ -195,7 +198,8 @@ async fn serve_client(state: Arc<State>, tcp: TcpStream) {
     builder
         .timer(TokioTimer::new())
         .header_read_timeout(state.options.header_read_timeout)
-        .max_buf_size(H1_MAX_BUF);
+        .max_buf_size(H1_MAX_BUF)
+        .max_headers(MAX_HEADERS);
     let conn = builder
         .serve_connection(TokioIo::new(tcp), service)
         .with_upgrades();

@@ -15,7 +15,7 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::body::{Body, DoneBody, empty, status};
 use crate::http::strip_hop_by_hop;
-use crate::limits::H1_MAX_BUF;
+use crate::limits::{H1_MAX_BUF, MAX_HEADERS};
 use crate::proxy::State;
 use crate::upstream::{Target, UpstreamError, connect_tcp, connect_tls, learn_from_failure};
 
@@ -125,6 +125,7 @@ async fn dial(
         let (tls, _) = connect_tls(&config, name, tcp).await?;
         let (sender, conn) = http1::Builder::new()
             .max_buf_size(H1_MAX_BUF)
+            .max_headers(MAX_HEADERS)
             .handshake(TokioIo::new(tls))
             .await?;
         state.shutdown.spawn(async move {

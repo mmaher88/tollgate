@@ -10,7 +10,7 @@ use hyper::{StatusCode, Version};
 use rustls::ClientConnection;
 use rustls::pki_types::ServerName;
 use tokio::io::AsyncWriteExt;
-use tollgate_mitm::CertAuthority;
+use tollgate_mitm::{CertAuthority, limits};
 use tollgate_policy::Config;
 
 use support::client::{get, http1, read_to_close, send1, wait_for};
@@ -374,4 +374,85 @@ async fn stalled_handshake_times_out_and_frees_the_slot() {
     assert_eq!(stats.connections_intercepted, 2);
     assert_eq!(stats.connections_passthrough, 1);
     assert_eq!(stats.tls_client_rejections, 0);
+}
+
+/// Opens an intercepted HTTP/2 connection to the test origin.
+async fn intercepted_h2(s: &Setup) -> support::tunnel::Sender2 {
+    let tcp = connect(s.proxy.addr, &s.target()).await;
+    let tls = tls(tcp, tls_config(&[&s.ca], &[b"h2"]), "www.tollgate.test")
+        .await
+        .unwrap();
+    http2(tls).await
+}
+
+#[tokio::test]
+async fn large_http2_response_headers_are_forwarded() {
+    let s = setup().await;
+    let mut h2 = intercepted_h2(&s).await;
+    // About 24 KB of Set-Cookie, over hyper's 16 KiB default.
+    let url = s.url("www.tollgate.test", "/headers?count=3&size=8000");
+    let reply = send2(&mut h2, get(&url, &[])).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.headers.get_all("set-cookie").iter().count(), 3);
+}
+
+#[tokio::test]
+async fn many_http1_response_headers_are_forwarded() {
+    let s = setup_with(&[b"http/1.1"], |_| {}).await;
+    let mut h2 = intercepted_h2(&s).await;
+    // 120 header lines, over hyper's default of 100.
+    let url = s.url("www.tollgate.test", "/headers?count=120&size=10");
+    let reply = send2(&mut h2, get(&url, &[])).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.headers.get_all("set-cookie").iter().count(), 120);
+}
+
+#[tokio::test]
+async fn response_headers_over_the_limit_get_a_clean_502() {
+    let s = setup().await;
+    let mut h2 = intercepted_h2(&s).await;
+    let size = 7400;
+    let count = limits::MAX_HEADER_LIST as usize / size + 1;
+    let url = s.url(
+        "www.tollgate.test",
+        &format!("/headers?count={count}&size={size}"),
+    );
+    let reply = send2(&mut h2, get(&url, &[])).await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    // The proxy is still serving: the same client connection works afterwards.
+    let reply = send2(&mut h2, get(&s.url("www.tollgate.test", "/"), &[])).await;
+    assert_eq!(reply.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn large_http2_request_cookie_is_forwarded() {
+    let s = setup().await;
+    let mut h2 = intercepted_h2(&s).await;
+    let cookie = format!("a={}", "x".repeat(24 * 1024));
+    let reply = send2(
+        &mut h2,
+        get(&s.url("www.tollgate.test", "/"), &[("cookie", &cookie)]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.ends_with(&cookie));
+}
+
+#[tokio::test]
+async fn many_http1_request_headers_are_forwarded() {
+    let s = setup().await;
+    let tcp = connect(s.proxy.addr, &s.target()).await;
+    let tls = tls(
+        tcp,
+        tls_config(&[&s.ca], &[b"http/1.1"]),
+        "www.tollgate.test",
+    )
+    .await
+    .unwrap();
+    let mut h1 = http1(tls).await;
+    let names: Vec<String> = (0..120).map(|i| format!("x-extra-{i}")).collect();
+    let mut headers: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "1")).collect();
+    headers.push(("host", "www.tollgate.test"));
+    let reply = send1(&mut h1, get("/", &headers)).await;
+    assert_eq!(reply.status, StatusCode::OK);
 }

@@ -139,6 +139,26 @@ fn big(request: &Request<Incoming>, counters: Arc<Counters>) -> Response<OriginB
     Response::new(StreamBody::new(chunks).boxed())
 }
 
+/// `/headers?count=N&size=S`: `N` `set-cookie` headers, each with an `S`-byte value.
+fn headers(request: &Request<Incoming>) -> Response<OriginBody> {
+    let query = request.uri().query().unwrap_or("");
+    let param = |name: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    };
+    let mut response = Response::new(full("headers"));
+    for i in 0..param("count") {
+        let value = format!("c{i}={}", "x".repeat(param("size")));
+        response
+            .headers_mut()
+            .append("set-cookie", value.parse().unwrap());
+    }
+    response
+}
+
 /// Decrements `live` when a connection ends.
 pub struct Live(Arc<Counters>);
 
@@ -157,7 +177,8 @@ impl Drop for Live {
     }
 }
 
-/// Answers `/echo` with [`echo`], `/big` with [`big`], and every other request with a line
+/// Answers `/echo` with [`echo`], `/big` with [`big`], `/headers` with [`headers`], and
+/// every other request with a line
 /// describing it: `GET /path?q authority=host:port version=HTTP/1.1 conn=1 cookie=a=1|b=2`.
 /// `?delay=<ms>` waits before answering.
 async fn handle(
@@ -169,6 +190,7 @@ async fn handle(
     match request.uri().path() {
         "/echo" => return Ok(echo(request).await),
         "/big" => return Ok(big(&request, counters)),
+        "/headers" => return Ok(headers(&request)),
         _ => {}
     }
     if let Some(ms) = request
@@ -207,13 +229,17 @@ async fn handle(
     Ok(Response::new(full(line)))
 }
 
-/// Serves HTTP/1.1 or HTTP/2 on `io` with [`handle`].
+/// Serves HTTP/1.1 or HTTP/2 on `io` with [`handle`]. Like real servers, it accepts far
+/// larger request headers than hyper's defaults.
 pub async fn serve_http<T>(io: T, conn: usize, counters: Arc<Counters>)
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let service = service_fn(move |request| handle(conn, counters.clone(), request));
-    let _ = auto::Builder::new(TokioExecutor::new())
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder.http1().max_headers(1000);
+    builder.http2().max_header_list_size(1024 * 1024);
+    let _ = builder
         .serve_connection_with_upgrades(TokioIo::new(io), service)
         .await;
 }

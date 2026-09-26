@@ -41,6 +41,7 @@ use crate::body::{Body, DoneBody};
 use crate::http::{authority, join_cookies, strip_hop_by_hop};
 use crate::limits::{
     H1_MAX_BUF, H2_CONNECTION_WINDOW, H2_MAX_SEND_BUF, H2_STREAM_WINDOW, KEEP_ALIVE_TIMEOUT,
+    MAX_HEADER_LIST, MAX_HEADERS,
 };
 use crate::shutdown::Shutdown;
 
@@ -602,6 +603,7 @@ impl Pool {
             .initial_stream_window_size(H2_STREAM_WINDOW)
             .initial_connection_window_size(H2_CONNECTION_WINDOW)
             .max_send_buf_size(H2_MAX_SEND_BUF)
+            .max_header_list_size(MAX_HEADER_LIST)
             .keep_alive_interval(self.0.options.keep_alive_interval)
             .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
             // Ping idle connections too, so one whose path died is found and dropped
@@ -631,6 +633,7 @@ impl Pool {
     {
         let (h1, conn) = http1::Builder::new()
             .max_buf_size(H1_MAX_BUF)
+            .max_headers(MAX_HEADERS)
             .handshake(io)
             .await?;
         self.0.shutdown.spawn(async move {

@@ -101,7 +101,10 @@ pub async fn http2<T>(io: T) -> Sender2
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(io))
+    // Like Safari, accept far larger response headers than hyper's 16 KiB default.
+    let (sender, conn) = http2::Builder::new(TokioExecutor::new())
+        .max_header_list_size(1024 * 1024)
+        .handshake(TokioIo::new(io))
         .await
         .unwrap();
     tokio::spawn(async move {
