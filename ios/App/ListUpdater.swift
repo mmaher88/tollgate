@@ -116,6 +116,11 @@ final class ListUpdater: ObservableObject {
 
     private func run(refresh: Bool, deadline: Date?) async -> Bool {
         guard !isBusy else { return false }
+        // Every entry point (launch and foreground refresh, Update, Apply changes now, My
+        // rules) can be followed by the user leaving the app; without this iOS suspends it
+        // mid-download and the list in flight fails with a lost connection.
+        let backgroundTime = BackgroundTime(name: "lists")
+        defer { backgroundTime.end() }
         guard let directory = AppGroup.coreDirectory else {
             state = .failed("App Group container unavailable")
             return false
@@ -237,7 +242,20 @@ final class ListUpdater: ObservableObject {
         Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled
     }
 
+    /// Downloads `url`, retrying once after a lost connection or a timeout, which is what
+    /// a suspension (the background time ran out, or the app was suspended before it got
+    /// any) leaves behind. Other failures, such as no network or an HTTP error, are not
+    /// retried, so the cached copy is used at once.
     private static func download(_ url: URL) async throws -> String {
+        do {
+            return try await fetch(url)
+        } catch let error as URLError where error.code == .networkConnectionLost || error.code == .timedOut {
+            if Task.isCancelled { throw error }
+            return try await fetch(url)
+        }
+    }
+
+    private static func fetch(_ url: URL) async throws -> String {
         var request = URLRequest(url: url, timeoutInterval: 60)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         let (data, response) = try await URLSession.shared.data(for: request)
