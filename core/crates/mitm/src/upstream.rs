@@ -5,6 +5,12 @@
 //! origins together hold at most `max_connections`; when that is reached, the oldest idle
 //! connection is closed to make room.
 //!
+//! A client that stops reading a response leaves up to a stream window of data unread on
+//! the shared HTTP/2 connection, and a few such streams use up the connection's window, so
+//! no other response on it could move. Once stalled streams could hold half of that window,
+//! the connection gets no new requests: the next one opens a new connection, and the old
+//! one closes when its streams end.
+//!
 //! Idle connections are aged with the continuous clock (`PoolOptions::clock`), because
 //! tokio's clock stops while the device sleeps, and are checked again when they are taken
 //! from the pool. `ProxyContext::reset_upstream_connections` drops them all after a wake or
@@ -14,12 +20,14 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Empty};
-use hyper::body::{Body as _, Incoming};
+use hyper::body::{Body as _, Frame, Incoming, SizeHint};
 use hyper::client::conn::{http1, http2};
 use hyper::header::{self, HeaderValue};
 use hyper::rt::{Read, Write};
@@ -51,6 +59,11 @@ const EVICT_RETRY: Duration = Duration::from_millis(50);
 const MAX_ADDRESSES: usize = 2;
 /// Limit for one connection attempt to an address from the resolver.
 const ADDRESS_TIMEOUT: Duration = Duration::from_secs(2);
+/// A response body that handed over data and was not asked for more for this long counts
+/// as stalled: its client stopped reading.
+const STALLED_AFTER: Duration = Duration::from_secs(1);
+/// Stalled streams on one HTTP/2 connection that could hold half its receive window.
+const MAX_STALLED_STREAMS: usize = (H2_CONNECTION_WINDOW / 2).div_ceil(H2_STREAM_WINDOW) as usize;
 
 /// Where a request goes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -237,10 +250,116 @@ enum Protocol {
     Http2,
 }
 
+/// Whether a response body's client is still reading it.
+struct Progress {
+    /// Milliseconds after `base` plus 1 when the body last handed over data and has not been
+    /// asked for more since; 0 while it waits for the upstream or has ended.
+    handed_over: AtomicU64,
+    base: Instant,
+}
+
+impl Progress {
+    fn new() -> Progress {
+        // Counted from the response headers: the body has not been asked for data yet.
+        Progress {
+            handed_over: AtomicU64::new(1),
+            base: Instant::now(),
+        }
+    }
+
+    fn handed_over(&self) {
+        let millis = u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+        self.handed_over.store(millis + 1, Ordering::Relaxed);
+    }
+
+    fn waiting(&self) {
+        self.handed_over.store(0, Ordering::Relaxed);
+    }
+
+    fn is_stalled(&self, now: Instant) -> bool {
+        match self.handed_over.load(Ordering::Relaxed) {
+            0 => false,
+            at => {
+                let since = self.base + Duration::from_millis(at - 1);
+                now.saturating_duration_since(since) >= STALLED_AFTER
+            }
+        }
+    }
+}
+
+/// The response bodies on one HTTP/2 connection.
+#[derive(Default)]
+struct Streams(Mutex<Vec<Weak<Progress>>>);
+
+impl Streams {
+    fn list(&self) -> MutexGuard<'_, Vec<Weak<Progress>>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn add(&self) -> Arc<Progress> {
+        let progress = Arc::new(Progress::new());
+        let mut list = self.list();
+        list.retain(|p| p.strong_count() > 0);
+        list.push(Arc::downgrade(&progress));
+        progress
+    }
+
+    fn stalled(&self) -> usize {
+        let now = Instant::now();
+        let mut list = self.list();
+        list.retain(|p| p.strong_count() > 0);
+        list.iter()
+            .filter_map(Weak::upgrade)
+            .filter(|p| p.is_stalled(now))
+            .count()
+    }
+}
+
+/// An upstream response body that records in `progress` whether its client keeps asking
+/// for data.
+struct Watched {
+    inner: Incoming,
+    progress: Option<Arc<Progress>>,
+}
+
+impl hyper::body::Body for Watched {
+    type Data = bytes::Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let polled = Pin::new(&mut self.inner).poll_frame(cx);
+        if let Some(progress) = &self.progress {
+            match &polled {
+                Poll::Ready(Some(Ok(_))) => progress.handed_over(),
+                _ => progress.waiting(),
+            }
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// The shared HTTP/2 connection of an origin.
+#[derive(Clone)]
+struct Shared {
+    sender: http2::SendRequest<Body>,
+    streams: Arc<Streams>,
+}
+
 struct Host {
     /// Unknown until the first TLS handshake has negotiated ALPN.
     protocol: Option<Protocol>,
-    h2: Option<http2::SendRequest<Body>>,
+    h2: Option<Shared>,
     /// Idle HTTP/1.1 connections and when they became idle (`PoolOptions::clock`).
     idle: Vec<(http1::SendRequest<Body>, u64)>,
     /// One permit per live HTTP/1.1 connection.
@@ -271,13 +390,20 @@ impl Host {
 
     /// A pooled connection that is open and was not idle for `idle` seconds or more at
     /// `now`. Older ones are dropped: after sleep or a network change their path may be
-    /// gone without the connection noticing.
+    /// gone without the connection noticing. So is an HTTP/2 connection whose stalled
+    /// streams could hold half its window; it closes when they end.
     fn reuse(&mut self, now: u64, idle: u64) -> Option<Sender> {
         if let Some(h2) = &self.h2 {
             let idle_too_long = self.active.load(Ordering::Relaxed) == 0
                 && now.saturating_sub(self.last_used) >= idle;
-            if h2.is_ready() && !idle_too_long {
+            let stalled = h2.streams.stalled();
+            if h2.sender.is_ready() && !idle_too_long && stalled < MAX_STALLED_STREAMS {
                 return Some(Sender::Http2(h2.clone()));
+            }
+            if stalled >= MAX_STALLED_STREAMS {
+                log::debug!(
+                    "{stalled} stalled streams on a shared HTTP/2 connection; opening another"
+                );
             }
             self.h2 = None;
         }
@@ -299,7 +425,7 @@ impl Host {
 
 enum Sender {
     Http1(http1::SendRequest<Body>),
-    Http2(http2::SendRequest<Body>),
+    Http2(Shared),
 }
 
 /// Where `checkout` got a connection from.
@@ -403,15 +529,20 @@ impl Pool {
         loop {
             let (sender, checkout) = self.checkout(target, fresh_only).await?;
             let mut error = match sender {
-                Sender::Http2(mut h2) => {
-                    match h2.try_send_request(for_http2(request, target)).await {
-                        Ok(response) => return Ok(self.wrap(target, response, None)),
-                        Err(e) => e,
+                Sender::Http2(Shared {
+                    mut sender,
+                    streams,
+                }) => match sender.try_send_request(for_http2(request, target)).await {
+                    Ok(response) => {
+                        return Ok(self.wrap(target, response, Connection::Http2(streams)));
                     }
-                }
+                    Err(e) => e,
+                },
                 Sender::Http1(mut h1) => {
                     match h1.try_send_request(for_http1(request, target)).await {
-                        Ok(response) => return Ok(self.wrap(target, response, Some(h1))),
+                        Ok(response) => {
+                            return Ok(self.wrap(target, response, Connection::Http1(h1)));
+                        }
                         Err(e) => e,
                     }
                 }
@@ -478,7 +609,11 @@ impl Pool {
                 .retain(|(h1, since)| now.saturating_sub(*since) < idle && !h1.is_closed());
             let active = host.active.load(Ordering::Relaxed);
             let h2_idle = active == 0 && now.saturating_sub(host.last_used) >= idle;
-            if host.h2.as_ref().is_some_and(|h2| h2.is_closed() || h2_idle) {
+            if host
+                .h2
+                .as_ref()
+                .is_some_and(|h2| h2.sender.is_closed() || h2_idle)
+            {
                 host.h2 = None;
             }
             let unused = host.idle.is_empty()
@@ -618,8 +753,12 @@ impl Pool {
                 log::debug!("upstream HTTP/2 connection to {authority}: {e}");
             }
         });
-        self.set_protocol(target, Protocol::Http2, Some(h2.clone()));
-        Ok((Sender::Http2(h2), checkout))
+        let shared = Shared {
+            sender: h2,
+            streams: Arc::default(),
+        };
+        self.set_protocol(target, Protocol::Http2, Some(shared.clone()));
+        Ok((Sender::Http2(shared), checkout))
     }
 
     async fn start_http1<T>(
@@ -645,12 +784,7 @@ impl Pool {
         Ok(h1)
     }
 
-    fn set_protocol(
-        &self,
-        target: &Target,
-        protocol: Protocol,
-        h2: Option<http2::SendRequest<Body>>,
-    ) {
+    fn set_protocol(&self, target: &Target, protocol: Protocol, h2: Option<Shared>) {
         if let Some(host) = self.0.hosts().get_mut(target) {
             host.protocol = Some(protocol);
             if h2.is_some() {
@@ -689,13 +823,14 @@ impl Pool {
         }
     }
 
-    /// Counts the response as active until its body is done, strips hop-by-hop headers and
-    /// hands an HTTP/1.1 connection back to the pool afterwards.
+    /// Counts the response as active until its body is done, strips hop-by-hop headers,
+    /// watches an HTTP/2 body for a client that stops reading, and hands an HTTP/1.1
+    /// connection back to the pool afterwards.
     fn wrap(
         &self,
         target: &Target,
         response: Response<Incoming>,
-        h1: Option<http1::SendRequest<Body>>,
+        via: Connection,
     ) -> Response<Body> {
         let active = self
             .0
@@ -708,6 +843,14 @@ impl Pool {
         let target = target.clone();
         let (mut parts, body) = response.into_parts();
         strip_hop_by_hop(&mut parts.headers);
+        let (h1, progress) = match via {
+            Connection::Http1(h1) => (Some(h1), None),
+            Connection::Http2(streams) => (None, Some(streams.add())),
+        };
+        let body = Watched {
+            inner: body,
+            progress,
+        };
         let body = DoneBody::new(body, move || {
             active.fetch_sub(1, Ordering::Relaxed);
             if let Some(h1) = h1 {
@@ -716,6 +859,12 @@ impl Pool {
         });
         Response::from_parts(parts, body.boxed_unsync())
     }
+}
+
+/// The connection a response came on.
+enum Connection {
+    Http1(http1::SendRequest<Body>),
+    Http2(Arc<Streams>),
 }
 
 /// A copy of `request` without its body, if sending it twice is safe: GET, HEAD or

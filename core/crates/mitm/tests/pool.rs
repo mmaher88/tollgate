@@ -16,6 +16,7 @@ use tollgate_mitm::{CertAuthority, ServeOptions};
 use tollgate_policy::Config;
 
 use support::client::{get, http1, proxy_get, read_reply};
+use support::tunnel::{Sender2, connect, http2, send2, tls, tls_config};
 use support::{proxy, tls_origin};
 
 fn ca(name: &str) -> Arc<CertAuthority> {
@@ -186,4 +187,55 @@ async fn a_request_with_a_body_is_not_retried() {
     let reply = read_reply(sender.send_request(request).await.unwrap()).await;
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
     assert_eq!(requests.load(Ordering::SeqCst), 2);
+}
+
+/// Opens an intercepted HTTP/2 connection to `target` through the proxy, sends `GET url`
+/// and returns once the response headers are in, without reading the body. The connection
+/// stays open while the returned values live.
+async fn start_unread(
+    proxy: SocketAddr,
+    proxy_ca: &CertAuthority,
+    target: &str,
+    url: &str,
+) -> (Sender2, hyper::Response<hyper::body::Incoming>) {
+    let tcp = connect(proxy, target).await;
+    let tls = tls(tcp, tls_config(&[proxy_ca], &[b"h2"]), "localhost")
+        .await
+        .unwrap();
+    let mut sender = http2(tls).await;
+    let response = sender.send_request(get(url, &[])).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    (sender, response)
+}
+
+#[tokio::test]
+async fn clients_that_stop_reading_do_not_freeze_the_shared_http2_connection() {
+    let proxy_ca = ca("Tollgate Test CA");
+    let origin_ca = ca("Origin CA");
+    let origin = tls_origin::https(origin_ca.clone(), &[b"h2"]).await;
+    let ctx = proxy::context(proxy_ca.clone(), &Config::default(), None);
+    let proxy = proxy::start(ctx, tls_origin::trusting(&origin_ca)).await;
+    let target = format!("localhost:{}", origin.port());
+    let big = format!("https://{target}/big?bytes=268435456");
+
+    // Two clients stop reading large responses. Their upstream streams share one
+    // connection, and together they can hold its whole receive window.
+    let _first = start_unread(proxy.addr, &proxy_ca, &target, &big).await;
+    let _second = start_unread(proxy.addr, &proxy_ca, &target, &big).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let small = format!("https://{target}/small");
+    let third = async {
+        let tcp = connect(proxy.addr, &target).await;
+        let tls = tls(tcp, tls_config(&[&proxy_ca], &[b"h2"]), "localhost")
+            .await
+            .unwrap();
+        let mut sender = http2(tls).await;
+        send2(&mut sender, get(&small, &[])).await
+    };
+    let reply = tokio::time::timeout(Duration::from_secs(5), third)
+        .await
+        .expect("a request to the same origin was stuck behind the stalled ones");
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.body.starts_with("GET /small "), "{}", reply.body);
 }

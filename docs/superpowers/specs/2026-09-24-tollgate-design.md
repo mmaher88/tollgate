@@ -346,7 +346,11 @@ drops redundant children of blocked parents. The false positive rate is about 5e
 - At most 32 intercepted client connections (about 0.35 MiB each) instead of 64; above the cap,
   or when less than 8 MiB of memory is available, new connections pass through. Upstream
   connections are pooled per host and shared across client connections: at most 6 HTTP/1.1
-  connections per host and 64 upstream connections in total.
+  connections per host and 64 upstream connections in total. An HTTP/2 origin shares one
+  connection, except that one whose stalled streams (responses whose clients stopped reading
+  for 1 s) could hold half its 256 KiB window gets no new requests: the next request opens
+  another connection, and the stalled one closes when its streams end. The 64-connection
+  limit still bounds the windows at 16 MiB.
 - Timeouts: 10 s for the first bytes and for the TLS handshake, 30 s to read request headers,
   HTTP/2 keep-alive pings, and idle connections are closed after 60 s without requests.
   Pooled upstream connections are aged with the continuous clock (tokio's clock stops during

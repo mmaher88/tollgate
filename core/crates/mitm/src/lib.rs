@@ -34,7 +34,9 @@ pub mod limits {
 
     /// HTTP/2 stream receive window, client and server side.
     pub const H2_STREAM_WINDOW: u32 = 128 * 1024;
-    /// HTTP/2 connection receive window, client and server side.
+    /// HTTP/2 connection receive window, client and server side. Clients that stop reading
+    /// can fill it with two stream windows, so an upstream connection whose stalled streams
+    /// could hold half of it takes no new requests (see the upstream pool).
     pub const H2_CONNECTION_WINDOW: u32 = 256 * 1024;
     /// HTTP/2 send buffer per stream.
     pub const H2_MAX_SEND_BUF: usize = 128 * 1024;
