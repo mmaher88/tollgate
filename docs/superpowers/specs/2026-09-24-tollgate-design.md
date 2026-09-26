@@ -421,11 +421,18 @@ about 5e-14 per lookup.
   `bad_certificate`, `certificate_unknown`, `decrypt_error`) count, two within 10 minutes.
   Connections that finish the handshake and close without a request are counted as a
   statistic only, until E4 shows how iOS clients actually fail. An upstream certificate the
-  proxy cannot verify (webpki roots, no intermediate fetching), a server the proxy's TLS
-  client shares no version or cipher suite with, or one that requires a client certificate
-  makes the SNI name a learned pin at once, since it fails the same way every time; the
-  request that failed gets `502`, its client connection is closed, and later connections
-  are passed through for the client to handle.
+  proxy cannot verify (unknown issuer or missing intermediate: webpki roots, no
+  intermediate fetching), a server the proxy's TLS client shares no version or cipher suite
+  with, or one that requires a client certificate makes the SNI name a learned pin at once;
+  the request that failed gets `502`, its client connection is closed, and later
+  connections are passed through for the client to handle. A certificate for another name,
+  expired, not yet valid, revoked or for another purpose only gets `502`: the client would
+  reject it too. Such failures can come from the network rather than the server (a captive
+  portal before login, a filter that intercepts HTTPS), which makes every host fail. So
+  when a third different host would be learned this way within 60 s, it is not, the
+  upstream pins from that minute are taken back, and upstream failures teach nothing for
+  10 minutes. On a wake or a network path change, upstream pins learned in the last
+  5 minutes are dropped as well. Pins from client rejections are never taken back.
 
 **ffi.**
 - Foreign traits use `#[uniffi::export(foreign)]`: `CoreLogger` (not `Logger`, which would

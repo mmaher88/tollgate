@@ -17,6 +17,15 @@ pub const PIN_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 /// Hosts with a single recent rejection that are remembered at once.
 const MAX_RECENT_REJECTIONS: usize = 1024;
 const PINS_FORMAT_VERSION: u32 = 1;
+/// Upstream TLS failures on this many different hosts within [`UPSTREAM_BURST_SECS`] come
+/// from the network, not the servers: a captive portal, or a filter that intercepts HTTPS.
+pub const UPSTREAM_BURST_HOSTS: usize = 3;
+/// See [`UPSTREAM_BURST_HOSTS`].
+pub const UPSTREAM_BURST_SECS: u64 = 60;
+/// After a burst, upstream failures teach nothing for this long.
+pub const UPSTREAM_SUPPRESS_SECS: u64 = 10 * 60;
+/// Pins learned from upstream failures this recently are dropped on a network change.
+pub const UPSTREAM_RECENT_SECS: u64 = 5 * 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -120,6 +129,35 @@ struct Learning {
     pins: HashMap<String, u64>,
     /// Host to the time of its last rejection that did not make it a pin.
     recent: HashMap<String, u64>,
+    /// Pins learned from upstream failures in the last [`UPSTREAM_RECENT_SECS`] of this
+    /// session, oldest first, with the time each was learned, so a burst or a network
+    /// change can take them back. Not saved: only fresh pins are taken back.
+    upstream: Vec<(String, u64)>,
+    /// Upstream failures teach nothing before this time (after a burst).
+    upstream_suppressed_until: Option<u64>,
+}
+
+impl Learning {
+    /// Removes `host`'s pin if it is the one learned from an upstream failure at `at`.
+    fn take_back(&mut self, host: &str, at: u64) -> bool {
+        if self.pins.get(host) == Some(&at) {
+            self.pins.remove(host);
+            return true;
+        }
+        false
+    }
+
+    /// Whether upstream failures are ignored at `now`. A suppression that lies further
+    /// ahead than it can (the wall clock went back) is dropped.
+    fn upstream_suppressed(&mut self, now: u64) -> bool {
+        match self.upstream_suppressed_until {
+            Some(until) if now < until && until - now <= UPSTREAM_SUPPRESS_SECS => true,
+            _ => {
+                self.upstream_suppressed_until = None;
+                false
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -156,7 +194,7 @@ impl Policy {
             allowlist: PatternSet::new(&allowlist),
             learning: Mutex::new(Learning {
                 pins,
-                recent: HashMap::new(),
+                ..Learning::default()
             }),
         })
     }
@@ -194,6 +232,7 @@ impl Policy {
         match learning.recent.get(&key) {
             Some(&previous) if within(previous, now, REJECTION_WINDOW_SECS) => {
                 learning.recent.remove(&key);
+                learning.upstream.retain(|(host, _)| *host != key);
                 log::info!("learned certificate pin for {key} after {kind:?}");
                 learning.pins.insert(key, now);
                 true
@@ -227,8 +266,17 @@ impl Policy {
     /// or cipher suite with the proxy, or it requires a client certificate. Such a failure
     /// repeats on every connection, and the client, which can fetch intermediates, trusts
     /// the system roots and may hold the certificate, is the better judge once the
-    /// connection is passed through. Returns true when the host became a pin; false when it
-    /// already was one or `host` is empty. The pin expires like any other.
+    /// connection is passed through. The pin expires like any other.
+    ///
+    /// When the network rather than the server presents the certificate (a captive portal
+    /// before login, a filter that intercepts HTTPS), every host fails. So the host that
+    /// would make [`UPSTREAM_BURST_HOSTS`] different hosts learned this way within
+    /// [`UPSTREAM_BURST_SECS`] is not learned, the others from that window are taken back
+    /// (pins from client rejections are kept), and upstream failures teach nothing for
+    /// [`UPSTREAM_SUPPRESS_SECS`].
+    ///
+    /// Returns true when the host became a pin; false when it already was one, `host` is
+    /// empty, or the failure was part of a burst.
     pub fn learn_upstream_untrusted(&self, host: &str, now: u64) -> bool {
         let key = lookup_key(host);
         if key.is_empty() {
@@ -236,12 +284,66 @@ impl Policy {
         }
         let mut learning = self.lock();
         learning.pins.retain(|_, at| pin_is_live(*at, now));
-        if learning.pins.contains_key(&key) {
+        if learning.pins.contains_key(&key) || learning.upstream_suppressed(now) {
+            return false;
+        }
+        learning
+            .upstream
+            .retain(|(_, at)| within(*at, now, UPSTREAM_RECENT_SECS));
+        let burst: Vec<(String, u64)> = learning
+            .upstream
+            .iter()
+            .filter(|(_, at)| within(*at, now, UPSTREAM_BURST_SECS))
+            .cloned()
+            .collect();
+        let hosts: HashSet<&str> = burst.iter().map(|(host, _)| host.as_str()).collect();
+        if hosts.len() + 1 >= UPSTREAM_BURST_HOSTS {
+            let mut taken_back = 0;
+            for (host, at) in &burst {
+                if learning.take_back(host, *at) {
+                    taken_back += 1;
+                }
+            }
+            learning
+                .upstream
+                .retain(|(_, at)| !within(*at, now, UPSTREAM_BURST_SECS));
+            learning.upstream_suppressed_until = Some(now + UPSTREAM_SUPPRESS_SECS);
+            log::info!(
+                "upstream TLS failed for {UPSTREAM_BURST_HOSTS} hosts within \
+                 {UPSTREAM_BURST_SECS} s, so the network probably intercepts HTTPS: took back \
+                 {taken_back} learned pins, learning nothing from upstream failures for \
+                 {} minutes",
+                UPSTREAM_SUPPRESS_SECS / 60
+            );
             return false;
         }
         learning.recent.remove(&key);
-        learning.pins.insert(key, now);
+        learning.pins.insert(key.clone(), now);
+        learning.upstream.push((key, now));
         true
+    }
+
+    /// Drops the pins learned from upstream failures in the last [`UPSTREAM_RECENT_SECS`]:
+    /// a captive portal or filtering network may have caused them without a burst. Call it
+    /// when the device wakes or the network path changes (after a portal login, or on
+    /// leaving the network). A host that really needs it is learned again on its next
+    /// failure. Pins from client rejections are kept.
+    pub fn on_network_change(&self, now: u64) {
+        let mut learning = self.lock();
+        let upstream = std::mem::take(&mut learning.upstream);
+        let mut dropped = 0;
+        for (host, at) in upstream {
+            if within(at, now, UPSTREAM_RECENT_SECS) && learning.take_back(&host, at) {
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            log::info!(
+                "network changed: dropped {dropped} certificate pins learned from upstream \
+                 failures in the last {} minutes",
+                UPSTREAM_RECENT_SECS / 60
+            );
+        }
     }
 
     /// True when `host` matches a user allowlist pattern, so nothing for it is blocked.
@@ -262,6 +364,7 @@ impl Policy {
                 removed += 1;
             }
             learning.recent.remove(&key);
+            learning.upstream.retain(|(host, _)| *host != key);
         }
         removed
     }

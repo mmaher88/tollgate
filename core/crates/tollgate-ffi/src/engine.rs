@@ -340,9 +340,12 @@ impl Engine {
     /// Drops the proxy's pooled upstream connections and the DoH connections (used by
     /// the DNS forwarder and the proxy's name lookups), so the next requests and queries
     /// connect again. Call it when the device wakes and when the network path changes:
-    /// connections from before usually still look open while their path is gone.
+    /// connections from before usually still look open while their path is gone. Also
+    /// drops the certificate pins learned from upstream TLS failures in the last few
+    /// minutes, which a captive portal or a filtering network may have caused.
     pub fn reset_connections(&self) {
         let _ = catch_panic(|| {
+            self.proxy.policy.on_network_change(clock::unix_secs());
             self.proxy.reset_upstream_connections();
             // Clone and release the lock at once, so stop() never waits on us.
             let resolver = self.running().as_ref().map(|r| r.resolver.clone());

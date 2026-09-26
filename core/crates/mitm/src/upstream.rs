@@ -45,6 +45,7 @@ use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tollgate_common::resolve::Resolve;
+use tollgate_policy::Decision;
 
 use crate::ProxyContext;
 use crate::body::{Body, DoneBody};
@@ -100,16 +101,20 @@ impl Target {
 /// issuer, missing intermediate, a root only the system trusts), the server shares no
 /// protocol version or cipher suite with the proxy's TLS client (old TLS, CBC-only), or
 /// it requires a client certificate the proxy cannot present. Timeouts, connection
-/// failures, HTTP errors and other TLS alerts are not.
+/// failures, HTTP errors and other TLS alerts are not, and neither is a certificate for
+/// another name, outside its validity dates, revoked or for another purpose: the client
+/// would reject it too, and it is what a captive portal or a wrong device clock produces.
 pub(crate) fn needs_passthrough(error: &UpstreamError) -> bool {
     if let UpstreamError::ClientCertificate(_) = error {
         return true;
     }
+    if let Some(rustls::Error::InvalidCertificate(certificate)) = rustls_error(error) {
+        return !client_rejects_too(certificate);
+    }
     matches!(
         rustls_error(error),
         Some(
-            rustls::Error::InvalidCertificate(_)
-                | rustls::Error::PeerIncompatible(_)
+            rustls::Error::PeerIncompatible(_)
                 | rustls::Error::AlertReceived(
                     AlertDescription::HandshakeFailure
                         | AlertDescription::ProtocolVersion
@@ -117,6 +122,27 @@ pub(crate) fn needs_passthrough(error: &UpstreamError) -> bool {
                         | AlertDescription::CertificateRequired
                 )
         )
+    )
+}
+
+/// Certificate errors that do not depend on which roots or intermediates the verifier
+/// has: the name, the dates, revocation and the key usage.
+fn client_rejects_too(error: &rustls::CertificateError) -> bool {
+    use rustls::CertificateError as E;
+    matches!(
+        error,
+        E::NotValidForName
+            | E::NotValidForNameContext { .. }
+            | E::Expired
+            | E::ExpiredContext { .. }
+            | E::NotValidYet
+            | E::NotValidYetContext { .. }
+            | E::Revoked
+            | E::UnknownRevocationStatus
+            | E::ExpiredRevocationList
+            | E::ExpiredRevocationListContext { .. }
+            | E::InvalidPurpose
+            | E::InvalidPurposeContext { .. }
     )
 }
 
@@ -157,20 +183,20 @@ fn rustls_error(error: &UpstreamError) -> Option<&rustls::Error> {
 
 /// After a failed upstream request to the server named `name`: when the failure is one
 /// the client would not have (see [`needs_passthrough`]), the host is passed through from
-/// now on, so the client talks to the server itself. Returns true in that case, also when
-/// the host already was a pin (another request may have learned it at the same time), so
-/// the caller closes the client connection.
+/// now on, so the client talks to the server itself. Returns true when the host is passed
+/// through now, also when it already was a pin (another request may have learned it at the
+/// same time), so the caller closes the client connection; false when the policy did not
+/// learn it (a burst of failures that looks like the network's doing).
 pub(crate) fn learn_from_failure(ctx: &ProxyContext, name: &str, error: &UpstreamError) -> bool {
     if !needs_passthrough(error) {
         return false;
     }
-    if ctx
-        .policy
-        .learn_upstream_untrusted(name, tollgate_common::clock::unix_secs())
-    {
+    let now = tollgate_common::clock::unix_secs();
+    if ctx.policy.learn_upstream_untrusted(name, now) {
         log::info!("{name}: upstream TLS failed ({error}); passing it through from now on");
     }
-    true
+    // Not a pin when the failure was part of a burst (see `learn_upstream_untrusted`).
+    matches!(ctx.policy.classify(name, now), Decision::Passthrough(_))
 }
 
 /// Records whether the server asked for a client certificate. The proxy has none to
@@ -1026,6 +1052,35 @@ mod tests {
         // A reset after the request is not an alert, so not a certificate requirement.
         let reset = io::Error::from(io::ErrorKind::ConnectionReset);
         assert!(!needs_passthrough(&connect_failure(reset, true)));
+    }
+
+    #[test]
+    fn certificates_the_client_would_reject_too_are_not_learned() {
+        use rustls::CertificateError;
+        for error in [
+            CertificateError::NotValidForName,
+            CertificateError::Expired,
+            CertificateError::NotValidYet,
+            CertificateError::Revoked,
+            CertificateError::UnknownRevocationStatus,
+            CertificateError::InvalidPurpose,
+        ] {
+            let failure = tls_failure(rustls::Error::InvalidCertificate(error.clone()));
+            assert!(
+                !needs_passthrough(&UpstreamError::Connect(failure)),
+                "{error:?}"
+            );
+        }
+        for error in [
+            CertificateError::UnknownIssuer,
+            CertificateError::BadSignature,
+        ] {
+            let failure = tls_failure(rustls::Error::InvalidCertificate(error.clone()));
+            assert!(
+                needs_passthrough(&UpstreamError::Connect(failure)),
+                "{error:?}"
+            );
+        }
     }
 
     #[test]
