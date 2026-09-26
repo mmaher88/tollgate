@@ -100,8 +100,18 @@ fn lookup_key(host: &str) -> String {
     host.to_ascii_lowercase()
 }
 
+/// A time recorded up to this far in the future still counts; one further ahead was taken
+/// while the wall clock was wrong and is treated as expired, so a pin learned then does not
+/// outlive its lifetime by the clock error.
+const CLOCK_TOLERANCE_SECS: u64 = 60 * 60;
+
+/// Whether `at` lies at most `max_age` seconds before `now` (and not far after it).
+fn within(at: u64, now: u64, max_age: u64) -> bool {
+    at <= now.saturating_add(CLOCK_TOLERANCE_SECS) && now.saturating_sub(at) <= max_age
+}
+
 fn pin_is_live(learned_at: u64, now: u64) -> bool {
-    now.saturating_sub(learned_at) < PIN_LIFETIME_SECS
+    within(learned_at, now, PIN_LIFETIME_SECS - 1)
 }
 
 #[derive(Default)]
@@ -182,7 +192,7 @@ impl Policy {
             return false;
         }
         match learning.recent.get(&key) {
-            Some(&previous) if now.saturating_sub(previous) <= REJECTION_WINDOW_SECS => {
+            Some(&previous) if within(previous, now, REJECTION_WINDOW_SECS) => {
                 learning.recent.remove(&key);
                 log::info!("learned certificate pin for {key} after {kind:?}");
                 learning.pins.insert(key, now);
@@ -193,7 +203,7 @@ impl Policy {
                 if learning.recent.len() >= MAX_RECENT_REJECTIONS {
                     learning
                         .recent
-                        .retain(|_, at| now.saturating_sub(*at) <= REJECTION_WINDOW_SECS);
+                        .retain(|_, at| within(*at, now, REJECTION_WINDOW_SECS));
                 }
                 if learning.recent.len() >= MAX_RECENT_REJECTIONS {
                     let oldest = learning

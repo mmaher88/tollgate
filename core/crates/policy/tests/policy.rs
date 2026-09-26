@@ -156,6 +156,32 @@ fn pins_expire_after_thirty_days() {
 }
 
 #[test]
+fn pins_and_rejections_from_a_clock_that_was_ahead_do_not_count() {
+    const DAY: u64 = 24 * 60 * 60;
+    let p = policy(&[]);
+    // Learned while the clock was two days ahead, then the clock is set back.
+    p.record_client_rejection("ahead.example", RejectionKind::UnknownCa, T0 + 2 * DAY);
+    assert!(p.record_client_rejection("ahead.example", RejectionKind::UnknownCa, T0 + 2 * DAY));
+    assert_eq!(p.classify("ahead.example", T0), Decision::Intercept);
+    // A small correction keeps the pin.
+    assert!(p.learn_upstream_untrusted("near.example", T0 + 60));
+    assert_eq!(
+        p.classify("near.example", T0),
+        passthrough(PassthroughReason::LearnedPin)
+    );
+    // A single rejection recorded while the clock was ahead does not pair with one now.
+    assert!(!p.record_client_rejection("once.example", RejectionKind::UnknownCa, T0 + 2 * DAY));
+    assert!(!p.record_client_rejection("once.example", RejectionKind::UnknownCa, T0));
+    // A saved pin from the future is not live either.
+    let json = format!(
+        r#"{{"version":1,"pins":[{{"host":"saved.example","learned_at":{}}}]}}"#,
+        T0 + 2 * DAY
+    );
+    let restored = Policy::new(&Config::default(), Some(&json)).unwrap();
+    assert_eq!(restored.classify("saved.example", T0), Decision::Intercept);
+}
+
+#[test]
 fn user_and_bundled_rank_above_learned_pins() {
     let p = policy(&["user.example"]);
     for host in ["user.example", "gateway.icloud.com"] {

@@ -30,6 +30,11 @@ pub const LEAF_CACHE_SIZE: usize = 128;
 /// A cached leaf older than this is issued again, so a long-running tunnel never serves a
 /// leaf close to its end date.
 pub const LEAF_REISSUE_SECS: u64 = 7 * 24 * 60 * 60;
+/// A cached leaf issued up to this far in the future is still served. Leaves start one day
+/// before they were issued, so a small clock correction backwards keeps them valid, while a
+/// leaf issued when the clock was ahead by more than this is issued again: its start date
+/// could be in the future, and every client would reject it.
+const LEAF_CLOCK_TOLERANCE_SECS: u64 = 60 * 60;
 
 struct CachedLeaf {
     key: Arc<CertifiedKey>,
@@ -113,17 +118,21 @@ impl CertAuthority {
     /// subject, the host as its only subject alternative name, the `serverAuth` extended
     /// key usage and an authority key identifier matching the CA.
     pub fn leaf(&self, host: &str) -> Result<Arc<CertifiedKey>, MitmError> {
+        self.leaf_at(host, tollgate_common::clock::unix_secs())
+    }
+
+    /// [`CertAuthority::leaf`] with `now` (wall-clock unix seconds) passed in.
+    pub(crate) fn leaf_at(&self, host: &str, now: u64) -> Result<Arc<CertifiedKey>, MitmError> {
         let name = normalize_host(host);
         if name.is_empty() {
             return Err(MitmError::InvalidHost(host.to_string()));
         }
-        let now = tollgate_common::clock::unix_secs();
         if let Some(cached) = self.cache().get(&name)
-            && now.saturating_sub(cached.issued_at) < LEAF_REISSUE_SECS
+            && reusable(cached.issued_at, now)
         {
             return Ok(cached.key.clone());
         }
-        let key = Arc::new(self.issue(&name)?);
+        let key = Arc::new(self.issue(&name, now)?);
         self.cache().put(
             name,
             CachedLeaf {
@@ -139,7 +148,11 @@ impl CertAuthority {
         self.cache().len()
     }
 
-    fn issue(&self, name: &str) -> Result<CertifiedKey, MitmError> {
+    fn issue(&self, name: &str, now: u64) -> Result<CertifiedKey, MitmError> {
+        let issued = i64::try_from(now)
+            .ok()
+            .and_then(|secs| OffsetDateTime::from_unix_timestamp(secs).ok())
+            .unwrap_or_else(OffsetDateTime::now_utc);
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
         // new() stores the name as a DNS name, or as an IP address when it parses as one.
         let mut params = CertificateParams::new(vec![name.to_string()])?;
@@ -149,7 +162,7 @@ impl CertAuthority {
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.use_authority_key_identifier_extension = true;
-        params.not_before = OffsetDateTime::now_utc() - Duration::days(1);
+        params.not_before = issued - Duration::days(1);
         params.not_after = params.not_before + Duration::days(LEAF_VALIDITY_DAYS);
         let cert = params.signed_by(&key, &self.issuer)?;
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
@@ -160,6 +173,13 @@ impl CertAuthority {
     fn cache(&self) -> MutexGuard<'_, LruCache<String, CachedLeaf>> {
         self.leaves.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// Whether a leaf issued at `issued_at` can still be served at `now`: it is younger than
+/// [`LEAF_REISSUE_SECS`] and was not issued while the wall clock was ahead.
+fn reusable(issued_at: u64, now: u64) -> bool {
+    issued_at <= now.saturating_add(LEAF_CLOCK_TOLERANCE_SECS)
+        && now.saturating_sub(issued_at) < LEAF_REISSUE_SECS
 }
 
 /// Shows the CA's name, never its key.
@@ -179,4 +199,48 @@ fn normalize_host(host: &str) -> String {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     host.to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    fn not_before(key: &CertifiedKey) -> i64 {
+        let (_, cert) = x509_parser::parse_x509_certificate(&key.cert[0]).expect("leaf parses");
+        cert.validity().not_before.timestamp()
+    }
+
+    #[test]
+    fn a_leaf_issued_while_the_clock_was_ahead_is_issued_again() {
+        let ca = CertAuthority::generate("Test CA").expect("ca");
+        let now = tollgate_common::clock::unix_secs();
+        let ahead = ca.leaf_at("example.com", now + 2 * DAY).expect("leaf");
+        assert!(not_before(&ahead) > now as i64);
+        let back = ca.leaf_at("example.com", now).expect("leaf");
+        assert!(!Arc::ptr_eq(&ahead, &back));
+        assert!(not_before(&back) <= now as i64);
+        // The new leaf replaced the cached one.
+        let again = ca.leaf_at("example.com", now).expect("leaf");
+        assert!(Arc::ptr_eq(&back, &again));
+    }
+
+    #[test]
+    fn a_leaf_is_reused_within_the_reissue_window_and_small_corrections() {
+        let ca = CertAuthority::generate("Test CA").expect("ca");
+        let now = tollgate_common::clock::unix_secs();
+        let first = ca.leaf_at("example.com", now).expect("leaf");
+        assert_eq!(not_before(&first), (now - DAY) as i64);
+        let later = ca.leaf_at("example.com", now + DAY).expect("leaf");
+        assert!(Arc::ptr_eq(&first, &later));
+        let corrected = ca
+            .leaf_at("example.com", now - LEAF_CLOCK_TOLERANCE_SECS)
+            .expect("leaf");
+        assert!(Arc::ptr_eq(&first, &corrected));
+        let old = ca
+            .leaf_at("example.com", now + LEAF_REISSUE_SECS)
+            .expect("leaf");
+        assert!(!Arc::ptr_eq(&first, &old));
+    }
 }
