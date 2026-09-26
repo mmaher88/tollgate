@@ -3,8 +3,14 @@
 //!
 //! Each upstream has one shared connection. Queries are independent futures that clone the
 //! connection's sender, so any number of them run at once on the same connection.
+//!
+//! An upstream that times out or cannot be reached is marked down for [`DOWN_FOR`] and tried
+//! only after the others, so a network that silently drops its packets does not cost every
+//! query the cold deadline. When the time is up, one query is sent to it in the background;
+//! its answer brings the upstream back, and a failure keeps it down for another period.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
@@ -32,6 +38,9 @@ pub const WARM_DEADLINE: Duration = Duration::from_millis(1500);
 pub const MAX_IDLE: Duration = Duration::from_secs(30);
 /// Queries resolving at once; above it `resolve` fails at once with [`DohError::Busy`].
 pub const MAX_IN_FLIGHT: usize = 128;
+/// How long an upstream that timed out or could not be reached is tried only after the
+/// others (all of them in order when every upstream is down).
+pub const DOWN_FOR: Duration = Duration::from_secs(30);
 
 const DNS_MESSAGE: &str = "application/dns-message";
 const MAX_ANSWER_LEN: usize = 65_535;
@@ -98,6 +107,20 @@ struct Upstream {
     slot: std::sync::Mutex<Slot>,
     /// Held while connecting, so concurrent cold queries open one connection, not many.
     connecting: tokio::sync::Mutex<()>,
+    /// Until when (on the resolver's clock) the upstream is tried after the others; 0 when
+    /// it is up.
+    down_until: AtomicU64,
+    /// Set while a background query checks whether a down upstream is back.
+    probing: AtomicBool,
+}
+
+/// Whether an upstream is tried in order or after the others.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Health {
+    Up,
+    Down,
+    /// Down, and its time is up: worth a query in the background.
+    Due,
 }
 
 struct Inner {
@@ -178,13 +201,15 @@ impl DohResolver {
         }
     }
 
-    /// Drops every upstream's open connection, so the next query to each opens a new one.
+    /// Drops every upstream's open connection, so the next query to each opens a new one,
+    /// and forgets which upstreams were down, so each gets another chance on the new path.
     /// For a network path change or a wake from sleep: a connection made on the old path
     /// would otherwise be reused for up to [`MAX_IDLE`] and cost each query the warm
     /// deadline before it fails. Queries already in flight on the old connection finish or
     /// time out as before. Safe to call from any thread, inside or outside the runtime.
     pub fn reset_connections(&self) {
         for upstream in &self.inner.upstreams {
+            upstream.down_until.store(0, Ordering::SeqCst);
             let mut slot = upstream.slot();
             if slot.sender.take().is_some() {
                 // A late touch or discard from a query on the old connection is a no-op.
@@ -194,7 +219,8 @@ impl DohResolver {
     }
 
     /// Sends `query` (a DNS message) to each upstream in turn until one answers, and returns
-    /// the answer with the query's id. The error is the last upstream's.
+    /// the answer with the query's id. Upstreams that are down come after the others. The
+    /// error is the last upstream's.
     pub async fn resolve(&self, query: &[u8]) -> Result<Vec<u8>, DohError> {
         if query.len() < DNS_HEADER_LEN {
             return Err(DohError::BadQuery);
@@ -207,7 +233,8 @@ impl DohResolver {
         body[..2].fill(0);
         let body = Bytes::from(body);
         let mut last = DohError::NoUpstream;
-        for upstream in &self.inner.upstreams {
+        for index in self.order(&body) {
+            let upstream = &self.inner.upstreams[index];
             match upstream.query(&self.inner.tls, &body, &*self.clock).await {
                 Ok(mut answer) => {
                     answer[..2].copy_from_slice(&query[..2]);
@@ -220,6 +247,49 @@ impl DohResolver {
             }
         }
         Err(last)
+    }
+
+    /// The upstreams to try, by index: those that are up in configured order, then those
+    /// that are down in configured order. Starts a background query to each down upstream
+    /// whose time is up.
+    fn order(&self, body: &Bytes) -> Vec<usize> {
+        let now = (self.clock)();
+        let mut up = Vec::with_capacity(self.inner.upstreams.len());
+        let mut down = Vec::new();
+        for (index, upstream) in self.inner.upstreams.iter().enumerate() {
+            match upstream.health(now) {
+                Health::Up => up.push(index),
+                Health::Down => down.push(index),
+                Health::Due => {
+                    self.probe(index, body);
+                    down.push(index);
+                }
+            }
+        }
+        up.extend(down);
+        up
+    }
+
+    /// Sends `body` to the down upstream `index` in a task of its own, unless one is already
+    /// on its way, so no caller waits on it. The query marks the upstream up or down again.
+    fn probe(&self, index: usize, body: &Bytes) {
+        if self.inner.upstreams[index]
+            .probing
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let inner = self.inner.clone();
+        let clock = self.clock.clone();
+        let body = body.clone();
+        tokio::spawn(async move {
+            let upstream = &inner.upstreams[index];
+            log::debug!("checking whether DoH upstream {} is back", upstream.name);
+            if let Err(e) = upstream.query(&inner.tls, &body, &*clock).await {
+                log::debug!("DoH upstream {} is still down: {e}", upstream.name);
+            }
+            upstream.probing.store(false, Ordering::SeqCst);
+        });
     }
 }
 
@@ -251,12 +321,44 @@ impl Upstream {
             uri,
             slot: std::sync::Mutex::new(Slot::default()),
             connecting: tokio::sync::Mutex::new(()),
+            down_until: AtomicU64::new(0),
+            probing: AtomicBool::new(false),
         })
+    }
+
+    fn health(&self, now: u64) -> Health {
+        match self.down_until.load(Ordering::SeqCst) {
+            0 => Health::Up,
+            until if now < until => Health::Down,
+            _ if self.probing.load(Ordering::SeqCst) => Health::Down,
+            _ => Health::Due,
+        }
+    }
+
+    fn mark_up(&self) {
+        if self.down_until.swap(0, Ordering::SeqCst) != 0 {
+            log::debug!("DoH upstream {} is back", self.name);
+        }
+    }
+
+    /// For an attempt that spent its deadline or failed below HTTP: not for an upstream
+    /// that answered, even with an error status.
+    fn mark_down(&self, now: u64) {
+        // Never 0, which means up.
+        let until = now.saturating_add(DOWN_FOR.as_secs()).max(1);
+        if self.down_until.swap(until, Ordering::SeqCst) == 0 {
+            log::debug!(
+                "DoH upstream {} is down for {} s",
+                self.name,
+                DOWN_FOR.as_secs()
+            );
+        }
     }
 
     /// One query: an attempt on the open connection if there is one that was used within
     /// [`MAX_IDLE`] (retried once on a new connection if that connection turns out to be
-    /// closed), otherwise an attempt on a new connection.
+    /// closed), otherwise an attempt on a new connection. An answer, even an unusable one,
+    /// marks the upstream up; a timeout or a failure to connect or exchange marks it down.
     async fn query(
         &self,
         tls: &TlsConnector,
@@ -267,6 +369,7 @@ impl Upstream {
             let result = timeout(WARM_DEADLINE, self.exchange(sender, body.clone())).await;
             if let Ok(Ok(_) | Err(Failure::Answer(_))) = &result {
                 self.touch(generation, now());
+                self.mark_up();
             }
             match result {
                 Ok(Ok(answer)) => return Ok(answer),
@@ -279,21 +382,30 @@ impl Upstream {
                     // A connection that stops answering (for example after the device
                     // slept) is dropped, so the next query connects again.
                     self.discard(generation);
+                    self.mark_down(now());
                     return Err(DohError::Timeout);
                 }
             }
         }
         let attempt = async {
-            let (generation, sender) = self.connected_sender(tls, now).await?;
+            let (generation, sender) = self
+                .connected_sender(tls, now)
+                .await
+                .map_err(Failure::Connection)?;
             let result = self.exchange(sender, body.clone()).await;
             if let Ok(_) | Err(Failure::Answer(_)) = &result {
                 self.touch(generation, now());
             }
-            result.map_err(Failure::into_error)
+            result
         };
-        timeout(COLD_DEADLINE, attempt)
+        let result = timeout(COLD_DEADLINE, attempt)
             .await
-            .unwrap_or(Err(DohError::Timeout))
+            .unwrap_or(Err(Failure::Connection(DohError::Timeout)));
+        match &result {
+            Ok(_) | Err(Failure::Answer(_)) => self.mark_up(),
+            Err(Failure::Connection(_)) => self.mark_down(now()),
+        }
+        result.map_err(Failure::into_error)
     }
 
     fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {

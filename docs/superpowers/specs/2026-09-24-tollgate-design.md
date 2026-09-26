@@ -321,7 +321,10 @@ drops redundant children of blocked parents. The false positive rate is about 5e
 - DoH: one shared HTTP/2 connection per upstream; each query runs in its own task on that
   connection. An attempt has a 2 s deadline on a cold connection and 1.5 s on a warm one. A
   closed connection is retried once, then the next upstream is tried, then the answer is
-  SERVFAIL. At most 128 queries are in flight.
+  SERVFAIL. An upstream whose attempt timed out or failed to connect is marked down for 30 s
+  and tried only after the others (all in order when every upstream is down); when the time
+  is up, one query goes to it in the background, and its answer brings it back. A network
+  path change clears the marks. At most 128 queries are in flight.
 - Responses are normalized to the requester: OPT is echoed only if the query had one, and
   answers larger than the requester's UDP size are trimmed: authority and additional records
   go first, then answer records from the end, keeping the CNAME chain and as many whole

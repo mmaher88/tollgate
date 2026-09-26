@@ -15,7 +15,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub use answer::{BLOCK_TTL, MAX_UDP_PAYLOAD};
 pub use cache::{CACHE_CAPACITY, MAX_CACHE_TTL, MIN_CACHE_TTL};
-pub use doh::{COLD_DEADLINE, DohError, DohResolver, MAX_IDLE, MAX_IN_FLIGHT, WARM_DEADLINE};
+pub use doh::{
+    COLD_DEADLINE, DOWN_FOR, DohError, DohResolver, MAX_IDLE, MAX_IN_FLIGHT, WARM_DEADLINE,
+};
 pub use handler::{DnsHandler, ForwardJob, Outcome};
 pub use lookup::{HostResolver, LOOKUP_CACHE_CAPACITY, LOOKUP_TIMEOUT, MAX_LOOKUP_TTL};
 
