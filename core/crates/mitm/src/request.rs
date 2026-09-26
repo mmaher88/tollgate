@@ -12,6 +12,7 @@ use crate::filtering::is_blocked;
 use crate::idle::InFlight;
 use crate::intercept::Origin;
 use crate::proxy::State;
+use crate::upstream::learn_from_failure;
 use crate::websocket;
 
 pub(crate) async fn handle(
@@ -68,6 +69,7 @@ async fn respond(state: &State, origin: &Origin, mut request: Request<Incoming>)
         Ok(response) => response,
         Err(e) => {
             log::debug!("upstream {}: {e}", origin.authority());
+            learn_from_failure(&state.ctx, &origin.name, &e);
             status(StatusCode::BAD_GATEWAY)
         }
     }

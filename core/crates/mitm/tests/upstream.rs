@@ -9,7 +9,8 @@ use hyper::StatusCode;
 use tollgate_mitm::{CertAuthority, ServeOptions};
 use tollgate_policy::Config;
 
-use support::client::proxy_get;
+use support::client::{get, proxy_get};
+use support::tunnel::{connect, http2, issuer_via, peer_issuer, send2, tls, tls_config};
 use support::{proxy, tls_origin};
 
 fn ca(name: &str) -> Arc<CertAuthority> {
@@ -101,8 +102,9 @@ async fn ip_address_origins_are_verified_by_ip() {
 }
 
 #[tokio::test]
-async fn untrusted_origin_certificate_gets_502() {
-    let origin = tls_origin::https(ca("Unknown CA"), &[b"h2", b"http/1.1"]).await;
+async fn untrusted_origin_certificate_gets_502_and_the_host_is_passed_through_from_then_on() {
+    let origin_ca = ca("Unknown CA");
+    let origin = tls_origin::https(origin_ca.clone(), &[b"h2", b"http/1.1"]).await;
     let proxy = start(tls_origin::trusting(&ca("Some Other CA"))).await;
 
     let reply = proxy_get(
@@ -113,4 +115,53 @@ async fn untrusted_origin_certificate_gets_502() {
     .await;
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
     assert_eq!(origin.requests(), 0);
+    let pins: Vec<String> = proxy
+        .ctx
+        .policy
+        .learned_pins()
+        .into_iter()
+        .map(|(host, _)| host)
+        .collect();
+    assert_eq!(pins, ["localhost"]);
+
+    // The client now judges the origin's certificate itself.
+    let target = format!("localhost:{}", origin.port());
+    let issuer = issuer_via(proxy.addr, &target, &[&origin_ca], "localhost").await;
+    assert_eq!(issuer, "CN=Unknown CA, O=Tollgate");
+}
+
+#[tokio::test]
+async fn an_intercepted_host_with_an_unverifiable_certificate_is_learned() {
+    let tollgate_ca = ca("Tollgate Test CA");
+    let origin_ca = ca("Unknown CA");
+    let origin = tls_origin::https(origin_ca.clone(), &[b"h2", b"http/1.1"]).await;
+    let ctx = proxy::context(tollgate_ca.clone(), &Config::default(), None);
+    let proxy = proxy::start(ctx, tls_origin::trusting(&ca("Some Other CA"))).await;
+    let target = format!("localhost:{}", origin.port());
+
+    let tcp = connect(proxy.addr, &target).await;
+    let tls = tls(tcp, tls_config(&[&tollgate_ca], &[b"h2"]), "localhost")
+        .await
+        .unwrap();
+    assert_eq!(peer_issuer(&tls), "CN=Tollgate Test CA, O=Tollgate");
+    let mut sender = http2(tls).await;
+    let reply = send2(
+        &mut sender,
+        get(&format!("https://localhost:{}/", origin.port()), &[]),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(proxy.ctx.policy.learned_pins().len(), 1);
+
+    let issuer = issuer_via(proxy.addr, &target, &[&origin_ca], "localhost").await;
+    assert_eq!(issuer, "CN=Unknown CA, O=Tollgate");
+}
+
+#[tokio::test]
+async fn an_unreachable_origin_is_not_learned() {
+    let proxy = start(ServeOptions::default()).await;
+    let port = support::origin::closed_port().await;
+    let reply = proxy_get(proxy.addr, &format!("https://localhost:{port}/"), &[]).await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    assert!(proxy.ctx.policy.learned_pins().is_empty());
 }

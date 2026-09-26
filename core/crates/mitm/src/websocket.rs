@@ -20,7 +20,7 @@ use crate::body::{Body, DoneBody, empty, status};
 use crate::http::strip_hop_by_hop;
 use crate::limits::H1_MAX_BUF;
 use crate::proxy::State;
-use crate::upstream::{Target, UpstreamError, connect_tcp};
+use crate::upstream::{Target, UpstreamError, connect_tcp, learn_from_failure};
 
 pub(crate) fn is_upgrade<B>(request: &Request<B>) -> bool {
     request.version() == Version::HTTP_11
@@ -39,6 +39,7 @@ pub(crate) async fn forward(
         Ok(dialed) => dialed,
         Err(e) => {
             log::debug!("WebSocket upstream {}: {e}", target.authority());
+            learn_from_failure(&state.ctx, &target.server_name, &e);
             return status(StatusCode::BAD_GATEWAY);
         }
     };

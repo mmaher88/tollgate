@@ -94,3 +94,19 @@ fn a_forgotten_pin_can_be_learned_again() {
     learn(&p, "pinned.example", T0 + 100);
     assert_eq!(p.learned_pins(), [("pinned.example".to_string(), T0 + 101)]);
 }
+
+#[test]
+fn one_unverifiable_upstream_certificate_makes_a_pin() {
+    let p = policy();
+    assert!(p.learn_upstream_untrusted("Legacy.Example.", T0));
+    assert_eq!(p.learned_pins(), [("legacy.example".to_string(), T0)]);
+    assert_eq!(
+        p.classify("legacy.example", T0 + 1),
+        Decision::Passthrough(PassthroughReason::LearnedPin)
+    );
+    // Already a pin: nothing new is learned, and the time is kept.
+    assert!(!p.learn_upstream_untrusted("legacy.example", T0 + 5));
+    assert_eq!(p.learned_pins(), [("legacy.example".to_string(), T0)]);
+    assert!(!p.learn_upstream_untrusted("", T0));
+    assert!(p.learned_pins_json().contains("legacy.example"));
+}

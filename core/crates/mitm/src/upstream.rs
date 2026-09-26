@@ -74,6 +74,32 @@ impl Target {
     }
 }
 
+/// True when the upstream server's certificate could not be verified (unknown issuer,
+/// expired, wrong name, bad signature and so on). Timeouts, connection failures and HTTP
+/// errors are not.
+pub(crate) fn is_untrusted_certificate(error: &UpstreamError) -> bool {
+    let UpstreamError::Connect(io) = error else {
+        return false;
+    };
+    // tokio-rustls reports TLS errors as io::Error(InvalidData) wrapping the rustls error.
+    matches!(
+        io.get_ref().and_then(|e| e.downcast_ref::<rustls::Error>()),
+        Some(rustls::Error::InvalidCertificate(_))
+    )
+}
+
+/// After a failed upstream request to the server named `name`: when its certificate could
+/// not be verified, the host is passed through from now on, so the client verifies it.
+pub(crate) fn learn_from_failure(ctx: &ProxyContext, name: &str, error: &UpstreamError) {
+    if is_untrusted_certificate(error)
+        && ctx
+            .policy
+            .learn_upstream_untrusted(name, tollgate_common::clock::unix_secs())
+    {
+        log::info!("{name}: upstream certificate not verifiable; passing it through from now on");
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UpstreamError {
     #[error("connecting: {0}")]

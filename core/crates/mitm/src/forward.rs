@@ -8,7 +8,7 @@ use crate::body::{Body, blocked, status};
 use crate::filtering::{is_blocked, is_domain_blocked};
 use crate::http::bare_host;
 use crate::proxy::State;
-use crate::upstream::Target;
+use crate::upstream::{Target, learn_from_failure};
 
 /// Filters and forwards one request. `https://` URLs are forwarded over TLS; anything
 /// that is not an absolute `http://` or `https://` URL gets `400`.
@@ -43,6 +43,7 @@ pub(crate) async fn forward(state: &State, request: Request<Incoming>) -> Respon
         Ok(response) => response,
         Err(e) => {
             log::debug!("upstream {}: {e}", target.authority());
+            learn_from_failure(&state.ctx, &target.server_name, &e);
             status(StatusCode::BAD_GATEWAY)
         }
     }

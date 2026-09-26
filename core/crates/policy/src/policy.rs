@@ -211,6 +211,27 @@ impl Policy {
         }
     }
 
+    /// Makes `host` a learned pin at once because the proxy could not verify the upstream
+    /// server's certificate (for example a missing intermediate, or a root that only the
+    /// system trusts). Such a failure repeats on every connection, and the client, which
+    /// can fetch intermediates and trusts the system roots, is the better judge once the
+    /// connection is passed through. Returns true when the host became a pin; false when it
+    /// already was one or `host` is empty. The pin expires like any other.
+    pub fn learn_upstream_untrusted(&self, host: &str, now: u64) -> bool {
+        let key = lookup_key(host);
+        if key.is_empty() {
+            return false;
+        }
+        let mut learning = self.lock();
+        learning.pins.retain(|_, at| pin_is_live(*at, now));
+        if learning.pins.contains_key(&key) {
+            return false;
+        }
+        learning.recent.remove(&key);
+        learning.pins.insert(key, now);
+        true
+    }
+
     /// True when `host` matches a user allowlist pattern, so nothing for it is blocked.
     pub fn is_allowlisted(&self, host: &str) -> bool {
         let key = lookup_key(host);
