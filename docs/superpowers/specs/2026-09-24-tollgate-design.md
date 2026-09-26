@@ -177,8 +177,11 @@ the CA, exercises the whole filtering path without a phone.
    - `NEProxySettings`: HTTP and HTTPS proxy `127.0.0.1:<port>`, `matchDomains = [""]`,
      `excludeSimpleHostnames = true`, exceptions for loopback, the private and link-local
      IPv4 and IPv6 ranges, `*.local`, `*.lan`, `*.home.arpa`, `*.internal`,
-     `*.localdomain`, `fritz.box`, `*.fritz.box` and `captive.apple.com`, so local network
-     pages never go through the extension.
+     `*.localdomain`, `fritz.box`, `*.fritz.box`, `*.intranet`, `*.corp`, `*.private` and
+     `captive.apple.com`, so local network pages never go through the extension. The
+     suffix entries cover every local suffix the core's DNS treats as local
+     (`LOCAL_SUFFIXES` in the dns crate) plus `*.local`; a test in the dns crate checks
+     that the two lists stay in sync.
    - MTU 1500.
 4. Loop `packetFlow.readPackets` into `engine.handlePackets` and write the results back.
 

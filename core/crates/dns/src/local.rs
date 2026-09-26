@@ -5,6 +5,11 @@
 
 /// Suffixes of names only a local resolver knows. `fritz.box` is the name AVM routers give
 /// themselves and their network; the rest of `.box` is a public top-level domain.
+///
+/// Keep in sync with `proxyExceptions` in `ios/Tunnel/PacketTunnelProvider.swift`, which
+/// must list `*.<suffix>` for every entry (and `fritz.box` bare) so these names bypass the
+/// system proxy. The test `proxy_exceptions_cover_local_suffixes` checks it. `*.local` is
+/// the one intended difference: mDNS names bypass the proxy but are not listed here.
 const LOCAL_SUFFIXES: &[&str] = &[
     "lan",
     "home.arpa",
@@ -73,7 +78,34 @@ pub fn is_local_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_local_name;
+    use super::{LOCAL_SUFFIXES, is_local_name};
+
+    /// Every local suffix must bypass the system proxy, or HTTPS pages under it are
+    /// intercepted by the extension (and a self-signed LAN device becomes a learned pin).
+    #[test]
+    fn proxy_exceptions_cover_local_suffixes() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../ios/Tunnel/PacketTunnelProvider.swift"
+        );
+        let swift = std::fs::read_to_string(path).expect("read PacketTunnelProvider.swift");
+        let start = swift
+            .find("static let proxyExceptions")
+            .expect("proxyExceptions in PacketTunnelProvider.swift");
+        let end = start
+            + swift[start..]
+                .find("\n    ]")
+                .expect("end of proxyExceptions");
+        let list = &swift[start..end];
+        for suffix in LOCAL_SUFFIXES {
+            let wildcard = format!("\"*.{suffix}\"");
+            assert!(list.contains(&wildcard), "proxyExceptions lacks {wildcard}");
+        }
+        assert!(
+            list.contains("\"fritz.box\""),
+            "proxyExceptions lacks \"fritz.box\""
+        );
+    }
 
     #[test]
     fn local_names() {

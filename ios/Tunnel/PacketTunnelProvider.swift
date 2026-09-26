@@ -259,10 +259,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// IP ranges are listed in both CIDR spellings, since which ones iOS accepts is not
     /// documented; an entry it does not parse can only match a host name ending in it, and
     /// no real name does. Also loopback, names under local-only suffixes, and the captive
-    /// portal check.
+    /// portal check. The suffix entries must stay in sync with `LOCAL_SUFFIXES` in
+    /// core/crates/dns/src/local.rs (a test there checks it); `*.local` is the one intended
+    /// extra, since mDNS names are not in that list.
     static let proxyExceptions = [
         "localhost", "*.localhost", "127.0.0.1", "127.0.0.0/8", "127/8", "::1", "[::1]",
         "*.local", "*.lan", "*.home.arpa", "*.internal", "*.localdomain", "fritz.box", "*.fritz.box",
+        "*.intranet", "*.corp", "*.private",
         "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
         "10/8", "172.16/12", "192.168/16", "169.254/16",
         "fe80::/10", "fc00::/7",
