@@ -152,11 +152,14 @@ struct ContentView: View {
             HStack {
                 Label("Filter lists", systemImage: "list.bullet.rectangle")
                 Spacer()
+                // Borderless, so only the button starts an update: in a List, a row with a
+                // default-style button acts as one big button.
                 Button("Update") {
                     Task {
                         if await lists.update() { await tunnel.listsUpdated() }
                     }
                 }
+                .buttonStyle(.borderless)
                 .disabled(lists.isBusy)
             }
             Text(listsDetail).font(.footnote).foregroundStyle(.secondary)

@@ -295,7 +295,10 @@ struct HostListEditor: View {
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
                         .onSubmit(add)
-                    Button("Add", action: add).disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
+                    // Borderless, so a tap on the text field does not also add the draft.
+                    Button("Add", action: add)
+                        .buttonStyle(.borderless)
+                        .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
                 if let error {
                     Text(error).font(.footnote).foregroundStyle(.red)
