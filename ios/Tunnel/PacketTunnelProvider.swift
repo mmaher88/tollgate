@@ -244,6 +244,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    /// Destinations the system reaches directly instead of through the proxy. Local network
+    /// pages (routers, NAS, Home Assistant) would otherwise either fail or be fetched by the
+    /// extension, which lets any app reach the LAN without iOS's Local Network permission.
+    /// IP ranges are listed in both CIDR spellings, since which ones iOS accepts is not
+    /// documented; an entry it does not parse can only match a host name ending in it, and
+    /// no real name does. Also loopback, names under local-only suffixes, and the captive
+    /// portal check.
+    static let proxyExceptions = [
+        "localhost", "*.localhost", "127.0.0.1", "127.0.0.0/8", "127/8", "::1", "[::1]",
+        "*.local", "*.lan", "*.home.arpa", "*.internal",
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+        "10/8", "172.16/12", "192.168/16", "169.254/16",
+        "fe80::/10", "fc00::/7",
+        "captive.apple.com",
+    ]
+
     static func networkSettings(proxyPort: UInt16?) -> NEPacketTunnelNetworkSettings {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
 
@@ -268,7 +284,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             proxy.httpsServer = server
             proxy.matchDomains = [""]
             proxy.excludeSimpleHostnames = true
-            proxy.exceptionList = ["*.local", "localhost", "127.0.0.1"]
+            proxy.exceptionList = proxyExceptions
             settings.proxySettings = proxy
         }
 

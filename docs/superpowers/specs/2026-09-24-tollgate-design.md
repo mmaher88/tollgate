@@ -175,7 +175,9 @@ the CA, exercises the whole filtering path without a phone.
      only.
    - `NEDNSSettings(servers: ["198.18.0.1", "fd00:7467::1"])` with `matchDomains = [""]`.
    - `NEProxySettings`: HTTP and HTTPS proxy `127.0.0.1:<port>`, `matchDomains = [""]`,
-     `excludeSimpleHostnames = true`, exceptions for `*.local` and captive portal hosts.
+     `excludeSimpleHostnames = true`, exceptions for loopback, the private and link-local
+     IPv4 and IPv6 ranges, `*.local`, `*.lan`, `*.home.arpa`, `*.internal` and
+     `captive.apple.com`, so local network pages never go through the extension.
    - MTU 1500.
 4. Loop `packetFlow.readPackets` into `engine.handlePackets` and write the results back.
 
