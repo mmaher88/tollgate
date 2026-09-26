@@ -24,11 +24,11 @@ struct ContentView: View {
                 await tunnel.load()
                 await certificate.prepare()
                 enforceTrust()
-                await updateListsIfMissing()
+                updateListsIfMissing()
             }
             .task(id: tunnel.status) {
                 heartbeat = TunnelHeartbeat.read()
-                if tunnel.status == .connected { await updateListsIfMissing() }
+                if tunnel.status == .connected { updateListsIfMissing() }
                 while tunnel.status == .connected, !Task.isCancelled {
                     await tunnel.refreshStats()
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -39,7 +39,7 @@ struct ContentView: View {
                 Task {
                     await certificate.refreshTrust()
                     enforceTrust()
-                    await updateListsIfMissing()
+                    updateListsIfMissing()
                 }
             }
         }
@@ -84,9 +84,11 @@ struct ContentView: View {
     }
 
     /// Downloads the lists when they are missing (offline at first launch, a failed first
-    /// attempt) or more than a day old, then hands them to the tunnel.
-    private func updateListsIfMissing() async {
-        await AppModel.shared.refreshListsIfNeeded()
+    /// attempt) or more than a day old, then hands them to the tunnel. Not awaited: the
+    /// download belongs to AppModel, so switching tabs or a tunnel status change does not
+    /// cancel it.
+    private func updateListsIfMissing() {
+        AppModel.shared.startRefreshIfNeeded()
     }
 
     /// HTTPS filtering with an untrusted root breaks every intercepted site, so it is turned
