@@ -178,6 +178,51 @@ pub(crate) fn is_unreachable(error: &UpstreamError) -> bool {
     }
 }
 
+/// True when the server took the request and then closed or reset the connection, reset
+/// the HTTP/2 stream or sent GOAWAY, before any response: the client, talking to the server
+/// itself, would have seen a closed connection too. A TLS alert, a malformed response, a
+/// stream reset with PROTOCOL_ERROR (which the proxy may have caused) and a lack of
+/// permits are not included, and neither is a client certificate requirement.
+pub(crate) fn closed_without_response(error: &UpstreamError) -> bool {
+    let UpstreamError::Http(http) = error else {
+        return false;
+    };
+    if rustls_error(error).is_some() {
+        return false;
+    }
+    // hyper reports a connection that closed before the request was written as canceled,
+    // caused by an incomplete message.
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(http);
+    while let Some(error) = next {
+        if error
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message)
+        {
+            return true;
+        }
+        if let Some(io) = error.downcast_ref::<io::Error>()
+            && matches!(
+                io.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::UnexpectedEof
+            )
+        {
+            return true;
+        }
+        if let Some(h2) = error.downcast_ref::<h2::Error>()
+            && (h2.is_reset() || h2.is_go_away())
+            && h2.is_remote()
+            && h2.reason() != Some(h2::Reason::PROTOCOL_ERROR)
+        {
+            return true;
+        }
+        next = error.source();
+    }
+    false
+}
+
 /// The rustls error behind `error`, if any. tokio-rustls reports TLS errors as an
 /// `io::Error` wrapping the rustls error, and hyper wraps that `io::Error` in turn.
 fn rustls_error(error: &UpstreamError) -> Option<&rustls::Error> {

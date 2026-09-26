@@ -14,20 +14,24 @@ use crate::filtering::is_blocked;
 use crate::idle::InFlight;
 use crate::intercept::Origin;
 use crate::proxy::State;
-use crate::upstream::{UpstreamError, certificate_problem, is_unreachable, learn_from_failure};
+use crate::upstream::{
+    UpstreamError, certificate_problem, closed_without_response, is_unreachable, learn_from_failure,
+};
 use crate::websocket;
 
-/// Ends a request without a response. hyper closes an HTTP/1.1 connection and resets an
-/// HTTP/2 stream, so the client sees a connection failure, as it would without the proxy.
+/// Ends a request without a response, for an upstream that could not be reached or that
+/// closed or reset the connection before any response. hyper closes an HTTP/1.1 connection
+/// and resets an HTTP/2 stream, so the client sees a connection failure, as it would
+/// without the proxy.
 #[derive(Debug, thiserror::Error)]
-#[error("no response: the upstream is unreachable")]
+#[error("no response: the upstream is unreachable or closed the connection")]
 pub(crate) struct NoResponse;
 
 /// The service for one request on an intercepted connection. An upstream that cannot be
-/// reached gets [`NoResponse`] rather than a `502`: the proxy answered the `CONNECT` and
-/// the TLS handshake itself, so a `502` over its trusted leaf would be an ordinary server
-/// response to the browser, shown as an empty page, and would keep it from falling back
-/// from `https://` to `http://`.
+/// reached, or that hangs up without answering, gets [`NoResponse`] rather than a `502`:
+/// the proxy answered the `CONNECT` and the TLS handshake itself, so a `502` over its
+/// trusted leaf would be an ordinary server response to the browser, shown as an empty
+/// page, and would keep it from falling back from `https://` to `http://`.
 pub(crate) async fn handle(
     state: Arc<State>,
     origin: Arc<Origin>,
@@ -126,15 +130,17 @@ async fn forward(
     }
 }
 
-/// The answer to a request the upstream pool could not send. A TLS failure gets `502`
-/// (and may teach the proxy to pass the host through, see [`bad_gateway`]), no free
-/// upstream connection `503`, and an upstream that cannot be reached at all no response.
+/// The answer to a request the upstream pool could not send. An upstream that cannot be
+/// reached at all, or that closes or resets the connection (or the HTTP/2 stream) before
+/// any response without a TLS error, gets no response; no free upstream connection `503`;
+/// anything else, TLS failures included, `502` (which may teach the proxy to pass the host
+/// through, see [`bad_gateway`]).
 fn failure(
     state: &State,
     origin: &Origin,
     error: &UpstreamError,
 ) -> Result<(Response<Body>, bool), NoResponse> {
-    if is_unreachable(error) {
+    if gets_no_response(error) {
         return Err(NoResponse);
     }
     if let UpstreamError::Exhausted = error {
@@ -142,6 +148,11 @@ fn failure(
     }
     let untrusted = learn_from_failure(&state.ctx, &origin.name, error);
     Ok((bad_gateway(error), untrusted))
+}
+
+/// True for the failures [`failure`] answers with [`NoResponse`].
+fn gets_no_response(error: &UpstreamError) -> bool {
+    is_unreachable(error) || closed_without_response(error)
 }
 
 /// `502` for a failed upstream request. The client accepted the proxy's certificate, so it
@@ -201,6 +212,102 @@ mod tests {
             assert!(body.starts_with("Tollgate: "), "{error:?}: {body}");
             assert!(body.contains(says), "{error:?}: {body}");
         }
+    }
+
+    /// Reads fail with `error`, or end the connection when it is `None`; writes succeed.
+    struct Upstream(Option<io::Error>);
+
+    impl tokio::io::AsyncRead for Upstream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(self.0.take().map_or(Ok(()), Err))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Upstream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// What the upstream pool reports when an HTTP/1.1 request fails because reading the
+    /// response fails with `read` (`None`: the server closes the connection).
+    async fn http1_failure(read: Option<io::Error>) -> UpstreamError {
+        use http_body_util::Empty;
+        use hyper_util::rt::TokioIo;
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Empty<bytes::Bytes>>(
+            TokioIo::new(Upstream(read)),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(conn);
+        let request = Request::get("/").body(Empty::new()).unwrap();
+        UpstreamError::Http(sender.send_request(request).await.unwrap_err())
+    }
+
+    fn alert(description: rustls::AlertDescription) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(description),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_hangs_up_gets_no_response() {
+        assert!(gets_no_response(&http1_failure(None).await));
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            let error = http1_failure(Some(io::Error::from(kind))).await;
+            assert!(gets_no_response(&error), "{kind:?}");
+            assert!(!is_unreachable(&error), "{kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_alerts_and_client_certificates_still_get_a_502() {
+        use crate::upstream::needs_passthrough;
+        // A TLS alert after the handshake keeps its 502, and learns a pin when it says so.
+        for (description, learned) in [
+            (rustls::AlertDescription::InternalError, false),
+            (rustls::AlertDescription::CertificateRequired, true),
+        ] {
+            let error = http1_failure(Some(alert(description))).await;
+            assert!(!gets_no_response(&error), "{description:?}");
+            assert_eq!(needs_passthrough(&error), learned, "{description:?}");
+        }
+        // A server that required a client certificate and hung up is still learned.
+        let error = UpstreamError::ClientCertificate(Box::new(http1_failure(None).await));
+        assert!(!gets_no_response(&error));
+        assert!(needs_passthrough(&error));
+        // So is a response the proxy cannot parse.
+        let garbled = io::Error::new(io::ErrorKind::InvalidData, "garbled");
+        assert!(!gets_no_response(&http1_failure(Some(garbled)).await));
+        assert!(!gets_no_response(&UpstreamError::Exhausted));
     }
 
     #[tokio::test]

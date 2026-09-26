@@ -12,6 +12,7 @@ tollgate-filter = { workspace = true }
 tollgate-policy = { workspace = true }
 arc-swap = { workspace = true }
 bytes = { workspace = true }
+h2 = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

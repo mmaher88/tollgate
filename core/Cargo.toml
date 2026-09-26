@@ -68,6 +68,8 @@ hyper = { version = "1.11.1", features = ["http1", "http2", "server", "client"] 
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "http1", "http2"] }
 http-body-util = "0.1.5"
 bytes = "1.12.1"
+# Already in the tree through hyper; the proxy reads stream resets and GOAWAY from its errors.
+h2 = "0.4.19"
 
 # tools/devproxy only. env_logger without regex, colors or timestamps; socket2 (already in
 # the tree through tokio) to share the DNS port with an mDNS responder.

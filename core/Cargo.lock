@@ -1731,6 +1731,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "futures-core",
+ "h2",
  "http-body-util",
  "hyper",
  "hyper-util",
