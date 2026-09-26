@@ -71,6 +71,8 @@ fn start_stop_restart_drop_and_stop_from_the_runtime_thread() {
     assert_eq!(engine.port(), Some(port));
     wait_until("one runtime thread", || runtime_threads() == 1);
     assert_eq!(engine.start(sink().0), Err(TollgateError::AlreadyRunning));
+    // What the tunnel calls on wake and on network changes.
+    engine.reset_connections();
 
     // The proxy listens as soon as start() returns and filters plain HTTP.
     let response = proxy_get(port, "http://blocked.example/ad.js", "blocked.example");

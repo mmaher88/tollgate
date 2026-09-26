@@ -33,6 +33,11 @@ pub struct ServeOptions {
     pub max_upstream_connections: usize,
     /// HTTP/1.1 upstream connections per origin. Default 6.
     pub max_h1_per_host: usize,
+    /// Seconds from a clock that keeps counting while the device sleeps, used to age pooled
+    /// upstream connections. tokio's clock, like `Instant` on iOS, stops during sleep, so a
+    /// connection pooled before hours of sleep would still look fresh. Default
+    /// `tollgate_common::clock::now_secs`; tests pass a clock they can move.
+    pub clock: fn() -> u64,
 }
 
 impl Default for ServeOptions {
@@ -47,6 +52,7 @@ impl Default for ServeOptions {
             keep_alive_interval: Duration::from_secs(30),
             max_upstream_connections: MAX_UPSTREAM_CONNECTIONS,
             max_h1_per_host: MAX_H1_PER_HOST,
+            clock: tollgate_common::clock::now_secs,
         }
     }
 }

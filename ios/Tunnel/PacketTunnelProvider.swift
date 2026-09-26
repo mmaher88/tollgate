@@ -16,6 +16,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let reading = OSAllocatedUnfairLock(initialState: false)
 
     private var engine: Engine? { engineState.withLock { $0 } }
+    /// Watches `defaultPath` while the core runs.
+    private var pathObservation: NSKeyValueObservation?
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         setLogger(logger: OSLogCoreLogger(subsystem: "dev.tollgate.core"), maxLevel: .info)
@@ -43,8 +45,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         log.info("stopTunnel reason=\(reason.rawValue, privacy: .public)")
         // Always stop explicitly: the runtime thread holds the packet sink, so relying on
         // deinit would leave the core running.
+        pathObservation?.invalidate()
+        pathObservation = nil
         takeAndStopEngine()
         completionHandler()
+    }
+
+    /// Pooled upstream connections from before sleep usually still look open, but after a
+    /// network change while asleep their path is gone and a request sent on one would hang.
+    override func wake() {
+        log.info("wake: dropping pooled upstream connections")
+        engine?.resetConnections()
     }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
@@ -137,9 +148,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             self.log.info("tunnel up")
+            self.observeNetworkChanges()
             self.reading.withLock { $0 = true }
             Self.readPackets(engine: engine, flow: self.packetFlow, reading: self.reading, log: self.log)
             completionHandler(nil)
+        }
+    }
+
+    /// Drops the proxy's pooled upstream connections when the default path changes (for
+    /// example from Wi-Fi to cellular), like apps connecting directly would lose theirs.
+    /// The first value and changes to an unsatisfied path are ignored.
+    private func observeNetworkChanges() {
+        pathObservation?.invalidate()
+        pathObservation = observe(\.defaultPath, options: [.old, .new]) { [weak self] _, change in
+            guard let self,
+                  let old = change.oldValue ?? nil,
+                  let new = change.newValue ?? nil,
+                  new.status == .satisfied,
+                  !new.isEqual(to: old)
+            else { return }
+            self.log.info("network path changed: dropping pooled upstream connections")
+            self.engine?.resetConnections()
         }
     }
 

@@ -50,6 +50,7 @@ pub fn context(ca: Arc<CertAuthority>, config: &Config, rules: Option<&str>) -> 
         max_intercepted: config.max_intercepted_connections as usize,
         available_memory: || None,
         events: None,
+        upstream_resets: Default::default(),
     }
 }
 

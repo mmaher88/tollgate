@@ -344,6 +344,11 @@ drops redundant children of blocked parents. The false positive rate is about 5e
   connections per host and 64 upstream connections in total.
 - Timeouts: 10 s for the first bytes and for the TLS handshake, 30 s to read request headers,
   HTTP/2 keep-alive pings, and idle connections are closed after 60 s without requests.
+  Pooled upstream connections are aged with the continuous clock (tokio's clock stops during
+  sleep), checked again when taken from the pool, pinged while idle (HTTP/2), and dropped all
+  at once when the provider wakes or the default network path changes. A GET, HEAD or
+  OPTIONS without a body that fails on a reused connection before its response starts is
+  sent once more on a new connection.
 - WebSockets over intercepted HTTPS are forwarded over a dedicated HTTP/1.1 upstream
   connection.
 - HTTP/2 requests whose authority does not match the connection's SNI get `421 Misdirected

@@ -3,6 +3,7 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
@@ -45,6 +46,18 @@ pub struct ProxyContext {
     pub available_memory: fn() -> Option<u64>,
     /// Where blocked requests are recorded; `None` records nothing.
     pub events: Option<Arc<EventLog>>,
+    /// Bumped by [`ProxyContext::reset_upstream_connections`]; start it at 0.
+    pub upstream_resets: AtomicU64,
+}
+
+impl ProxyContext {
+    /// Closes every pooled upstream connection that is not carrying a request, so the next
+    /// request dials again. Call it when the device wakes or the network path changes: a
+    /// connection on the old path usually still looks open, and a request sent on it would
+    /// hang until TCP gives up. Requests in flight finish on their connections.
+    pub fn reset_upstream_connections(&self) {
+        self.upstream_resets.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 /// Shared by every task of one `serve` call.
@@ -99,8 +112,10 @@ pub async fn serve_with_options(
             keep_alive_interval: options.keep_alive_interval,
             max_connections: options.max_upstream_connections,
             max_h1_per_host: options.max_h1_per_host,
+            clock: options.clock,
         },
         tasks.clone(),
+        ctx.clone(),
     );
     let mut server = auto::Builder::new(TokioExecutor::new());
     server

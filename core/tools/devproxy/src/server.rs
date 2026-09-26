@@ -158,6 +158,7 @@ impl DevProxy {
             max_intercepted: config.max_intercepted_connections as usize,
             available_memory: || None,
             events: Some(events.clone()),
+            upstream_resets: Default::default(),
         });
         let dns = Arc::new(DnsHandler::new(domains.map(Arc::new), stats));
         dns.set_allowlist(allowlist);

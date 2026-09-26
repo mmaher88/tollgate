@@ -4,19 +4,25 @@
 //! most `max_h1_per_host` connections; further requests wait for one to become idle. All
 //! origins together hold at most `max_connections`; when that is reached, the oldest idle
 //! connection is closed to make room.
+//!
+//! Idle connections are aged with the continuous clock (`PoolOptions::clock`), because
+//! tokio's clock stops while the device sleeps, and are checked again when they are taken
+//! from the pool. `ProxyContext::reset_upstream_connections` drops them all after a wake or
+//! a network change, and a safe request that fails on a reused connection before its
+//! response starts is sent once more on a new connection.
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use http_body_util::BodyExt;
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Empty};
+use hyper::body::{Body as _, Incoming};
 use hyper::client::conn::{http1, http2};
 use hyper::header::{self, HeaderValue};
 use hyper::rt::{Read, Write};
-use hyper::{Request, Response, Uri, Version};
+use hyper::{Method, Request, Response, Uri, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
@@ -25,6 +31,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 
+use crate::ProxyContext;
 use crate::body::{Body, DoneBody};
 use crate::http::{authority, join_cookies, strip_hop_by_hop};
 use crate::limits::{
@@ -81,6 +88,15 @@ pub(crate) struct PoolOptions {
     pub(crate) keep_alive_interval: Duration,
     pub(crate) max_connections: usize,
     pub(crate) max_h1_per_host: usize,
+    /// Seconds from a clock that keeps counting while the device sleeps.
+    pub(crate) clock: fn() -> u64,
+}
+
+impl PoolOptions {
+    /// The idle timeout in whole seconds of `clock`, at least 1.
+    fn idle_secs(&self) -> u64 {
+        self.idle_timeout.as_secs().max(1)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +109,8 @@ struct Host {
     /// Unknown until the first TLS handshake has negotiated ALPN.
     protocol: Option<Protocol>,
     h2: Option<http2::SendRequest<Body>>,
-    idle: Vec<(http1::SendRequest<Body>, Instant)>,
+    /// Idle HTTP/1.1 connections and when they became idle (`PoolOptions::clock`).
+    idle: Vec<(http1::SendRequest<Body>, u64)>,
     /// One permit per live HTTP/1.1 connection.
     slots: Arc<Semaphore>,
     /// Signalled when an HTTP/1.1 connection becomes idle.
@@ -102,11 +119,12 @@ struct Host {
     dial: Arc<tokio::sync::Mutex<()>>,
     /// Responses whose bodies are still streaming.
     active: Arc<AtomicUsize>,
-    last_used: Instant,
+    /// When a request last started on this origin (`PoolOptions::clock`).
+    last_used: u64,
 }
 
 impl Host {
-    fn new(tls: bool, max_h1: usize) -> Host {
+    fn new(tls: bool, max_h1: usize, now: u64) -> Host {
         Host {
             protocol: if tls { None } else { Some(Protocol::Http1) },
             h2: None,
@@ -115,23 +133,35 @@ impl Host {
             ready: Arc::new(Notify::new()),
             dial: Arc::new(tokio::sync::Mutex::new(())),
             active: Arc::new(AtomicUsize::new(0)),
-            last_used: Instant::now(),
+            last_used: now,
         }
     }
 
-    fn reuse(&mut self) -> Option<Sender> {
+    /// A pooled connection that is open and was not idle for `idle` seconds or more at
+    /// `now`. Older ones are dropped: after sleep or a network change their path may be
+    /// gone without the connection noticing.
+    fn reuse(&mut self, now: u64, idle: u64) -> Option<Sender> {
         if let Some(h2) = &self.h2 {
-            if h2.is_ready() {
+            let idle_too_long = self.active.load(Ordering::Relaxed) == 0
+                && now.saturating_sub(self.last_used) >= idle;
+            if h2.is_ready() && !idle_too_long {
                 return Some(Sender::Http2(h2.clone()));
             }
             self.h2 = None;
         }
-        while let Some((h1, _)) = self.idle.pop() {
-            if h1.is_ready() {
+        while let Some((h1, since)) = self.idle.pop() {
+            if h1.is_ready() && now.saturating_sub(since) < idle {
                 return Some(Sender::Http1(h1));
             }
         }
         None
+    }
+
+    /// Drops every pooled connection. In-flight requests keep their connections, and the
+    /// slots and counters stay, since those connections still use them.
+    fn clear(&mut self) {
+        self.h2 = None;
+        self.idle.clear();
     }
 }
 
@@ -148,11 +178,27 @@ struct Inner {
     tls: TlsConnector,
     options: PoolOptions,
     shutdown: Shutdown,
+    /// Where `reset_upstream_connections` is counted.
+    ctx: Arc<ProxyContext>,
+    /// The reset count the pool has acted on.
+    resets_seen: AtomicU64,
 }
 
 impl Inner {
+    /// The hosts, after dropping every pooled connection if a reset was asked for since
+    /// the last look.
     fn hosts(&self) -> MutexGuard<'_, HashMap<Target, Host>> {
-        self.hosts.lock().unwrap_or_else(PoisonError::into_inner)
+        let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
+        let resets = self.ctx.upstream_resets.load(Ordering::Acquire);
+        if self.resets_seen.swap(resets, Ordering::AcqRel) != resets {
+            log::info!("dropping pooled upstream connections");
+            hosts.values_mut().for_each(Host::clear);
+        }
+        hosts
+    }
+
+    fn now(&self) -> u64 {
+        (self.options.clock)()
     }
 
     /// Returns an HTTP/1.1 connection to the idle list once its last response is done.
@@ -165,9 +211,10 @@ impl Inner {
             if sender.ready().await.is_err() {
                 return;
             }
+            let now = inner.now();
             let mut hosts = inner.hosts();
             if let Some(host) = hosts.get_mut(&target) {
-                host.idle.push((sender, Instant::now()));
+                host.idle.push((sender, now));
                 host.ready.notify_one();
             }
         });
@@ -176,26 +223,39 @@ impl Inner {
 
 impl Pool {
     /// `tls` supplies the trusted roots; the pool offers ALPN `h2` and `http/1.1`.
-    pub(crate) fn new(tls: &ClientConfig, options: PoolOptions, shutdown: Shutdown) -> Pool {
+    /// `ctx` is where resets are asked for.
+    pub(crate) fn new(
+        tls: &ClientConfig,
+        options: PoolOptions,
+        shutdown: Shutdown,
+        ctx: Arc<ProxyContext>,
+    ) -> Pool {
         let mut config = tls.clone();
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let resets_seen = AtomicU64::new(ctx.upstream_resets.load(Ordering::Acquire));
         Pool(Arc::new(Inner {
             hosts: Mutex::new(HashMap::new()),
             global: Arc::new(Semaphore::new(options.max_connections)),
             tls: TlsConnector::from(Arc::new(config)),
             options,
             shutdown,
+            ctx,
+            resets_seen,
         }))
     }
 
     /// Sends `request` (any URI form) to `target`. A request that a reused connection
-    /// refused before sending it is retried once on a new connection.
+    /// refused before sending it is retried once on a new connection. So is a GET, HEAD
+    /// or OPTIONS without a body that a reused connection failed before its response
+    /// started: the connection may have been cut off by sleep or a network change, and
+    /// repeating such a request is safe.
     pub(crate) async fn send(
         &self,
         target: &Target,
         mut request: Request<Body>,
     ) -> Result<Response<Body>, UpstreamError> {
         let mut fresh_only = false;
+        let mut replay = replayable(&request);
         loop {
             let (sender, fresh) = self.checkout(target, fresh_only).await?;
             let mut error = match sender {
@@ -215,6 +275,16 @@ impl Pool {
             match error.take_message() {
                 Some(unsent) if !fresh => {
                     request = unsent;
+                    fresh_only = true;
+                }
+                None if !fresh && let Some(copy) = replay.take() => {
+                    log::debug!(
+                        "upstream {}: {} on a reused connection; retrying on a new one",
+                        target.authority(),
+                        error.error()
+                    );
+                    request =
+                        copy.map(|()| Empty::new().map_err(|never| match never {}).boxed_unsync());
                     fresh_only = true;
                 }
                 _ => return Err(error.into_error().into()),
@@ -245,14 +315,14 @@ impl Pool {
 
     /// Closes connections idle for longer than the idle timeout and forgets unused origins.
     pub(crate) fn reap(&self) {
-        let now = Instant::now();
-        let idle = self.0.options.idle_timeout;
+        let now = self.0.now();
+        let idle = self.0.options.idle_secs();
         let max_h1 = self.0.options.max_h1_per_host;
         self.0.hosts().retain(|_, host| {
             host.idle
-                .retain(|(h1, since)| now.duration_since(*since) < idle && !h1.is_closed());
+                .retain(|(h1, since)| now.saturating_sub(*since) < idle && !h1.is_closed());
             let active = host.active.load(Ordering::Relaxed);
-            let h2_idle = active == 0 && now.duration_since(host.last_used) >= idle;
+            let h2_idle = active == 0 && now.saturating_sub(host.last_used) >= idle;
             if host.h2.as_ref().is_some_and(|h2| h2.is_closed() || h2_idle) {
                 host.h2 = None;
             }
@@ -273,12 +343,22 @@ impl Pool {
     ) -> Result<(Sender, bool), UpstreamError> {
         loop {
             let (protocol, slots, ready, dial) = {
+                let now = self.0.now();
+                let idle = self.0.options.idle_secs();
+                let max_h1 = self.0.options.max_h1_per_host;
                 let mut hosts = self.0.hosts();
                 let host = hosts
                     .entry(target.clone())
-                    .or_insert_with(|| Host::new(target.tls, self.0.options.max_h1_per_host));
-                host.last_used = Instant::now();
-                if !fresh_only && let Some(sender) = host.reuse() {
+                    .or_insert_with(|| Host::new(target.tls, max_h1, now));
+                // Checked before last_used moves, so an HTTP/2 connection idle for too long
+                // is not mistaken for a busy one.
+                let reused = if fresh_only {
+                    None
+                } else {
+                    host.reuse(now, idle)
+                };
+                host.last_used = now;
+                if let Some(sender) = reused {
                     return Ok((sender, false));
                 }
                 (
@@ -299,11 +379,15 @@ impl Pool {
             }
             let _dialing = dial.lock().await;
             let now_protocol = {
+                let now = self.0.now();
+                let idle = self.0.options.idle_secs();
+                let max_h1 = self.0.options.max_h1_per_host;
                 let mut hosts = self.0.hosts();
                 let host = hosts
                     .entry(target.clone())
-                    .or_insert_with(|| Host::new(target.tls, self.0.options.max_h1_per_host));
-                if !fresh_only && let Some(sender) = host.reuse() {
+                    .or_insert_with(|| Host::new(target.tls, max_h1, now));
+                if !fresh_only && let Some(sender) = host.reuse(now, idle) {
+                    host.last_used = now;
                     return Ok((sender, false));
                 }
                 host.protocol
@@ -361,6 +445,9 @@ impl Pool {
             .max_send_buf_size(H2_MAX_SEND_BUF)
             .keep_alive_interval(self.0.options.keep_alive_interval)
             .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
+            // Ping idle connections too, so one whose path died is found and dropped
+            // before a request is sent on it. Pooled connections live 60 s at most.
+            .keep_alive_while_idle(true)
             .handshake(io)
             .await?;
         let authority = target.authority();
@@ -467,6 +554,27 @@ impl Pool {
         });
         Response::from_parts(parts, body.boxed_unsync())
     }
+}
+
+/// A copy of `request` without its body, if sending it twice is safe: GET, HEAD or
+/// OPTIONS with an empty body.
+fn replayable(request: &Request<Body>) -> Option<Request<()>> {
+    if !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) {
+        return None;
+    }
+    let body = request.body();
+    if !body.is_end_stream() && body.size_hint().exact() != Some(0) {
+        return None;
+    }
+    let mut copy = Request::new(());
+    *copy.method_mut() = request.method().clone();
+    *copy.uri_mut() = request.uri().clone();
+    *copy.version_mut() = request.version();
+    *copy.headers_mut() = request.headers().clone();
+    Some(copy)
 }
 
 /// Opens a TCP connection with Nagle's algorithm off.

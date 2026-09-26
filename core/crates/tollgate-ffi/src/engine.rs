@@ -250,6 +250,16 @@ impl Engine {
         .unwrap_or_default()
     }
 
+    /// Drops the proxy's pooled upstream connections, so the next requests dial again.
+    /// Call it when the device wakes and when the network path changes: connections from
+    /// before usually still look open while their path is gone.
+    pub fn reset_connections(&self) {
+        let _ = catch_panic(|| {
+            self.proxy.reset_upstream_connections();
+            Ok(())
+        });
+    }
+
     /// Whether HTTPS connections can be intercepted: `mitm_enabled` in the config, a CA and
     /// `engine.dat` were all present when the engine was created.
     pub fn mitm_active(&self) -> bool {
@@ -330,6 +340,7 @@ impl Engine {
             max_intercepted: config.max_intercepted_connections as usize,
             available_memory,
             events: Some(events.clone()),
+            upstream_resets: Default::default(),
         });
         let dns = Arc::new(DnsHandler::new(domains, stats.clone()));
         dns.set_allowlist(allowlist);

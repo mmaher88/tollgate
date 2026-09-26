@@ -46,6 +46,7 @@ fn engine_methods_have_the_expected_swift_names() {
             "func forgetPins(",
             "func forgetPins(hosts: [String]) -> UInt32",
         ),
+        ("func resetConnections(", "func resetConnections()"),
     ] {
         let found = declarations(&swift, needle);
         assert!(
