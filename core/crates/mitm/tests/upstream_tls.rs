@@ -13,7 +13,7 @@ use tollgate_mitm::CertAuthority;
 use tollgate_policy::Config;
 
 use support::client::{get, proxy_get};
-use support::tls_origin::{self, ClientAuth};
+use support::tls_origin::{self, ClientAuth, HangUp};
 use support::tunnel::{connect, http2, peer_issuer, send2, tls, tls_config};
 use support::{origin, proxy};
 
@@ -153,6 +153,51 @@ async fn a_server_asking_for_an_optional_client_certificate_stays_intercepted() 
             assert_eq!(status_via(&proxy, origin.port()).await, StatusCode::OK);
         }
         assert!(learned(&proxy).is_empty());
+    }
+}
+
+/// A server that asks for an optional client certificate proves over TLS 1.2 that it does
+/// not require one, and over TLS 1.3 sends no alert when it drops a request for another
+/// reason: neither is learned.
+#[tokio::test]
+async fn a_server_asking_for_an_optional_client_certificate_that_hangs_up_is_not_learned() {
+    for versions in [&[&TLS12], &[&TLS13]] {
+        for alpn in [&b"http/1.1"[..], b"h2"] {
+            for how in [HangUp::CloseNotify, HangUp::Reset] {
+                let origin_ca = ca("Origin CA");
+                let origin = tls_origin::hang_up(
+                    origin_ca.clone(),
+                    &[alpn],
+                    versions,
+                    ClientAuth::Optional,
+                    how,
+                )
+                .await;
+                let tollgate_ca = ca("Tollgate Test CA");
+                let ctx = proxy::context(tollgate_ca.clone(), &Config::default(), None);
+                let proxy = proxy::start(ctx, tls_origin::trusting(&origin_ca)).await;
+                let case = format!("{versions:?} {:?} {how:?}", String::from_utf8_lossy(alpn));
+                // Absolute form: 502.
+                assert_eq!(
+                    status_via(&proxy, origin.port()).await,
+                    StatusCode::BAD_GATEWAY,
+                    "{case}"
+                );
+                assert!(learned(&proxy).is_empty(), "{case}");
+                // Intercepted: no response, or 502.
+                let target = format!("localhost:{}", origin.port());
+                let tcp = connect(proxy.addr, &target).await;
+                let tls = tls(tcp, tls_config(&[&tollgate_ca], &[b"h2"]), "localhost")
+                    .await
+                    .unwrap();
+                let url = format!("https://localhost:{}/", origin.port());
+                if let Ok(response) = http2(tls).await.send_request(get(&url, &[])).await {
+                    assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{case}");
+                }
+                assert_eq!(origin.requests(), 2, "{case}");
+                assert!(learned(&proxy).is_empty(), "{case}");
+            }
+        }
     }
 }
 

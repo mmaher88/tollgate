@@ -38,7 +38,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::client::ResolvesClientCert;
 use rustls::pki_types::ServerName;
 use rustls::sign::CertifiedKey;
-use rustls::{AlertDescription, ClientConfig, SignatureScheme};
+use rustls::{AlertDescription, ClientConfig, ProtocolVersion, SignatureScheme};
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
@@ -284,7 +284,9 @@ impl ResolvesClientCert for ClientCertAsked {
 /// A TLS connection to an upstream, and whether the server asked for a client certificate.
 /// A server that requires one and rejects the empty certificate during the handshake
 /// (TLS 1.2) fails here with [`UpstreamError::ClientCertificate`]; over TLS 1.3 the
-/// rejection only arrives with the first request, so the caller checks the flag then.
+/// rejection only arrives as an alert after the handshake, so the caller watches for it
+/// (see [`AlertWatch`]). Over TLS 1.2 a completed handshake after a request proves that the
+/// certificate was optional.
 pub(crate) async fn connect_tls<T>(
     config: &ClientConfig,
     name: ServerName<'static>,
@@ -303,6 +305,81 @@ where
     match result {
         Ok(tls) => Ok((tls, asked)),
         Err(e) => Err(connect_failure(e, asked)),
+    }
+}
+
+/// A TLS stream that records whether a read failed with a fatal alert from the server. A
+/// TLS 1.3 server that requires a client certificate sends it (certificate_required, or
+/// bad_certificate or handshake_failure) after the handshake, in place of the first
+/// response. The flag survives HTTP/2, which keeps only the text of I/O errors.
+struct AlertWatch<T> {
+    inner: T,
+    alert: Arc<AtomicBool>,
+}
+
+impl<T> AlertWatch<T> {
+    fn new(inner: T) -> (AlertWatch<T>, Arc<AtomicBool>) {
+        let alert = Arc::new(AtomicBool::new(false));
+        let watch = AlertWatch {
+            inner,
+            alert: alert.clone(),
+        };
+        (watch, alert)
+    }
+
+    fn note<R>(&self, polled: Poll<io::Result<R>>) -> Poll<io::Result<R>> {
+        if let Poll::Ready(Err(e)) = &polled
+            && let Some(rustls::Error::AlertReceived(_)) = e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        {
+            self.alert.store(true, Ordering::Release);
+        }
+        polled
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for AlertWatch<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        self.note(polled)
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for AlertWatch<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.note(polled)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let polled = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.note(polled)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_flush(cx);
+        self.note(polled)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -329,8 +406,8 @@ pub(crate) enum UpstreamError {
     Exhausted,
     #[error(transparent)]
     Http(#[from] hyper::Error),
-    /// The server asked for a client certificate and failed the connection or the first
-    /// request without one.
+    /// The server asked for a client certificate and failed the handshake without one, or
+    /// (TLS 1.3) sent a fatal alert in place of the first response.
     #[error("client certificate required: {0}")]
     ClientCertificate(Box<UpstreamError>),
 }
@@ -541,13 +618,14 @@ enum Sender {
 }
 
 /// Where `checkout` got a connection from.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 enum Checkout {
     Pooled,
-    /// Opened for this request. `client_cert_asked` when the server asked for a client
-    /// certificate during the handshake.
+    /// Opened for this request. `cert_rejection` when the server asked for a client
+    /// certificate during a TLS 1.3 handshake, so it may still reject the empty one: set
+    /// once a fatal alert from the server was read (see [`AlertWatch`]).
     New {
-        client_cert_asked: bool,
+        cert_rejection: Option<Arc<AtomicBool>>,
     },
 }
 
@@ -659,7 +737,7 @@ impl Pool {
                     }
                 }
             };
-            if let Checkout::Pooled = checkout {
+            if let Checkout::Pooled = &checkout {
                 if let Some(unsent) = error.take_message() {
                     request = unsent;
                     fresh_only = true;
@@ -678,12 +756,17 @@ impl Pool {
                 }
             }
             let error = UpstreamError::from(error.into_error());
+            // Over TLS 1.3 a server that requires a client certificate rejects the empty one
+            // only after the handshake, with an alert in place of the first response. Any
+            // other failure (a reset, a close, a cut network path, an HTTP/2 stream error)
+            // is not a certificate requirement. A server whose reset arrives before its
+            // alert is read is not learned either: it gets a 502 or no response each time,
+            // rather than being passed through wrongly.
             if let Checkout::New {
-                client_cert_asked: true,
-            } = checkout
+                cert_rejection: Some(alert),
+            } = &checkout
+                && alert.load(Ordering::Acquire)
             {
-                // Over TLS 1.3 a server that requires a client certificate rejects the
-                // empty one only after the handshake, so the first request fails.
                 return Err(UpstreamError::ClientCertificate(Box::new(error)));
             }
             return Err(error);
@@ -832,15 +915,20 @@ impl Pool {
                 .start_http1(TokioIo::new(tcp), global, h1_permit)
                 .await?;
             let checkout = Checkout::New {
-                client_cert_asked: false,
+                cert_rejection: None,
             };
             return Ok((Sender::Http1(h1), checkout));
         }
         let name = ServerName::try_from(target.server_name.clone())
             .map_err(|_| UpstreamError::ServerName(target.server_name.clone()))?;
         let (tls, client_cert_asked) = connect_tls(&self.0.tls, name, tcp).await?;
-        let checkout = Checkout::New { client_cert_asked };
-        let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+        let session = &tls.get_ref().1;
+        let is_h2 = session.alpn_protocol() == Some(b"h2");
+        let tls13 = session.protocol_version() == Some(ProtocolVersion::TLSv1_3);
+        let (tls, alert) = AlertWatch::new(tls);
+        let checkout = Checkout::New {
+            cert_rejection: (client_cert_asked && tls13).then_some(alert),
+        };
         let io = TokioIo::new(tls);
         if !is_h2 {
             self.set_protocol(target, Protocol::Http1, None);
