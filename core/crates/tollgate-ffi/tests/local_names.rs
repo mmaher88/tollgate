@@ -151,3 +151,45 @@ fn waiting_local_queries_are_bounded_and_expire() {
     let first = local.calls()[0].0;
     assert!(engine.complete_local(first, None).is_empty());
 }
+
+/// A second query for a question already waiting joins it instead of starting another
+/// lookup. Besides saving work, this ends a lookup that comes back through the tunnel (a
+/// network whose own resolver is the tunnel's), which would otherwise start a new lookup
+/// for itself over and over.
+#[test]
+fn identical_local_queries_share_one_lookup() {
+    let server = DohServer::start();
+    let (_dir, engine) = engine(&server, EngineOptions::default());
+    let local = Arc::new(Recorder::default());
+    engine.set_local_resolver(Some(local.clone()));
+
+    let immediate = engine
+        .handle_packets(vec![
+            query(1, "nas.lan.", RecordType::A),
+            query(2, "NAS.lan.", RecordType::A),
+            query(3, "nas.lan.", RecordType::AAAA),
+        ])
+        .unwrap();
+    assert!(immediate.is_empty());
+    assert!(
+        engine
+            .handle_packets(vec![query(4, "nas.lan.", RecordType::A)])
+            .unwrap()
+            .is_empty()
+    );
+    let calls = local.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+
+    let record = DnsRecord {
+        rtype: 1,
+        rclass: 1,
+        ttl: 30,
+        data: vec![192, 168, 1, 20],
+    };
+    let packets = engine.complete_local(calls[0].0, Some(vec![record]));
+    let mut ids: Vec<u16> = packets.iter().map(|p| reply(p).metadata.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [1, 2, 4]);
+    assert!(packets.iter().all(|p| reply(p).answers.len() == 1));
+    assert_eq!(engine.complete_local(calls[1].0, Some(Vec::new())).len(), 1);
+}

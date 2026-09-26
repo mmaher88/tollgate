@@ -45,9 +45,12 @@ const MAX_BLOCKING_THREADS: usize = 4;
 /// How long `stop` waits for blocking work such as a hung `getaddrinfo`.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Most local network queries waiting for [`Engine::complete_local`]; further ones get
-/// SERVFAIL at once.
+/// Most local network lookups waiting for [`Engine::complete_local`]; queries for further
+/// questions get SERVFAIL at once.
 pub const LOCAL_PENDING: usize = 64;
+/// Most queries waiting on one local lookup (clients repeat a query that takes long);
+/// further ones get SERVFAIL at once.
+const LOCAL_JOBS_PER_LOOKUP: usize = 16;
 /// Default for [`EngineOptions::local_deadline`].
 pub const LOCAL_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -91,11 +94,33 @@ impl From<DnsRecord> for LocalRecord {
     }
 }
 
-/// Local network queries handed to the [`LocalResolver`], by id.
+/// A question's name in lowercase, its type and its class.
+type LocalQuestion = (String, u16, u16);
+
+/// One lookup handed to the [`LocalResolver`] and the queries waiting for it.
+struct LocalLookup {
+    question: LocalQuestion,
+    jobs: Vec<ForwardJob>,
+    since: Instant,
+}
+
+/// Local network lookups handed to the [`LocalResolver`], by id. A query for a question
+/// already being looked up waits for that lookup. Besides saving work, this ends a lookup
+/// that comes back through the tunnel (on a network whose resolver the system cannot scope
+/// to the interface), which would otherwise start a new lookup for itself again and again.
 #[derive(Default)]
 struct LocalJobs {
     next_id: u64,
-    waiting: HashMap<u64, (ForwardJob, Instant)>,
+    waiting: HashMap<u64, LocalLookup>,
+    by_question: HashMap<LocalQuestion, u64>,
+}
+
+impl LocalJobs {
+    fn remove(&mut self, id: u64) -> Option<LocalLookup> {
+        let lookup = self.waiting.remove(&id)?;
+        self.by_question.remove(&lookup.question);
+        Some(lookup)
+    }
 }
 
 /// Counters since the engine was created. Mirrors `tollgate_common::stats::StatsSnapshot`.
@@ -350,13 +375,17 @@ impl Engine {
     /// write to the tunnel, or nothing when `id` was already answered or has expired.
     pub fn complete_local(&self, id: u64, records: Option<Vec<DnsRecord>>) -> Vec<Vec<u8>> {
         catch_panic(|| {
-            let Some((job, _)) = lock(&self.local_jobs).waiting.remove(&id) else {
+            let Some(lookup) = lock(&self.local_jobs).remove(id) else {
                 return Ok(Vec::new());
             };
             let records: Option<Vec<LocalRecord>> =
                 records.map(|records| records.into_iter().map(LocalRecord::from).collect());
             let now = clock::now_secs();
-            Ok(vec![self.dns.complete_local(job, records.as_deref(), now)])
+            Ok(lookup
+                .jobs
+                .into_iter()
+                .map(|job| self.dns.complete_local(job, records.as_deref(), now))
+                .collect())
         })
         .unwrap_or_default()
     }
@@ -503,9 +532,9 @@ impl Engine {
         replies
     }
 
-    /// Hands local network queries to the [`LocalResolver`]. Returns SERVFAIL replies for
-    /// queries that cannot wait (no resolver, [`LOCAL_PENDING`] already waiting) and for
-    /// waiting ones past their deadline.
+    /// Hands local network queries to the [`LocalResolver`], one lookup per question.
+    /// Returns SERVFAIL replies for queries that cannot wait (no resolver, [`LOCAL_PENDING`]
+    /// lookups already waiting) and for waiting ones past their deadline.
     fn resolve_locally(&self, jobs: Vec<ForwardJob>, now: u64) -> Vec<Vec<u8>> {
         let resolver = lock(&self.local_resolver).clone();
         let mut failed = Vec::new();
@@ -516,25 +545,45 @@ impl Engine {
             let expired: Vec<u64> = local
                 .waiting
                 .iter()
-                .filter(|(_, (_, since))| since.elapsed() >= deadline)
+                .filter(|(_, lookup)| lookup.since.elapsed() >= deadline)
                 .map(|(&id, _)| id)
                 .collect();
             for id in expired {
-                if let Some((job, _)) = local.waiting.remove(&id) {
-                    log::debug!("local DNS query {id} got no answer in time");
-                    failed.push(job);
+                if let Some(lookup) = local.remove(id) {
+                    log::debug!("local DNS lookup {id} got no answer in time");
+                    failed.extend(lookup.jobs);
                 }
             }
             for job in jobs {
-                if resolver.is_none() || local.waiting.len() >= LOCAL_PENDING {
+                if resolver.is_none() {
+                    failed.push(job);
+                    continue;
+                }
+                let (rtype, rclass) = job.record_type_and_class();
+                let question = (job.name().to_ascii_lowercase(), rtype, rclass);
+                if let Some(&id) = local.by_question.get(&question) {
+                    let lookup = local.waiting.get_mut(&id).expect("indexed lookups wait");
+                    if lookup.jobs.len() < LOCAL_JOBS_PER_LOOKUP {
+                        lookup.jobs.push(job);
+                    } else {
+                        failed.push(job);
+                    }
+                    continue;
+                }
+                if local.waiting.len() >= LOCAL_PENDING {
                     failed.push(job);
                     continue;
                 }
                 let id = local.next_id;
                 local.next_id += 1;
-                let (rtype, rclass) = job.record_type_and_class();
                 calls.push((id, job.name().to_string(), rtype, rclass));
-                local.waiting.insert(id, (job, Instant::now()));
+                local.by_question.insert(question.clone(), id);
+                let lookup = LocalLookup {
+                    question,
+                    jobs: vec![job],
+                    since: Instant::now(),
+                };
+                local.waiting.insert(id, lookup);
             }
         }
         // Outside the lock: Swift may answer from inside the call.
