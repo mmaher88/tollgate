@@ -8,13 +8,14 @@ use crate::body::{Body, blocked, status};
 use crate::filtering::{is_blocked, is_domain_blocked};
 use crate::http::bare_host;
 use crate::proxy::State;
-use crate::request::{NoResponse, bad_gateway};
-use crate::upstream::{Target, UpstreamError, is_unreachable, learn_from_failure};
+use crate::request::{NoResponse, bad_gateway, gets_no_response};
+use crate::upstream::{Target, UpstreamError, learn_from_failure};
 
 /// Filters and forwards one request. `https://` URLs are forwarded over TLS; anything
 /// that is not an absolute `http://` or `https://` URL gets `400`. An upstream that cannot
-/// be reached gets [`NoResponse`]: the client connection closes, so the browser shows its
-/// own error page, as without the proxy, instead of an empty `502`.
+/// be reached, or closes or resets the connection before any response, gets
+/// [`NoResponse`]: the client connection closes, so the browser shows its own error page,
+/// as without the proxy, instead of an empty `502`.
 pub(crate) async fn forward(
     state: &State,
     request: Request<Incoming>,
@@ -49,7 +50,7 @@ pub(crate) async fn forward(
         Ok(response) => Ok(response),
         Err(e) => {
             state.log_upstream_failure(&target.authority(), &e);
-            if is_unreachable(&e) {
+            if gets_no_response(&e) {
                 return Err(NoResponse::Closed);
             }
             if let UpstreamError::Exhausted = e {

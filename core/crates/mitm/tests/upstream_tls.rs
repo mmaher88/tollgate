@@ -9,11 +9,12 @@ use std::sync::Arc;
 use hyper::StatusCode;
 use rustls::SupportedProtocolVersion;
 use rustls::version::{TLS12, TLS13};
+use tokio::net::TcpStream;
 use tollgate_common::clock::unix_secs;
 use tollgate_mitm::CertAuthority;
 use tollgate_policy::{Config, Decision, PassthroughReason};
 
-use support::client::{get, proxy_get, proxy_get_raw, wait_for};
+use support::client::{get, http1, proxy_get, proxy_get_raw, wait_for};
 use support::tls_origin::{self, ClientAuth, HangUp};
 use support::tunnel::{connect, http2, peer_issuer, reset_reason, tls, tls_config};
 use support::{origin, proxy};
@@ -180,12 +181,14 @@ async fn a_server_asking_for_an_optional_client_certificate_that_hangs_up_is_not
                 let ctx = proxy::context(tollgate_ca.clone(), &Config::default(), None);
                 let proxy = proxy::start(ctx, tls_origin::trusting(&origin_ca)).await;
                 let case = format!("{versions:?} {:?} {how:?}", String::from_utf8_lossy(alpn));
-                // Absolute form: 502.
-                assert_eq!(
-                    status_via(&proxy, origin.port()).await,
-                    StatusCode::BAD_GATEWAY,
-                    "{case}"
-                );
+                // Absolute form: no response (the server hung up), or 502.
+                let tcp = TcpStream::connect(proxy.addr).await.unwrap();
+                let url = format!("https://localhost:{}/", origin.port());
+                let host = format!("localhost:{}", origin.port());
+                let request = get(&url, &[("host", &host)]);
+                if let Ok(response) = http1(tcp).await.send_request(request).await {
+                    assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{case}");
+                }
                 assert!(learned(&proxy).is_empty(), "{case}");
                 // Intercepted: no response, or 502.
                 let target = format!("localhost:{}", origin.port());

@@ -194,8 +194,9 @@ fn failure(
     Ok((bad_gateway(error), false))
 }
 
-/// True for the failures [`failure`] answers with [`NoResponse`].
-fn gets_no_response(error: &UpstreamError) -> bool {
+/// True for the failures [`failure`] answers with [`NoResponse`], and that
+/// [`crate::forward::forward`] answers with [`NoResponse`] too.
+pub(crate) fn gets_no_response(error: &UpstreamError) -> bool {
     is_unreachable(error) || closed_without_response(error)
 }
 

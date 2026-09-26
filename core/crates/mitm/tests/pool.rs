@@ -15,7 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tollgate_mitm::{CertAuthority, ServeOptions};
 use tollgate_policy::Config;
 
-use support::client::{get, http1, proxy_get, read_reply};
+use support::client::{get, http1, proxy_get};
 use support::tunnel::{Sender2, connect, http2, send2, tls, tls_config};
 use support::{proxy, tls_origin};
 
@@ -184,8 +184,10 @@ async fn a_request_with_a_body_is_not_retried() {
     request
         .headers_mut()
         .insert("host", origin.to_string().parse().unwrap());
-    let reply = read_reply(sender.send_request(request).await.unwrap()).await;
-    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    // The server hung up without answering, so the client sees a closed connection, as
+    // it would without the proxy.
+    let result = sender.send_request(request).await;
+    assert!(result.is_err(), "expected no response, got {result:?}");
     assert_eq!(requests.load(Ordering::SeqCst), 2);
 }
 

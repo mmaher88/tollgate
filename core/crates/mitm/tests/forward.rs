@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::StatusCode;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tollgate_mitm::{CertAuthority, ServeOptions, accept_backoff};
 use tollgate_policy::Config;
 
@@ -194,6 +194,42 @@ async fn unreachable_upstream_gets_no_response_and_bad_requests_400() {
         .await
         .unwrap();
     assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+}
+
+/// A plain HTTP origin that reads each request head and then hangs up without a response,
+/// with a reset when `reset`.
+async fn hanging_up(reset: bool) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tcp.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                if reset {
+                    let _ = tcp.set_zero_linger();
+                }
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn an_upstream_that_hangs_up_gets_no_response() {
+    let proxy = start(ServeOptions::default()).await;
+    for reset in [false, true] {
+        let port = hanging_up(reset).await;
+        // Not an empty 502, which Safari shows as a blank page.
+        let response = proxy_get_raw(proxy.addr, &format!("http://127.0.0.1:{port}/")).await;
+        assert_eq!(String::from_utf8_lossy(&response), "", "reset: {reset}");
+    }
 }
 
 #[tokio::test]
