@@ -295,7 +295,7 @@ struct HostListEditor: View {
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
                         .onSubmit(add)
-                    // Borderless, so a tap on the text field does not also add the draft.
+                    // Borderless, so a tap elsewhere in the row does not add the draft.
                     Button("Add", action: add)
                         .buttonStyle(.borderless)
                         .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
