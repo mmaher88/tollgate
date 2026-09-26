@@ -67,11 +67,13 @@ struct Builder {
 
 impl DomainRules {
     /// Adblock lists contribute `||name^`, `||name^|`, `||name` (no caret, when the name
-    /// does not end in a dot), `.name^` (treated as the name and its subdomains), the
-    /// exact-host forms `|name^|` and `|name^` (the name only), their `@@` forms,
-    /// `$important` (not on exact-host blocks) and `$badfilter`. Exceptions whose name has
-    /// a `*` are kept as wildcard exceptions; blocks with a `*` are skipped. Any other
-    /// option, a path, a regex or a `|` prefix rule such as `|ads.` is skipped. Hosts lists
+    /// does not end in a dot), `.name^` and the unanchored `name^` and `name^|` (the name
+    /// must start with a letter or digit; all treated as the name and its subdomains), the
+    /// exact-host forms `|name^|`, `|name^`, `://name^` and `://name^|` (the name only),
+    /// their `@@` forms, `$important` (not on exact-host blocks) and `$badfilter`.
+    /// Exceptions whose name has a `*` are kept as wildcard exceptions; blocks with a `*`
+    /// are skipped. Any other option, a path, a regex, a rule without a caret such as
+    /// `ads.example` or a `|` prefix rule such as `|ads.` is skipped. Hosts lists
     /// contribute every name on `address name...` lines and bare `name` lines.
     pub fn parse(lists: &[ListSource]) -> DomainRules {
         let mut builder = Builder::default();
@@ -214,6 +216,29 @@ fn parse_adblock_line(line: &str) -> Line {
                 exact = true;
                 name
             }
+            None => return Line::Skip,
+        }
+    } else if let Some(rest) = pattern.strip_prefix("://") {
+        // `://name^` and `://name^|` match right after the scheme, up to the end of the
+        // host: exactly that host, like `|name^`.
+        match rest.strip_suffix("^|").or_else(|| rest.strip_suffix('^')) {
+            Some(name) => {
+                exact = true;
+                name
+            }
+            None => return Line::Skip,
+        }
+    } else if pattern.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        // `name^` and `name^|` without an anchor match wherever the name ends at a
+        // separator, so also in longer names; the DNS blocklist keeps the part it can
+        // decide, the host and its subdomains, like `||name^`. The first character must
+        // start a label: `-pia.example^` is a suffix of `x-pia.example`, not a block of
+        // `pia.example`.
+        match pattern
+            .strip_suffix("^|")
+            .or_else(|| pattern.strip_suffix('^'))
+        {
+            Some(name) => name,
             None => return Line::Skip,
         }
     } else {

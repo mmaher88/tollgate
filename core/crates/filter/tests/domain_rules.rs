@@ -1,4 +1,4 @@
-use tollgate_filter::{DomainRules, ListFormat, ListSource};
+use tollgate_filter::{DomainRules, DomainSet, ListFormat, ListSource};
 
 fn parse(format: ListFormat, text: &str) -> DomainRules {
     DomainRules::parse(&[ListSource {
@@ -255,4 +255,66 @@ fn wildcard_exceptions_are_kept_and_wildcard_blocks_skipped() {
     // The wildcard block, the wildcard important block, a pattern without a dot, one
     // with nothing but wildcards, a bad character and a path.
     assert_eq!(rules.skipped, 7);
+}
+
+/// The AdGuard DNS filter writes some host blocks without an anchor (`name^`, the host and
+/// its subdomains) and some anchored with `://` (`://name^`, the host only).
+#[test]
+fn unanchored_and_scheme_anchored_host_rules() {
+    let text = "dlsdk.appsflyer.com^\n\
+                Pipe.Example.net^|\n\
+                ://jhf.ru^\n\
+                ://exact-pipe.example^|\n\
+                @@ok.appsflyer.com^\n\
+                @@://ok-exact.example^\n\
+                imp.example^$important\n\
+                -pia.appsflyersdk.com^\n\
+                @@-ds.metric.gstatic.com^|\n\
+                ://*.a-akamaihd.com^\n\
+                @@://exc*.example^\n\
+                no-caret.example\n\
+                ://no-caret.example\n\
+                ://path.example/x^\n";
+    let rules = parse(ListFormat::Adblock, text);
+    assert_eq!(
+        rules.block,
+        names(&["dlsdk.appsflyer.com", "pipe.example.net"])
+    );
+    assert_eq!(rules.exact_block, names(&["exact-pipe.example", "jhf.ru"]));
+    assert_eq!(rules.allow, names(&["ok.appsflyer.com"]));
+    assert_eq!(rules.exact_allow, names(&["ok-exact.example"]));
+    assert_eq!(rules.important, names(&["imp.example"]));
+    assert_eq!(rules.exact_wildcard_allow, names(&["exc*.example"]));
+    assert!(rules.wildcard_allow.is_empty());
+    // A leading `-`, the wildcard block, two rules without a caret and a path.
+    assert_eq!(rules.skipped, 6);
+
+    let set = DomainSet::from_bytes(rules.encode()).unwrap();
+    assert!(set.is_blocked("dlsdk.appsflyer.com"));
+    assert!(set.is_blocked("eu.dlsdk.appsflyer.com"));
+    assert!(set.is_blocked("jhf.ru"));
+    assert!(!set.is_blocked("www.jhf.ru"));
+    assert!(!set.is_blocked("pia.appsflyersdk.com"));
+}
+
+#[test]
+fn badfilter_cancels_unanchored_and_scheme_anchored_rules() {
+    let rules = parse(
+        ListFormat::Adblock,
+        "gone.example^\n\
+         gone.example^$badfilter\n\
+         ://gone-exact.example^\n\
+         ://gone-exact.example^$badfilter\n\
+         @@gone-allow.example^\n\
+         @@gone-allow.example^$badfilter\n\
+         @@://gone-exact-allow.example^|\n\
+         @@://gone-exact-allow.example^|$badfilter\n\
+         kept.example^\n\
+         ://kept.example^$badfilter\n",
+    );
+    assert_eq!(rules.block, names(&["kept.example"]));
+    assert!(rules.exact_block.is_empty());
+    assert!(rules.allow.is_empty());
+    assert!(rules.exact_allow.is_empty());
+    assert_eq!(rules.skipped, 0);
 }

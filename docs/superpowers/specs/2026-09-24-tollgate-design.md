@@ -314,9 +314,13 @@ depend on each other.
 the lowercased name in a binary file: magic `TGDS`, format version, entry counts, the length
 of the pattern section, checksum, then block hashes, allow hashes and important hashes, then
 the pattern section. The extension mmaps it and binary-searches the host and each parent
-label. The parser accepts `||name^`, `||name`, `.name^`, `@@||name^`, the exact-host forms
-`|name^|` and `|name^` and their `@@` forms, `$important` and `$badfilter` rules and
-hosts-format lines. Exceptions with a `*` in the name (the AdGuard DNS filter has about ten,
+label. The parser accepts `||name^`, `||name`, `.name^`, the unanchored `name^` and
+`name^|` (the name must start with a letter or digit, so `-pia.example^`, a suffix of other
+names, is skipped; all of these block the name and its subdomains), `@@||name^`, the
+exact-host forms `|name^|`, `|name^`, `://name^` and `://name^|` and their `@@` forms,
+`$important` and `$badfilter` rules and hosts-format lines. The AdGuard DNS filter writes
+some blocks in the unanchored form (`dlsdk.appsflyer.com^`) and some with `://`
+(`://jhf.ru^`, that host only). Exceptions with a `*` in the name (the AdGuard DNS filter has about ten,
 such as `@@||clk*.tradedoubler.com^|` and `@@||bcicl.*.evergage.com^|`) are kept as text in
 the pattern section and parsed once at load; `*` matches any run of characters, dots
 included, and a `||` pattern may match the host or a parent, a `|` pattern the host only.
