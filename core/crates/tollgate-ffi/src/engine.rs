@@ -18,9 +18,9 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tollgate_common::clock;
 use tollgate_common::events::EventLog;
 use tollgate_common::stats::{Stats as Counters, StatsSnapshot};
-use tollgate_dns::{DnsHandler, DohError, DohResolver, ForwardJob, Outcome};
+use tollgate_dns::{DnsHandler, DohError, DohResolver, ForwardJob, HostResolver, Outcome};
 use tollgate_filter::{DOMAINS_FILE, DomainSet, ENGINE_FILE, FilterEngine, FilterError};
-use tollgate_mitm::{CertAuthority, ProxyContext};
+use tollgate_mitm::{CertAuthority, ProxyContext, ServeOptions};
 use tollgate_policy::{Config, HostPattern, Policy};
 
 use crate::ca::{load_ca, write_private};
@@ -662,9 +662,16 @@ async fn serve(
         pins,
         pins_save_interval,
     } = work;
+    // The proxy looks upstream names up over the same DoH connections, so they do not go
+    // to the network's resolver in plain text, whatever iOS does with the extension's own
+    // lookups. getaddrinfo stays the fallback.
+    let options = ServeOptions {
+        resolver: Some(Arc::new(HostResolver::new(resolver.clone()))),
+        ..ServeOptions::default()
+    };
     let forwarding = tokio::spawn(forward(queue, resolver, dns, sink, in_flight));
     let saving = tokio::spawn(save_pins_periodically(pins, pins_save_interval));
-    tollgate_mitm::serve(listener, proxy, async move {
+    tollgate_mitm::serve_with_options(listener, proxy, options, async move {
         let _ = stopped.await;
     })
     .await;

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustls::ClientConfig;
+use tollgate_common::resolve::Resolve;
 
 use crate::limits::{MAX_H1_PER_HOST, MAX_UPSTREAM_CONNECTIONS};
 
@@ -38,6 +39,10 @@ pub struct ServeOptions {
     /// connection pooled before hours of sleep would still look fresh. Default
     /// `tollgate_common::clock::now_secs`; tests pass a clock they can move.
     pub clock: fn() -> u64,
+    /// Looks up upstream host names, for example over DNS over HTTPS. When it finds
+    /// nothing, or none of its addresses answers, the system resolver is used. Default
+    /// `None`: the system resolver only.
+    pub resolver: Option<Arc<dyn Resolve>>,
 }
 
 impl Default for ServeOptions {
@@ -53,6 +58,7 @@ impl Default for ServeOptions {
             max_upstream_connections: MAX_UPSTREAM_CONNECTIONS,
             max_h1_per_host: MAX_H1_PER_HOST,
             clock: tollgate_common::clock::now_secs,
+            resolver: None,
         }
     }
 }

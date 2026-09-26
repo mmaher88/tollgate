@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -30,6 +31,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
+use tollgate_common::resolve::Resolve;
 
 use crate::ProxyContext;
 use crate::body::{Body, DoneBody};
@@ -41,6 +43,10 @@ use crate::shutdown::Shutdown;
 
 /// How often a request waiting for an upstream connection looks for an idle one to close.
 const EVICT_RETRY: Duration = Duration::from_millis(50);
+/// Addresses from the resolver tried before falling back to the system resolver.
+const MAX_ADDRESSES: usize = 2;
+/// Limit for one connection attempt to an address from the resolver.
+const ADDRESS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Where a request goes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -90,6 +96,8 @@ pub(crate) struct PoolOptions {
     pub(crate) max_h1_per_host: usize,
     /// Seconds from a clock that keeps counting while the device sleeps.
     pub(crate) clock: fn() -> u64,
+    /// Looks up upstream names before the system resolver is tried.
+    pub(crate) resolver: Option<Arc<dyn Resolve>>,
 }
 
 impl PoolOptions {
@@ -420,7 +428,8 @@ impl Pool {
         global: OwnedSemaphorePermit,
         h1_permit: Option<OwnedSemaphorePermit>,
     ) -> Result<Sender, UpstreamError> {
-        let tcp = connect_tcp(&target.host, target.port).await?;
+        let resolver = self.0.options.resolver.as_deref();
+        let tcp = connect_tcp(resolver, &target.host, target.port).await?;
         if !target.tls {
             let h1 = self
                 .start_http1(TokioIo::new(tcp), global, h1_permit)
@@ -577,8 +586,31 @@ fn replayable(request: &Request<Body>) -> Option<Request<()>> {
     Some(copy)
 }
 
-/// Opens a TCP connection with Nagle's algorithm off.
-pub(crate) async fn connect_tcp(host: &str, port: u16) -> io::Result<TcpStream> {
+/// Opens a TCP connection with Nagle's algorithm off. A host name is looked up with
+/// `resolver` first and its first addresses are tried; when it finds nothing or none of
+/// them answers, the system resolver (`getaddrinfo`) is used, so a DoH outage or a network
+/// that needs synthesized addresses (NAT64) still works.
+pub(crate) async fn connect_tcp(
+    resolver: Option<&dyn Resolve>,
+    host: &str,
+    port: u16,
+) -> io::Result<TcpStream> {
+    if let Some(resolver) = resolver
+        && host.parse::<IpAddr>().is_err()
+    {
+        let addresses = resolver.lookup(host).await;
+        for &ip in addresses.iter().take(MAX_ADDRESSES) {
+            match tokio::time::timeout(ADDRESS_TIMEOUT, TcpStream::connect((ip, port))).await {
+                Ok(Ok(tcp)) => {
+                    let _ = tcp.set_nodelay(true);
+                    return Ok(tcp);
+                }
+                Ok(Err(e)) => log::debug!("connecting to {host} at {ip}: {e}"),
+                Err(_) => log::debug!("connecting to {host} at {ip}: timed out"),
+            }
+        }
+        log::debug!("{host}: using the system resolver");
+    }
     let tcp = TcpStream::connect((host, port)).await?;
     let _ = tcp.set_nodelay(true);
     Ok(tcp)

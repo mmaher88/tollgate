@@ -7,6 +7,7 @@ mod answer;
 mod cache;
 mod doh;
 mod handler;
+mod lookup;
 pub mod packet;
 mod wire;
 
@@ -16,6 +17,7 @@ pub use answer::{BLOCK_TTL, MAX_UDP_PAYLOAD};
 pub use cache::{CACHE_CAPACITY, MAX_CACHE_TTL, MIN_CACHE_TTL};
 pub use doh::{COLD_DEADLINE, DohError, DohResolver, MAX_IDLE, MAX_IN_FLIGHT, WARM_DEADLINE};
 pub use handler::{DnsHandler, ForwardJob, Outcome};
+pub use lookup::{HostResolver, LOOKUP_CACHE_CAPACITY, LOOKUP_TIMEOUT, MAX_LOOKUP_TTL};
 
 /// The tunnel's IPv4 DNS server address.
 pub const TUNNEL_DNS_V4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);

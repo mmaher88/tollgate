@@ -98,8 +98,9 @@ pub async fn serve(
 /// [`serve`] with explicit options. When it returns, every connection and task it started
 /// is dropped.
 ///
-/// Upstream names are resolved with `getaddrinfo` on tokio's blocking pool, so the runtime
-/// should cap `max_blocking_threads`.
+/// Upstream names are resolved with `options.resolver` when set, and otherwise (or when it
+/// fails) with `getaddrinfo` on tokio's blocking pool, so the runtime should cap
+/// `max_blocking_threads`.
 pub async fn serve_with_options(
     listener: TcpListener,
     ctx: Arc<ProxyContext>,
@@ -116,6 +117,7 @@ pub async fn serve_with_options(
             max_connections: options.max_upstream_connections,
             max_h1_per_host: options.max_h1_per_host,
             clock: options.clock,
+            resolver: options.resolver.clone(),
         },
         tasks.clone(),
         ctx.clone(),

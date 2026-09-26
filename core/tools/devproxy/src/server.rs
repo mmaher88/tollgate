@@ -12,13 +12,13 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, UdpSocket};
 use tollgate_common::events::{BlockEvent, EventKind, EventLog};
 use tollgate_common::stats::{Stats, StatsSnapshot};
-use tollgate_dns::{DnsHandler, DohResolver};
+use tollgate_dns::{DnsHandler, DohResolver, HostResolver};
 use tollgate_ffi::{
     CA_CERT_FILE, LEARNED_PINS_FILE, ListFormat, ListInput, ListTarget, compile_lists, generate_ca,
     load_ca,
 };
 use tollgate_filter::{DOMAINS_FILE, DomainSet, ENGINE_FILE, FilterEngine, FilterError};
-use tollgate_mitm::ProxyContext;
+use tollgate_mitm::{ProxyContext, ServeOptions};
 use tollgate_policy::{Config, HostPattern, Policy};
 
 use crate::args::{Args, ListKind};
@@ -203,8 +203,13 @@ impl DevProxy {
             dns,
             resolver,
         } = self;
+        // Upstream names go over DoH too, like the tunnel.
+        let options = ServeOptions {
+            resolver: Some(Arc::new(HostResolver::new(resolver.clone()))),
+            ..ServeOptions::default()
+        };
         let responder = tokio::spawn(serve_dns(dns_socket, PayloadHandler::new(dns), resolver));
-        tollgate_mitm::serve(proxy_listener, ctx.clone(), shutdown).await;
+        tollgate_mitm::serve_with_options(proxy_listener, ctx.clone(), options, shutdown).await;
         responder.abort();
         let pins = data_dir.join(LEARNED_PINS_FILE);
         if let Err(e) = std::fs::write(&pins, ctx.policy.learned_pins_json()) {

@@ -191,10 +191,13 @@ where
 }
 
 async fn dial(state: &State, host: &str, port: u16) -> Result<TcpStream, UpstreamError> {
-    tokio::time::timeout(state.options.connect_timeout, connect_tcp(host, port))
-        .await
-        .map_err(|_| UpstreamError::Timeout)?
-        .map_err(UpstreamError::from)
+    tokio::time::timeout(
+        state.options.connect_timeout,
+        connect_tcp(state.options.resolver.as_deref(), host, port),
+    )
+    .await
+    .map_err(|_| UpstreamError::Timeout)?
+    .map_err(UpstreamError::from)
 }
 
 async fn tunnel<C>(mut client: C, mut upstream: TcpStream)

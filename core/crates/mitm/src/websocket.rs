@@ -106,7 +106,8 @@ async fn dial(
 ) -> Result<(http1::SendRequest<Body>, OwnedSemaphorePermit), UpstreamError> {
     let permit = state.pool.global_permit().await?;
     let connect = async {
-        let tcp = connect_tcp(&target.host, target.port).await?;
+        let resolver = state.options.resolver.as_deref();
+        let tcp = connect_tcp(resolver, &target.host, target.port).await?;
         let mut config = (*state.options.upstream_tls).clone();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let name = ServerName::try_from(target.server_name.clone())

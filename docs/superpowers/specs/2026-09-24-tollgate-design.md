@@ -357,6 +357,11 @@ drops redundant children of blocked parents. The false positive rate is about 5e
   hosts included), a TLS server name that differs from it, and absolute-form hosts. A block
   answers `403` (or closes the tunnel for a server name), never dials, counts in
   `dns_blocked` and is recorded as a DNS block. The allowlist applies.
+- Upstream host names are looked up through `ServeOptions::resolver` (the
+  `tollgate_common::resolve::Resolve` trait; the tunnel passes `tollgate_dns::HostResolver`,
+  A and AAAA over the shared DoH connections with a 256-name cache), so proxied lookups are
+  encrypted like the tunnel's. The first two addresses are tried for 2 s each; when the
+  lookup fails, finds nothing or no address answers, `getaddrinfo` is the fallback.
 - HTTP/2 requests whose authority does not match the connection's SNI get `421 Misdirected
   Request`.
 - The CA certificate and key are stored as PEM; leaves are issued from the stored certificate
