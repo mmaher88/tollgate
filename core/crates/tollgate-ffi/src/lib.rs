@@ -11,6 +11,7 @@ mod ca;
 mod controls;
 mod engine;
 mod error;
+mod fds;
 mod lists;
 mod logging;
 

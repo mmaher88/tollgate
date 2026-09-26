@@ -427,6 +427,8 @@ impl Engine {
         if running.is_some() {
             return Err(TollgateError::AlreadyRunning);
         }
+        // Before any socket is opened: the extension starts with a soft limit of 256.
+        crate::fds::raise_open_file_limit();
         let (jobs, queue) = mpsc::channel(self.options.forward_queue.max(1));
         let resolver = self.resolver()?;
         let work = Work {

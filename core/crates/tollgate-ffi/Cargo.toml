@@ -12,6 +12,7 @@ crate-type = ["lib", "staticlib"]
 
 [dependencies]
 arc-swap = { workspace = true }
+libc = { workspace = true }
 log = { workspace = true }
 ring = { workspace = true }
 rustls = { workspace = true }
