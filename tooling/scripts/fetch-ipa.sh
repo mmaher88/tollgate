@@ -8,6 +8,7 @@
 # With --allow-stale (or ALLOW_STALE=1) it falls back to the newest successful run on the
 # branch and says how many commits that build is behind the tip.
 # The chosen run is printed and written to build/ipa/BUILD_INFO; install.sh prints it again.
+# Its run number and short commit are what the app shows under Diagnostics, Build.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 # shellcheck source=SCRIPTDIR/../config.env
@@ -27,10 +28,11 @@ TIP="$(gh api "repos/$TOLLGATE_REPO/branches/$BRANCH" --jq .commit.sha)"
 [ -n "$TIP" ] || { echo "branch $BRANCH not found on $TOLLGATE_REPO" >&2; exit 1; }
 
 # Newest first, "|"-separated (tab would collapse the empty conclusion of a running build):
-# id, headSha, status, conclusion, createdAt, event, url.
+# id, headSha, status, conclusion, createdAt, event, url, number. The number (the run
+# number, which CI stamps as the build number) goes last so the other positions stay put.
 RUNS="$(gh run list --repo "$TOLLGATE_REPO" --workflow ios.yml --branch "$BRANCH" --limit 20 \
-    --json databaseId,headSha,status,conclusion,createdAt,event,url \
-    --jq '.[] | [.databaseId, .headSha, .status, .conclusion, .createdAt, .event, .url]
+    --json databaseId,headSha,status,conclusion,createdAt,event,url,number \
+    --jq '.[] | [.databaseId, .headSha, .status, .conclusion, .createdAt, .event, .url, .number]
         | map(tostring) | join("|")')"
 
 pick() { # prints the first run line matching the awk condition $1
@@ -43,7 +45,7 @@ if [ -z "$RUN" ]; then
     if [ -z "$LATEST" ]; then
         problem="tip $TIP of $BRANCH not built; run: gh workflow run ios.yml --repo $TOLLGATE_REPO --ref $BRANCH"
     else
-        IFS='|' read -r _ _ status conclusion _ _ url <<<"$LATEST"
+        IFS='|' read -r _ _ status conclusion _ _ url _ <<<"$LATEST"
         if [ "$status" != completed ]; then
             problem="build still running for tip $TIP ($status): $url"
         else
@@ -59,7 +61,7 @@ if [ -z "$RUN" ]; then
     [ -n "$RUN" ] || { echo "$problem; and no successful ios run on $BRANCH" >&2; exit 1; }
 fi
 
-IFS='|' read -r RUN_ID SHA _ _ CREATED EVENT URL <<<"$RUN"
+IFS='|' read -r RUN_ID SHA _ _ CREATED EVENT URL NUMBER <<<"$RUN"
 if [ "$SHA" != "$TIP" ]; then
     BEHIND="$(gh api "repos/$TOLLGATE_REPO/compare/$SHA...$TIP" --jq .ahead_by 2>/dev/null || echo "?")"
     echo "WARNING: STALE BUILD. It is $BEHIND commits behind the tip of $BRANCH ($TIP)." >&2
@@ -70,9 +72,10 @@ rm -rf build/ipa
 gh run download "$RUN_ID" --repo "$TOLLGATE_REPO" --name Tollgate-ipa --dir build/ipa
 {
     echo "branch:  $BRANCH"
-    echo "run:     $RUN_ID"
+    echo "run:     #$NUMBER (id $RUN_ID)"
     echo "url:     $URL"
-    echo "commit:  $SHA"
+    echo "commit:  ${SHA:0:7} ($SHA)"
+    echo "app:     Diagnostics, Build shows $NUMBER (${SHA:0:7})"
     echo "event:   $EVENT"
     echo "created: $CREATED"
     [ "$SHA" = "$TIP" ] || echo "STALE:   $BEHIND commits behind $TIP"

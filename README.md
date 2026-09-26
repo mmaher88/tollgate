@@ -70,8 +70,9 @@ tooling/scripts/logs.sh tunnel    # stream the extension's logs
 ```
 
 `fetch-ipa.sh` refuses a build older than the branch tip unless given `--allow-stale`, and
-prints the run id and commit (kept in `build/ipa/BUILD_INFO`). The app shows the same run
-number and commit under Diagnostics, Build.
+prints the run number (`#N`), run id and URL, and the commit (kept in `build/ipa/BUILD_INFO`).
+The app shows "N (short commit)" under Diagnostics, Build, which matches the run number and
+the short commit.
 
 The first install of a development-signed app asks for Developer Mode on the phone
 (Settings, Privacy & Security, Developer Mode), followed by a reboot.
