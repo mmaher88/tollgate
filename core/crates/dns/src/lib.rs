@@ -24,7 +24,9 @@ pub use handler::{
     DnsHandler, ForwardJob, LOCAL_CACHE_CAPACITY, LocalRecord, MAX_LOCAL_TTL, Outcome,
 };
 pub use local::is_local_name;
-pub use lookup::{HostResolver, LOOKUP_CACHE_CAPACITY, LOOKUP_TIMEOUT, MAX_LOOKUP_TTL};
+pub use lookup::{
+    HostResolver, LOOKUP_CACHE_CAPACITY, LOOKUP_PERMITS, LOOKUP_TIMEOUT, MAX_LOOKUP_TTL,
+};
 
 /// The tunnel's IPv4 DNS server address.
 pub const TUNNEL_DNS_V4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);

@@ -167,7 +167,10 @@ pub struct EngineOptions {
     pub doh_roots: Vec<Vec<u8>>,
     /// Capacity of the queue between `handle_packets` and the runtime.
     pub forward_queue: usize,
-    /// DoH queries resolving at once; further jobs wait in the queue.
+    /// Forwarded DoH queries resolving at once; further jobs wait in the queue. The default
+    /// is `MAX_IN_FLIGHT - LOOKUP_PERMITS` (96): the resolver's other 32 in-flight queries
+    /// are the proxy's name lookups, which wait for a turn of their own, so a forwarded
+    /// query never finds the resolver busy. More than the default can fail with SERVFAIL.
     pub forward_in_flight: usize,
     /// How often the running engine checks whether the learned pins changed and saves
     /// them. `stop` saves them too, but jetsam or a crash ends the extension without it.
@@ -182,7 +185,7 @@ impl Default for EngineOptions {
         EngineOptions {
             doh_roots: Vec::new(),
             forward_queue: FORWARD_QUEUE,
-            forward_in_flight: tollgate_dns::MAX_IN_FLIGHT,
+            forward_in_flight: tollgate_dns::MAX_IN_FLIGHT - tollgate_dns::LOOKUP_PERMITS,
             pins_save_interval: PINS_SAVE_INTERVAL,
             local_deadline: LOCAL_DEADLINE,
         }

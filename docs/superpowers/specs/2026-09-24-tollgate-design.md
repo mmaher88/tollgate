@@ -332,7 +332,10 @@ parents). The false positive rate is about 5e-14 per lookup.
   SERVFAIL. An upstream whose attempt timed out or failed to connect is marked down for 30 s
   and tried only after the others (all in order when every upstream is down); when the time
   is up, one query goes to it in the background, and its answer brings it back. A network
-  path change clears the marks. At most 128 queries are in flight.
+  path change clears the marks. At most 128 queries are in flight: 96 for the DNS forwarder
+  (further forwarded queries wait in its 256-job queue) and 32 for the proxy's name
+  lookups (16 names at once, A and AAAA together; further names wait for a turn, and
+  callers asking for a name already being looked up share that lookup).
 - Responses are normalized to the requester: OPT is echoed only if the query had one, and
   answers larger than the requester's UDP size are trimmed: authority and additional records
   go first, then answer records from the end, keeping the CNAME chain and as many whole

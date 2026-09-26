@@ -36,7 +36,10 @@ pub const WARM_DEADLINE: Duration = Duration::from_millis(1500);
 /// alive (the device may have slept, and NAT or the server dropped it): the next query
 /// opens a new connection under the cold deadline instead of waiting out the warm one.
 pub const MAX_IDLE: Duration = Duration::from_secs(30);
-/// Queries resolving at once; above it `resolve` fails at once with [`DohError::Busy`].
+/// Queries resolving at once, across all clones; above it `resolve` fails at once with
+/// [`DohError::Busy`]. The tunnel splits it: [`crate::LOOKUP_PERMITS`] for the proxy's name
+/// lookups (`HostResolver` waits for a turn instead of exceeding it) and the rest for the
+/// DNS forwarder, whose jobs wait in its queue, so neither sees `Busy`.
 pub const MAX_IN_FLIGHT: usize = 128;
 /// How long an upstream that timed out or could not be reached is tried only after the
 /// others (all of them in order when every upstream is down).

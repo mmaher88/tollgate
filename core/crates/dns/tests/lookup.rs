@@ -65,3 +65,48 @@ async fn local_names_are_not_looked_up_over_doh() {
     assert_eq!(server.requests(), 0);
     assert_eq!(resolver.lookup("www.example.com").await, [ANSWER]);
 }
+
+/// Callers asking for a name that is being looked up share that lookup, and at most
+/// `LOOKUP_PERMITS / 2` names are looked up at once, so the lookups never take more than
+/// their share of the resolver's in-flight limit.
+#[tokio::test]
+async fn lookups_are_shared_and_take_turns() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use support::doh_server::Mode;
+    use tollgate_dns::LOOKUP_PERMITS;
+
+    let server = TestServer::start().await;
+    server.set_mode(Mode::Gated);
+    let resolver = Arc::new(HostResolver::new(trusting(
+        vec![server.upstream()],
+        &[&server],
+    )));
+    let lookup = |host: String| {
+        let resolver = resolver.clone();
+        tokio::spawn(async move { resolver.lookup(&host).await })
+    };
+    let same: Vec<_> = (0..5)
+        .map(|_| lookup("shared.example".to_string()))
+        .collect();
+    let others: Vec<_> = (0..LOOKUP_PERMITS)
+        .map(|i| lookup(format!("host{i}.example")))
+        .collect();
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while server.requests() < LOOKUP_PERMITS {
+        assert!(Instant::now() < deadline, "only {}", server.requests());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // One A and one AAAA query for each name with a turn; the shared name counts once.
+    assert_eq!(server.requests(), LOOKUP_PERMITS);
+
+    server.open_gate();
+    for task in same.into_iter().chain(others) {
+        assert_eq!(task.await.unwrap(), [ANSWER]);
+    }
+    // 1 shared name and LOOKUP_PERMITS others, two queries each.
+    assert_eq!(server.requests(), 2 * (LOOKUP_PERMITS + 1));
+}
