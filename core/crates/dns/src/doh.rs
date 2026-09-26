@@ -8,7 +8,10 @@
 //! only after the others, so a network that silently drops its packets does not cost every
 //! query the cold deadline. When the time is up, one query is sent to it in the background;
 //! its answer brings the upstream back, and a failure keeps it down for another period.
+//! A network path change clears the marks, and queries still running on the old path stop
+//! and try once more on the new one without marking anything.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
@@ -23,7 +26,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tollgate_policy::DohUpstream;
@@ -115,6 +118,12 @@ struct Upstream {
     down_until: AtomicU64,
     /// Set while a background query checks whether a down upstream is back.
     probing: AtomicBool,
+    /// Counts [`DohResolver::reset_connections`] calls. An attempt that began before the
+    /// last one ran on the old path: it neither marks the upstream down nor shares the
+    /// connection it opened.
+    epoch: AtomicU64,
+    /// Wakes the attempts in flight when [`DohResolver::reset_connections`] runs.
+    reset: Notify,
 }
 
 /// Whether an upstream is tried in order or after the others.
@@ -208,16 +217,22 @@ impl DohResolver {
     /// and forgets which upstreams were down, so each gets another chance on the new path.
     /// For a network path change or a wake from sleep: a connection made on the old path
     /// would otherwise be reused for up to [`MAX_IDLE`] and cost each query the warm
-    /// deadline before it fails. Queries already in flight on the old connection finish or
-    /// time out as before. Safe to call from any thread, inside or outside the runtime.
+    /// deadline before it fails. Attempts in flight on the old path stop and try once more
+    /// on the new one, and whatever they do later does not mark an upstream down. Safe to
+    /// call from any thread, inside or outside the runtime.
     pub fn reset_connections(&self) {
         for upstream in &self.inner.upstreams {
+            // Before clearing the mark, so a stale attempt marking it down now undoes that.
+            upstream.epoch.fetch_add(1, Ordering::SeqCst);
             upstream.down_until.store(0, Ordering::SeqCst);
-            let mut slot = upstream.slot();
-            if slot.sender.take().is_some() {
-                // A late touch or discard from a query on the old connection is a no-op.
-                slot.generation += 1;
+            {
+                let mut slot = upstream.slot();
+                if slot.sender.take().is_some() {
+                    // A late touch or discard from a query on the old connection is a no-op.
+                    slot.generation += 1;
+                }
             }
+            upstream.reset.notify_waiters();
         }
     }
 
@@ -326,6 +341,8 @@ impl Upstream {
             connecting: tokio::sync::Mutex::new(()),
             down_until: AtomicU64::new(0),
             probing: AtomicBool::new(false),
+            epoch: AtomicU64::new(0),
+            reset: Notify::new(),
         })
     }
 
@@ -345,11 +362,24 @@ impl Upstream {
     }
 
     /// For an attempt that spent its deadline or failed below HTTP: not for an upstream
-    /// that answered, even with an error status.
-    fn mark_down(&self, now: u64) {
+    /// that answered, even with an error status. `epoch` is the reset count when the
+    /// attempt began: an attempt from before the last reset ran on the old path and says
+    /// nothing about the new one.
+    fn mark_down(&self, epoch: u64, now: u64) {
+        if self.epoch.load(Ordering::SeqCst) != epoch {
+            return;
+        }
         // Never 0, which means up.
         let until = now.saturating_add(DOWN_FOR.as_secs()).max(1);
-        if self.down_until.swap(until, Ordering::SeqCst) == 0 {
+        let before = self.down_until.swap(until, Ordering::SeqCst);
+        if self.epoch.load(Ordering::SeqCst) != epoch {
+            // A reset ran meanwhile; it may have cleared the mark before this set it.
+            let _ = self
+                .down_until
+                .compare_exchange(until, 0, Ordering::SeqCst, Ordering::SeqCst);
+            return;
+        }
+        if before == 0 {
             log::debug!(
                 "DoH upstream {} is down for {} s",
                 self.name,
@@ -358,57 +388,107 @@ impl Upstream {
         }
     }
 
+    /// Runs `attempt(epoch)`, where `epoch` is the reset count as it starts. With
+    /// `stop_on_reset`, a reset drops the attempt and gives `None`.
+    async fn unless_reset<F: Future>(
+        &self,
+        stop_on_reset: bool,
+        attempt: impl FnOnce(u64) -> F,
+    ) -> Option<F::Output> {
+        let reset = self.reset.notified();
+        tokio::pin!(reset);
+        // Registered before the count is read, so a reset right after cannot be missed.
+        reset.as_mut().enable();
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        if !stop_on_reset {
+            return Some(attempt(epoch).await);
+        }
+        tokio::select! {
+            output = attempt(epoch) => Some(output),
+            () = reset => None,
+        }
+    }
+
     /// One query: an attempt on the open connection if there is one that was used within
     /// [`MAX_IDLE`] (retried once on a new connection if that connection turns out to be
     /// closed), otherwise an attempt on a new connection. An answer, even an unusable one,
     /// marks the upstream up; a timeout or a failure to connect or exchange marks it down.
+    /// A network path change ([`DohResolver::reset_connections`]) stops the attempt in
+    /// flight, which is then made once more on a new connection.
     async fn query(
         &self,
         tls: &TlsConnector,
         body: &Bytes,
         now: &(dyn Fn() -> u64 + Send + Sync),
     ) -> Result<Vec<u8>, DohError> {
+        // One retry after a reset, so a query cannot be held up by resets for long.
+        let mut stop_on_reset = true;
         if let Some((generation, sender)) = self.open_sender(now()) {
-            let result = timeout(WARM_DEADLINE, self.exchange(sender, body.clone())).await;
-            if let Ok(Ok(_) | Err(Failure::Answer(_))) = &result {
-                self.touch(generation, now());
-                self.mark_up();
-            }
-            match result {
-                Ok(Ok(answer)) => return Ok(answer),
-                Ok(Err(Failure::Answer(e))) => return Err(e),
-                Ok(Err(Failure::Connection(e))) => {
-                    log::debug!("DoH connection to {} broke ({e}); retrying", self.name);
-                    self.discard(generation);
+            let warm = self
+                .unless_reset(true, |epoch| async move {
+                    let exchange = self.exchange(sender, body.clone());
+                    (epoch, timeout(WARM_DEADLINE, exchange).await)
+                })
+                .await;
+            match warm {
+                None => {
+                    log::debug!("the network changed during a DoH query to {}", self.name);
+                    stop_on_reset = false;
                 }
-                Err(_) => {
-                    // A connection that stops answering (for example after the device
-                    // slept) is dropped, so the next query connects again.
-                    self.discard(generation);
-                    self.mark_down(now());
-                    return Err(DohError::Timeout);
+                Some((epoch, result)) => {
+                    if let Ok(Ok(_) | Err(Failure::Answer(_))) = &result {
+                        self.touch(generation, now());
+                        self.mark_up();
+                    }
+                    match result {
+                        Ok(Ok(answer)) => return Ok(answer),
+                        Ok(Err(Failure::Answer(e))) => return Err(e),
+                        Ok(Err(Failure::Connection(e))) => {
+                            log::debug!("DoH connection to {} broke ({e}); retrying", self.name);
+                            self.discard(generation);
+                        }
+                        Err(_) => {
+                            // A connection that stops answering (for example after the
+                            // device slept) is dropped, so the next query connects again.
+                            self.discard(generation);
+                            self.mark_down(epoch, now());
+                            return Err(DohError::Timeout);
+                        }
+                    }
                 }
             }
         }
-        let attempt = async {
-            let (generation, sender) = self
-                .connected_sender(tls, now)
-                .await
-                .map_err(Failure::Connection)?;
-            let result = self.exchange(sender, body.clone()).await;
-            if let Ok(_) | Err(Failure::Answer(_)) = &result {
-                self.touch(generation, now());
+        loop {
+            let cold = self
+                .unless_reset(stop_on_reset, |epoch| async move {
+                    let attempt = async {
+                        let (generation, sender) = self
+                            .connected_sender(tls, now)
+                            .await
+                            .map_err(Failure::Connection)?;
+                        let result = self.exchange(sender, body.clone()).await;
+                        if let Ok(_) | Err(Failure::Answer(_)) = &result {
+                            self.touch(generation, now());
+                        }
+                        result
+                    };
+                    let result = timeout(COLD_DEADLINE, attempt)
+                        .await
+                        .unwrap_or(Err(Failure::Connection(DohError::Timeout)));
+                    (epoch, result)
+                })
+                .await;
+            let Some((epoch, result)) = cold else {
+                log::debug!("the network changed during a DoH query to {}", self.name);
+                stop_on_reset = false;
+                continue;
+            };
+            match &result {
+                Ok(_) | Err(Failure::Answer(_)) => self.mark_up(),
+                Err(Failure::Connection(_)) => self.mark_down(epoch, now()),
             }
-            result
-        };
-        let result = timeout(COLD_DEADLINE, attempt)
-            .await
-            .unwrap_or(Err(Failure::Connection(DohError::Timeout)));
-        match &result {
-            Ok(_) | Err(Failure::Answer(_)) => self.mark_up(),
-            Err(Failure::Connection(_)) => self.mark_down(now()),
+            return result.map_err(Failure::into_error);
         }
-        result.map_err(Failure::into_error)
     }
 
     fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {
@@ -448,7 +528,8 @@ impl Upstream {
     }
 
     /// The open connection, or a new one. Queries that arrive while a connection is being
-    /// opened wait for it instead of opening their own.
+    /// opened wait for it instead of opening their own. A connection that was being opened
+    /// when the network changed is not shared, and fails the attempt.
     async fn connected_sender(
         &self,
         tls: &TlsConnector,
@@ -458,7 +539,13 @@ impl Upstream {
         if let Some(open) = self.open_sender(now()) {
             return Ok(open);
         }
+        let epoch = self.epoch.load(Ordering::SeqCst);
         let sender = self.connect(tls).await?;
+        if self.epoch.load(Ordering::SeqCst) != epoch {
+            return Err(DohError::Connect(
+                "the network changed while connecting".to_string(),
+            ));
+        }
         let mut slot = self.slot();
         slot.generation += 1;
         slot.sender = Some(sender.clone());

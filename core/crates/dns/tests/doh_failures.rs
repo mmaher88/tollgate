@@ -181,6 +181,88 @@ async fn reset_connections_gives_a_down_upstream_another_chance() {
     assert_eq!(second.requests(), 2);
 }
 
+/// Waits until `done` holds, for up to two seconds.
+async fn until(done: impl Fn() -> bool) {
+    for _ in 0..200 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("gave up waiting");
+}
+
+#[tokio::test]
+async fn a_query_hung_on_the_old_path_does_not_mark_its_upstream_down_after_a_reset() {
+    let first = TestServer::start().await;
+    let second = TestServer::start().await;
+    let resolver = trusting(
+        vec![first.upstream(), second.upstream()],
+        &[&first, &second],
+    );
+    let query = query(1, "example.com.", RecordType::A, None);
+    resolver.resolve(&query).await.unwrap();
+
+    // A query hangs on the warm connection when the network changes.
+    first.set_mode(Mode::HangConnection(1));
+    let stale = tokio::spawn({
+        let resolver = resolver.clone();
+        let query = query.clone();
+        async move { resolver.resolve(&query).await }
+    });
+    until(|| first.requests() == 2).await;
+    resolver.reset_connections();
+    resolver.resolve(&query).await.unwrap();
+    assert_eq!(first.connections(), 2);
+
+    // The stale query neither sidelines the first upstream nor waits out its deadline.
+    let start = Instant::now();
+    stale.await.unwrap().unwrap();
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        start.elapsed()
+    );
+    resolver.resolve(&query).await.unwrap();
+    assert_eq!(second.requests(), 0);
+    assert_eq!(first.connections(), 2);
+}
+
+#[tokio::test]
+async fn a_connect_stuck_on_the_old_path_does_not_hold_up_or_sideline_its_upstream() {
+    let first = TestServer::start().await;
+    let second = TestServer::start().await;
+    let resolver = trusting(
+        vec![first.upstream(), second.upstream()],
+        &[&first, &second],
+    );
+    let query = query(1, "example.com.", RecordType::A, None);
+
+    // A cold query is still connecting when the network changes.
+    first.set_mode(Mode::StallHandshake(1));
+    let stale = tokio::spawn({
+        let resolver = resolver.clone();
+        let query = query.clone();
+        async move { resolver.resolve(&query).await }
+    });
+    until(|| first.connections() == 1).await;
+    resolver.reset_connections();
+
+    // A query on the new path does not wait for the stuck connect to give up.
+    let start = Instant::now();
+    resolver.resolve(&query).await.unwrap();
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        start.elapsed()
+    );
+    stale.await.unwrap().unwrap();
+    resolver.resolve(&query).await.unwrap();
+    assert_eq!(second.requests(), 0);
+    assert_eq!(first.connections(), 2);
+    assert_eq!(first.requests(), 3);
+}
+
 #[tokio::test]
 async fn upstreams_that_are_all_down_are_still_tried_in_order() {
     let (_first_listener, first) = silent_upstream().await;

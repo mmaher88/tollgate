@@ -46,6 +46,9 @@ pub enum Mode {
     /// Never answers requests on the connection with this number (the first accepted is
     /// 1), like a connection that died while the device slept; answers on the others.
     HangConnection(usize),
+    /// Never answers the TLS handshake of the connection with this number, like a
+    /// connection opened on a path that just went away; answers on the others.
+    StallHandshake(usize),
 }
 
 /// One request as the server saw it.
@@ -180,6 +183,10 @@ async fn serve_connection(
     number: usize,
     state: Arc<State>,
 ) {
+    if *state.mode.lock().unwrap() == Mode::StallHandshake(number) {
+        // Holds the socket open without a word.
+        std::future::pending::<()>().await;
+    }
     let Ok(tls) = acceptor.accept(tcp).await else {
         return;
     };
@@ -251,7 +258,7 @@ async fn handle(
         Mode::AnswerThenGoAway => signals.go_away.notify_one(),
         Mode::Gated => state.gate.acquire().await.unwrap().forget(),
         Mode::HangConnection(hung) if hung == connection => std::future::pending::<()>().await,
-        Mode::HangConnection(_) => {}
+        Mode::HangConnection(_) | Mode::StallHandshake(_) => {}
     }
     Ok(Response::builder()
         .header("content-type", "application/dns-message")
