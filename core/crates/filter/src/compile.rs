@@ -5,7 +5,7 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::domain_set::HEADER_LEN;
+use crate::domain_set::hash_count;
 use crate::{DomainRules, FilterEngine, FilterError, ListFormat, ListSource, network_rule_count};
 
 pub const ENGINE_FILE: &str = "engine.dat";
@@ -61,7 +61,7 @@ pub fn compile_split(
     write_atomically(&dir.join(DOMAINS_FILE), &domains)?;
     let report = CompileReport {
         network_rules,
-        domain_entries: ((domains.len() - HEADER_LEN) / 8) as u64,
+        domain_entries: hash_count(&domains),
         engine_bytes: engine.len() as u64,
         domains_bytes: domains.len() as u64,
     };

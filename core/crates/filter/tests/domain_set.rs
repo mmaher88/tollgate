@@ -166,9 +166,10 @@ fn rejects_damaged_files() {
     bad[4..8].copy_from_slice(&2u32.to_le_bytes());
     assert_eq!(error(bad), DomainSetError::UnsupportedVersion(2));
 
+    // The reserved word is the pattern section's length, so the file is now too short.
     let mut bad = good.clone();
     bad[20] = 1;
-    assert_eq!(error(bad), DomainSetError::BadHeader);
+    assert!(matches!(error(bad), DomainSetError::LengthMismatch { .. }));
 
     assert_eq!(
         error(good[..good.len() - 8].to_vec()),
@@ -286,4 +287,97 @@ fn exact_blocks_cover_only_their_host_and_lose_to_exceptions() {
     assert!(!d.is_blocked("klaviyo.com"));
     assert!(!d.is_blocked("ads.fine.org"));
     assert!(d.is_blocked("a.imp.org"));
+}
+
+#[test]
+fn wildcard_exceptions_unblock_matching_hosts() {
+    let d = build(
+        "||tradedoubler.com^\n\
+         @@||clk*.tradedoubler.com^|\n\
+         ||evergage.com^\n\
+         @@||bcicl.*.evergage.com^|\n\
+         ||brsrvr.com^\n\
+         @@|brm-core-*.brsrvr.com^|\n\
+         ||forced.example^$important\n\
+         @@||x*.forced.example^\n",
+    );
+    assert!(!d.is_blocked("clk1.tradedoubler.com"));
+    assert!(!d.is_blocked("CLK.tradedoubler.com."));
+    assert!(!d.is_blocked("a.clk1.tradedoubler.com"));
+    assert!(d.is_blocked("www.tradedoubler.com"));
+    assert!(d.is_blocked("tradedoubler.com"));
+    assert!(d.is_blocked("xclk1.tradedoubler.com"));
+    // `*` matches across labels.
+    assert!(!d.is_blocked("bcicl.eu.evergage.com"));
+    assert!(!d.is_blocked("bcicl.a.b.evergage.com"));
+    assert!(d.is_blocked("bcicl.evergage.com"));
+    assert!(d.is_blocked("x.evergage.com"));
+    // `|` patterns cover the host only.
+    assert!(!d.is_blocked("brm-core-0.brsrvr.com"));
+    assert!(d.is_blocked("x.brm-core-0.brsrvr.com"));
+    // Important blocks still win.
+    assert!(d.is_blocked("x1.forced.example"));
+    // Hosts that nothing blocks stay unblocked.
+    assert!(!d.is_blocked("clk1.example.org"));
+}
+
+#[test]
+fn wildcard_exceptions_survive_a_file_round_trip() {
+    let bytes = DomainSet::build(&[ListSource {
+        name: "dns",
+        text: "||tradedoubler.com^\n@@||clk*.tradedoubler.com^|\n@@|a*.tradedoubler.com^|\n",
+        format: ListFormat::Adblock,
+    }]);
+    let section = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
+    assert_eq!(bytes.len(), 32 + 8 + section);
+    assert_eq!(
+        &bytes[bytes.len() - section..],
+        b"||clk*.tradedoubler.com\n|a*.tradedoubler.com\n"
+    );
+    assert_eq!(&bytes[24..32], &fnv1a64_bytes(&bytes[32..]).to_le_bytes());
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(&bytes).unwrap();
+    let d = DomainSet::load(file.path()).unwrap();
+    assert!(!d.is_blocked("clk9.tradedoubler.com"));
+    assert!(!d.is_blocked("ab.tradedoubler.com"));
+    assert!(d.is_blocked("x.ab.tradedoubler.com"));
+    assert!(d.is_blocked("www.tradedoubler.com"));
+    assert_eq!(d.len(), 1);
+}
+
+/// A file written by the build before wildcard exceptions: version 1, reserved word 0.
+#[test]
+fn files_without_a_pattern_section_still_load() {
+    let block = fnv1a64("tradedoubler.com");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"TGDS");
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&block.to_le_bytes());
+    let d = DomainSet::from_bytes(reseal(bytes)).unwrap();
+    assert!(d.is_blocked("clk1.tradedoubler.com"));
+    assert_eq!(d.len(), 1);
+}
+
+#[test]
+fn rejects_a_damaged_pattern_section() {
+    let good = DomainSet::build(&[ListSource {
+        name: "dns",
+        text: "||tradedoubler.com^\n@@||clk*.tradedoubler.com^|\n",
+        format: ListFormat::Adblock,
+    }]);
+    for (from, to) in [(b'|', b'x'), (b'c', b'!'), (b'\n', b' ')] {
+        let mut bad = good.clone();
+        let at = 40 + bad[40..].iter().position(|&b| b == from).unwrap();
+        bad[at] = to;
+        assert_eq!(error(reseal(bad)), DomainSetError::BadPatterns);
+    }
+    // The section length counts toward the file length.
+    let mut bad = good.clone();
+    bad[20..24].copy_from_slice(&1000u32.to_le_bytes());
+    assert!(matches!(error(bad), DomainSetError::LengthMismatch { .. }));
 }

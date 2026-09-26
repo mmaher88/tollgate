@@ -20,8 +20,14 @@ pub struct DomainRules {
     pub exact_allow: Vec<String>,
     /// `|name^|` and `|name^`: the host itself, not its subdomains.
     pub exact_block: Vec<String>,
+    /// `@@||pattern^` exceptions whose name has a `*`, which matches any run of characters
+    /// (dots included). They unblock a host when the host or one of its parents matches,
+    /// but never win over `important`. Sorted and unique.
+    pub wildcard_allow: Vec<String>,
+    /// `@@|pattern^|` and `@@|pattern^` exceptions with a `*`: the host itself must match.
+    pub exact_wildcard_allow: Vec<String>,
     /// Lines that are neither comments nor host rules: rules with other options, paths,
-    /// wildcards, regexes, and hosts lines without a usable name.
+    /// wildcard blocks, regexes, and hosts lines without a usable name.
     pub skipped: u64,
 }
 
@@ -32,6 +38,8 @@ enum Kind {
     Block,
     ExactAllow,
     ExactBlock,
+    WildcardAllow,
+    ExactWildcardAllow,
 }
 
 enum Line {
@@ -51,6 +59,8 @@ struct Builder {
     block: HashSet<String>,
     exact_allow: HashSet<String>,
     exact_block: HashSet<String>,
+    wildcard_allow: HashSet<String>,
+    exact_wildcard_allow: HashSet<String>,
     badfilter: HashSet<(Kind, String)>,
     skipped: u64,
 }
@@ -59,8 +69,9 @@ impl DomainRules {
     /// Adblock lists contribute `||name^`, `||name^|`, `||name` (no caret, when the name
     /// does not end in a dot), `.name^` (treated as the name and its subdomains), the
     /// exact-host forms `|name^|` and `|name^` (the name only), their `@@` forms,
-    /// `$important` (not on exact-host blocks) and `$badfilter`. Any other option, a path,
-    /// a wildcard, a regex or a `|` prefix rule such as `|ads.` is skipped. Hosts lists
+    /// `$important` (not on exact-host blocks) and `$badfilter`. Exceptions whose name has
+    /// a `*` are kept as wildcard exceptions; blocks with a `*` are skipped. Any other
+    /// option, a path, a regex or a `|` prefix rule such as `|ads.` is skipped. Hosts lists
     /// contribute every name on `address name...` lines and bare `name` lines.
     pub fn parse(lists: &[ListSource]) -> DomainRules {
         let mut builder = Builder::default();
@@ -106,6 +117,8 @@ impl Builder {
             Kind::Block => &mut self.block,
             Kind::ExactAllow => &mut self.exact_allow,
             Kind::ExactBlock => &mut self.exact_block,
+            Kind::WildcardAllow => &mut self.wildcard_allow,
+            Kind::ExactWildcardAllow => &mut self.exact_wildcard_allow,
         }
     }
 
@@ -149,6 +162,8 @@ impl Builder {
             block: without_redundant_children(&self.block),
             exact_allow: sorted(&self.exact_allow),
             exact_block: sorted(&self.exact_block),
+            wildcard_allow: sorted(&self.wildcard_allow),
+            exact_wildcard_allow: sorted(&self.exact_wildcard_allow),
             skipped: self.skipped,
         }
     }
@@ -205,7 +220,24 @@ fn parse_adblock_line(line: &str) -> Line {
         return Line::Skip;
     };
     let Some(name) = normalize_name(name) else {
-        return Line::Skip;
+        // Lists unblock hosts that break sites with wildcard exceptions such as
+        // `@@||clk*.tradedoubler.com^|`; dropping them would block what the list allows.
+        if !exception || !name.contains('*') {
+            return Line::Skip;
+        }
+        let Some(pattern) = normalize_pattern(name) else {
+            return Line::Skip;
+        };
+        let kind = if exact {
+            Kind::ExactWildcardAllow
+        } else {
+            Kind::WildcardAllow
+        };
+        return Line::Rule {
+            kind,
+            name: pattern,
+            badfilter,
+        };
     };
     // An important exception is kept as a plain exception, so an important block for
     // the same host still wins. adblock would let the exception win; no DNS list uses it.
@@ -241,6 +273,32 @@ fn normalize_name(name: &str) -> Option<String> {
             && label
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if !valid {
+            return None;
+        }
+        last = label;
+    }
+    if last.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(name.to_ascii_lowercase())
+}
+
+/// Lowercases a wildcard exception's name and strips one trailing dot. The same checks as
+/// [`normalize_name`], except that labels may hold `*`; a name made only of `*` and dots is
+/// rejected, since it would unblock everything.
+pub(crate) fn normalize_pattern(name: &str) -> Option<String> {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.len() > 253 || !name.contains('.') || name.bytes().all(|b| b == b'*' || b == b'.') {
+        return None;
+    }
+    let mut last = "";
+    for label in name.split('.') {
+        let valid = !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'*');
         if !valid {
             return None;
         }

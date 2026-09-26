@@ -216,3 +216,43 @@ fn badfilter_cancels_exact_rules() {
     assert!(rules.exact_block.is_empty());
     assert!(rules.allow.is_empty());
 }
+
+#[test]
+fn wildcard_exceptions_are_kept_and_wildcard_blocks_skipped() {
+    let rules = parse(
+        ListFormat::Adblock,
+        "||tradedoubler.com^\n\
+         @@||clk*.tradedoubler.com^|\n\
+         @@||Static-V*.trbo.com^\n\
+         @@||bcicl.*.evergage.com^|\n\
+         @@|only*.example^|\n\
+         @@.dot*.example^\n\
+         @@||gone*.example^\n\
+         @@||gone*.example^$badfilter\n\
+         @@||clk*.tradedoubler.com^|\n\
+         ||ad*.example^\n\
+         ||*.wildcard.example^\n\
+         ||imp*.example^$important\n\
+         @@||nodot*^\n\
+         @@||*.*^\n\
+         @@||bad*char!.example^\n\
+         @@||path*.example/x^\n",
+    );
+    assert_eq!(
+        rules.wildcard_allow,
+        names(&[
+            "bcicl.*.evergage.com",
+            "clk*.tradedoubler.com",
+            "dot*.example",
+            "static-v*.trbo.com",
+        ])
+    );
+    assert_eq!(rules.exact_wildcard_allow, names(&["only*.example"]));
+    assert!(rules.allow.is_empty());
+    assert!(rules.exact_allow.is_empty());
+    assert_eq!(rules.block, names(&["tradedoubler.com"]));
+    assert!(rules.important.is_empty());
+    // The wildcard block, the wildcard important block, a pattern without a dot, one
+    // with nothing but wildcards, a bad character and a path.
+    assert_eq!(rules.skipped, 7);
+}

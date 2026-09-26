@@ -9,15 +9,21 @@
 //! | 8 | 4 | block count |
 //! | 12 | 4 | allow count |
 //! | 16 | 4 | important count |
-//! | 20 | 4 | reserved, 0 |
+//! | 20 | 4 | pattern section length in bytes (0 in files without one) |
 //! | 24 | 8 | FNV-1a 64 of every byte after the header |
 //! | 32 | 8 each | block hashes, then allow hashes, then important hashes |
+//! | after the hashes | as given | wildcard exception patterns |
 //!
 //! Each hash is FNV-1a 64 of the lowercase name without a trailing dot. An entry for one
 //! host only, not its subdomains (`|name^` rules), is stored in the block or allow section
 //! as the hash of `|` followed by the name, which no name can produce. Each section is
 //! sorted ascending with no duplicates. A false positive needs a 64-bit collision: about
 //! 5e-14 per lookup with 250,000 names.
+//!
+//! The pattern section holds the wildcard exceptions (`@@||clk*.tradedoubler.com^|`) as
+//! text, one per line, each ending in `\n`: `||pattern` for the host and its parents,
+//! `|pattern` for the host only. Patterns are lowercase and sorted, `||` ones first. Files
+//! written before the section existed have 0 in its length field and load unchanged.
 
 use std::fs::File;
 use std::ops::Range;
@@ -25,11 +31,20 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
+use crate::domain_rules::normalize_pattern;
 use crate::{DomainRules, FilterError, ListSource};
 
 const MAGIC: [u8; 4] = *b"TGDS";
 const VERSION: u32 = 1;
-pub(crate) const HEADER_LEN: usize = 32;
+const HEADER_LEN: usize = 32;
+
+/// The number of hashes in an encoded file, for the compile report.
+pub(crate) fn hash_count(bytes: &[u8]) -> u64 {
+    [8, 12, 16]
+        .iter()
+        .map(|&at| u64::from(read_u32(bytes, at)))
+        .sum()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DomainSetError {
@@ -39,8 +54,8 @@ pub enum DomainSetError {
     BadMagic,
     #[error("unsupported format version {0}")]
     UnsupportedVersion(u32),
-    #[error("reserved header field is not zero")]
-    BadHeader,
+    #[error("wildcard exception section is malformed")]
+    BadPatterns,
     #[error("header promises {expected} bytes, file has {actual}")]
     LengthMismatch { expected: u64, actual: u64 },
     #[error("checksum mismatch")]
@@ -107,18 +122,31 @@ impl DomainRules {
             sorted_hashes(&self.important, &[]),
         ];
         let total: usize = sections.iter().map(Vec::len).sum();
-        let mut out = Vec::with_capacity(HEADER_LEN + 8 * total);
+        let mut patterns = String::new();
+        for (prefix, list) in [
+            ("||", &self.wildcard_allow),
+            ("|", &self.exact_wildcard_allow),
+        ] {
+            for pattern in list {
+                patterns.push_str(prefix);
+                patterns.push_str(pattern);
+                patterns.push('\n');
+            }
+        }
+        let mut out = Vec::with_capacity(HEADER_LEN + 8 * total + patterns.len());
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
         for section in &sections {
             let count = u32::try_from(section.len()).expect("fewer than 2^32 names");
             out.extend_from_slice(&count.to_le_bytes());
         }
-        out.extend_from_slice(&0u32.to_le_bytes());
+        let patterns_len = u32::try_from(patterns.len()).expect("patterns under 4 GiB");
+        out.extend_from_slice(&patterns_len.to_le_bytes());
         out.extend_from_slice(&0u64.to_le_bytes());
         for hash in sections.iter().flatten() {
             out.extend_from_slice(&hash.to_le_bytes());
         }
+        out.extend_from_slice(patterns.as_bytes());
         let sum = checksum(&out[HEADER_LEN..]);
         out[24..32].copy_from_slice(&sum.to_le_bytes());
         out
@@ -139,12 +167,68 @@ impl Backing {
     }
 }
 
+/// A wildcard exception, parsed once at load.
+struct Pattern {
+    /// Lowercase, `*` matches any run of characters.
+    glob: Box<[u8]>,
+    /// Whether a parent of the host may match too (`||`), not only the host (`|`).
+    parents: bool,
+}
+
+/// Parses the pattern section: every line must be `||pattern` or `|pattern` with a pattern
+/// the list parser would have produced, and end in a newline.
+fn parse_patterns(section: &[u8]) -> Option<Vec<Pattern>> {
+    let text = std::str::from_utf8(section).ok()?;
+    let body = match text.strip_suffix('\n') {
+        Some(body) => body,
+        None if text.is_empty() => return Some(Vec::new()),
+        None => return None,
+    };
+    body.split('\n')
+        .map(|line| {
+            let (parents, pattern) = match line.strip_prefix("||") {
+                Some(pattern) => (true, pattern),
+                None => (false, line.strip_prefix('|')?),
+            };
+            (normalize_pattern(pattern).as_deref() == Some(pattern)).then(|| Pattern {
+                glob: pattern.as_bytes().into(),
+                parents,
+            })
+        })
+        .collect()
+}
+
+/// Whether `text` matches `glob`, where `*` matches any run of bytes (dots included) and
+/// ASCII letters in `text` match in either case. `glob` is lowercase.
+fn glob_matches(glob: &[u8], text: &[u8]) -> bool {
+    let (mut g, mut t) = (0, 0);
+    // The last `*` seen and the text position it currently stands in for.
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if glob.get(g) == Some(&b'*') {
+            star = Some((g, t));
+            g += 1;
+        } else if glob.get(g) == Some(&text[t].to_ascii_lowercase()) {
+            g += 1;
+            t += 1;
+        } else if let Some((star_g, star_t)) = star {
+            g = star_g + 1;
+            t = star_t + 1;
+            star = Some((star_g, star_t + 1));
+        } else {
+            return false;
+        }
+    }
+    glob[g..].iter().all(|&b| b == b'*')
+}
+
 /// The hashed DNS blocklist. `Send + Sync`; lookups never allocate.
 pub struct DomainSet {
     data: Backing,
     block: Range<usize>,
     allow: Range<usize>,
     important: Range<usize>,
+    patterns: Vec<Pattern>,
 }
 
 impl DomainSet {
@@ -186,13 +270,11 @@ impl DomainSet {
         if version != VERSION {
             return Err(DomainSetError::UnsupportedVersion(version).into());
         }
-        if read_u32(bytes, 20) != 0 {
-            return Err(DomainSetError::BadHeader.into());
-        }
+        let patterns_len = u64::from(read_u32(bytes, 20));
         let counts =
             [read_u32(bytes, 8), read_u32(bytes, 12), read_u32(bytes, 16)].map(|c| c as usize);
         let total: u64 = counts.iter().map(|&c| c as u64).sum();
-        let expected = HEADER_LEN as u64 + 8 * total;
+        let expected = HEADER_LEN as u64 + 8 * total + patterns_len;
         if bytes.len() as u64 != expected {
             return Err(DomainSetError::LengthMismatch {
                 expected,
@@ -207,11 +289,15 @@ impl DomainSet {
         let block = 0..counts[0];
         let allow = block.end..block.end + counts[1];
         let important = allow.end..allow.end + counts[2];
+        let Some(patterns) = parse_patterns(&bytes[HEADER_LEN + 8 * important.end..]) else {
+            return Err(DomainSetError::BadPatterns.into());
+        };
         let set = DomainSet {
             data,
             block,
             allow,
             important,
+            patterns,
         };
         for range in [&set.block, &set.allow, &set.important] {
             let hashes = &set.hashes()[range.clone()];
@@ -226,7 +312,26 @@ impl DomainSet {
     }
 
     fn hashes(&self) -> &[[u8; 8]] {
-        self.data.bytes()[HEADER_LEN..].as_chunks::<8>().0
+        self.data.bytes()[HEADER_LEN..HEADER_LEN + 8 * self.important.end]
+            .as_chunks::<8>()
+            .0
+    }
+
+    /// Whether a wildcard exception matches the host (or, for `||` patterns, a parent).
+    fn wildcard_allowed(&self, host: &[u8]) -> bool {
+        self.patterns.iter().any(|pattern| {
+            if !pattern.parents {
+                return glob_matches(&pattern.glob, host);
+            }
+            let parents = host
+                .iter()
+                .enumerate()
+                .filter(|&(_, &b)| b == b'.')
+                .map(|(i, _)| &host[i + 1..]);
+            std::iter::once(host)
+                .chain(parents)
+                .any(|name| glob_matches(&pattern.glob, name))
+        })
     }
 
     fn contains(&self, range: &Range<usize>, hash: u64) -> bool {
@@ -237,7 +342,8 @@ impl DomainSet {
 
     /// True if an entry covers the host or one of its parents, taking important blocks
     /// first, then exceptions (for the host only, then for it and its parents), then blocks
-    /// (the same way). ASCII case and one trailing dot are ignored.
+    /// (the same way). A block is lifted when a wildcard exception matches. ASCII case and
+    /// one trailing dot are ignored.
     pub fn is_blocked(&self, host: &str) -> bool {
         let host = host.strip_suffix('.').unwrap_or(host).as_bytes();
         // The host and each parent that still has a dot: names without a dot are never
@@ -269,10 +375,11 @@ impl DomainSet {
         if exactly(&self.allow) || covered(&self.allow) {
             return false;
         }
-        exactly(&self.block) || covered(&self.block)
+        (exactly(&self.block) || covered(&self.block)) && !self.wildcard_allowed(host)
     }
 
-    /// Number of stored hashes: blocks, exceptions and important blocks together.
+    /// Number of stored hashes: blocks, exceptions and important blocks together. Wildcard
+    /// exceptions are not counted.
     pub fn len(&self) -> usize {
         self.important.end
     }
