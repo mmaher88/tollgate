@@ -29,6 +29,12 @@ final class TunnelController: ObservableObject {
     private var stopRequested = false
     /// The message shown for the last failed start; cleared once the tunnel connects.
     private var startFailure: String?
+    /// The `listsUpdated` call in progress. Calls meanwhile join it instead of applying the
+    /// lists (and maybe restarting the tunnel) a second time.
+    private var applyingLists: Task<Void, Never>?
+    /// Set by a call that joined `applyingLists`: lists changed again, so it makes one more
+    /// round, without a second restart.
+    private var listsChangedAgain = false
     private var statusObserver: NSObjectProtocol?
     private var configurationObserver: NSObjectProtocol?
     private let log = Logger(subsystem: "dev.tollgate.app", category: "tunnel")
@@ -306,37 +312,67 @@ final class TunnelController: ObservableObject {
     /// In the background (the refresh task) a restart is left for the next time the app is
     /// active (`applyPendingListUpdate`): it could be cut short when the background time
     /// runs out, and would leave protection off until then.
+    /// Calls that overlap are merged: the tunnel is restarted at most once for them.
     func listsUpdated() async {
+        if let applying = applyingLists {
+            listsChangedAgain = true
+            await applying.value
+            return
+        }
+        let task = Task { @MainActor in
+            var restarted = false
+            repeat {
+                self.listsChangedAgain = false
+                // A restart just made started a new engine; it needs no second one.
+                if await self.applyLists(restartAllowed: !restarted) { restarted = true }
+            } while self.listsChangedAgain
+            // On the main actor right after the last check, so no call can join a task
+            // that will not look at its lists.
+            self.applyingLists = nil
+        }
+        applyingLists = task
+        await task.value
+    }
+
+    /// One round of `listsUpdated`. True when it restarted the tunnel.
+    private func applyLists(restartAllowed: Bool) async -> Bool {
         UserDefaults.standard.removeObject(forKey: Self.listsPendingKey)
         switch status {
         case .connected:
             await refreshStats()
-            if CoreConfig.load().mitmEnabled, stats?.httpsFilteringActive == false {
-                await restartUnlessInBackground()
+            if restartAllowed, CoreConfig.load().mitmEnabled, stats?.httpsFilteringActive == false {
+                return await restartUnlessInBackground()
             } else if let data = await send(.reloadLists) {
                 let reply = String(decoding: data, as: UTF8.self)
                 if reply != "ok" { lastError = "reload lists: \(reply)" }
             }
         case .connecting, .reasserting:
-            await restartUnlessInBackground()
+            if restartAllowed { return await restartUnlessInBackground() }
         default:
             break // off: the next start loads the new files
         }
+        return false
     }
 
-    private func restartUnlessInBackground() async {
+    /// True when it restarted the tunnel, false when it left the restart for later.
+    private func restartUnlessInBackground() async -> Bool {
         if UIApplication.shared.applicationState == .background {
             log.info("new lists need a tunnel restart; leaving it for the next time the app is active")
             UserDefaults.standard.set(true, forKey: Self.listsPendingKey)
-            return
+            return false
         }
         await restartIfRunning()
+        return true
     }
 
     /// Applies lists compiled in the background whose restart was left for later. Call it
-    /// when the app becomes active.
+    /// when the app becomes active. At launch it runs twice at once (from the view's task
+    /// and from the scene becoming active); only the first finds the flag.
     func applyPendingListUpdate() async {
-        guard UserDefaults.standard.bool(forKey: Self.listsPendingKey) else { return }
+        let defaults = UserDefaults.standard
+        guard defaults.bool(forKey: Self.listsPendingKey) else { return }
+        // Taken before any suspension point, so the second call returns here.
+        defaults.removeObject(forKey: Self.listsPendingKey)
         await load()
         await listsUpdated()
     }
