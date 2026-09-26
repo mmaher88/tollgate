@@ -52,3 +52,16 @@ async fn a_failed_lookup_is_empty_and_not_kept() {
     assert!(resolver.lookup("www.example.com").await.is_empty());
     assert!(resolver.lookup("www.example.com").await.is_empty());
 }
+
+/// Local network names go to the system resolver (and from there to the network's own
+/// resolver), never to the public DoH upstreams, which only know they do not exist.
+#[tokio::test]
+async fn local_names_are_not_looked_up_over_doh() {
+    let server = TestServer::start().await;
+    let resolver = HostResolver::new(trusting(vec![server.upstream()], &[&server]));
+    for host in ["nas.lan", "homeassistant.home.arpa.", "nas", "fritz.box"] {
+        assert!(resolver.lookup(host).await.is_empty(), "{host}");
+    }
+    assert_eq!(server.requests(), 0);
+    assert_eq!(resolver.lookup("www.example.com").await, [ANSWER]);
+}

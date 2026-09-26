@@ -22,20 +22,27 @@ struct Entry {
 
 pub(crate) struct AnswerCache {
     entries: LruCache<Box<[u8]>, Entry>,
+    max_ttl: u32,
 }
 
 impl AnswerCache {
     pub fn new() -> AnswerCache {
-        let capacity = NonZeroUsize::new(CACHE_CAPACITY).expect("capacity is not zero");
+        AnswerCache::with_limits(CACHE_CAPACITY, MAX_CACHE_TTL)
+    }
+
+    /// A cache of at most `capacity` answers kept for at most `max_ttl` seconds.
+    pub fn with_limits(capacity: usize, max_ttl: u32) -> AnswerCache {
+        let capacity = NonZeroUsize::new(capacity.max(1)).expect("capacity is not zero");
         AnswerCache {
             entries: LruCache::new(capacity),
+            max_ttl: max_ttl.max(MIN_CACHE_TTL),
         }
     }
 
-    /// Keeps `answer` for its smallest record TTL, clamped to
-    /// [`MIN_CACHE_TTL`]..=[`MAX_CACHE_TTL`].
+    /// Keeps `answer` for its smallest record TTL, clamped to [`MIN_CACHE_TTL`] and the
+    /// cache's longest time ([`MAX_CACHE_TTL`] for [`AnswerCache::new`]).
     pub fn insert(&mut self, key: Box<[u8]>, answer: UpstreamAnswer, now: u64) {
-        let lifetime = answer.min_ttl().clamp(MIN_CACHE_TTL, MAX_CACHE_TTL);
+        let lifetime = answer.min_ttl().clamp(MIN_CACHE_TTL, self.max_ttl);
         let entry = Entry {
             answer,
             stored_at: now,

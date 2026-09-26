@@ -24,8 +24,8 @@ pub use controls::{
     validate_host_pattern,
 };
 pub use engine::{
-    Engine, EngineOptions, FORWARD_QUEUE, LEARNED_PINS_FILE, PINS_SAVE_INTERVAL, PacketSink,
-    RUNTIME_THREAD, Stats,
+    DnsRecord, Engine, EngineOptions, FORWARD_QUEUE, LEARNED_PINS_FILE, LOCAL_DEADLINE,
+    LOCAL_PENDING, LocalResolver, PINS_SAVE_INTERVAL, PacketSink, RUNTIME_THREAD, Stats,
 };
 pub use error::{TollgateError, catch_panic, panic_message};
 pub use lists::{CompileReport, ListFormat, ListInput, ListTarget, compile_lists};

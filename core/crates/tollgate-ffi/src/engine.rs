@@ -1,6 +1,7 @@
 //! The engine the tunnel runs: DNS answers on the packet path, and the proxy plus the DNS
 //! forwarder on one runtime thread.
 
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use rustls::pki_types::CertificateDer;
@@ -18,7 +19,9 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tollgate_common::clock;
 use tollgate_common::events::EventLog;
 use tollgate_common::stats::{Stats as Counters, StatsSnapshot};
-use tollgate_dns::{DnsHandler, DohError, DohResolver, ForwardJob, HostResolver, Outcome};
+use tollgate_dns::{
+    DnsHandler, DohError, DohResolver, ForwardJob, HostResolver, LocalRecord, Outcome,
+};
 use tollgate_filter::{DOMAINS_FILE, DomainSet, ENGINE_FILE, FilterEngine, FilterError};
 use tollgate_mitm::{CertAuthority, ProxyContext, ServeOptions};
 use tollgate_policy::{Config, HostPattern, Policy};
@@ -42,11 +45,57 @@ const MAX_BLOCKING_THREADS: usize = 4;
 /// How long `stop` waits for blocking work such as a hung `getaddrinfo`.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Most local network queries waiting for [`Engine::complete_local`]; further ones get
+/// SERVFAIL at once.
+pub const LOCAL_PENDING: usize = 64;
+/// Default for [`EngineOptions::local_deadline`].
+pub const LOCAL_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Implemented in Swift over `NEPacketTunnelFlow.writePackets`. Called on the runtime
 /// thread with the answers to forwarded DNS queries, so it must only hand the packets off.
 #[uniffi::export(foreign)]
 pub trait PacketSink: Send + Sync {
     fn write_packets(&self, packets: Vec<Vec<u8>>);
+}
+
+/// Implemented in Swift: looks up names only the local network knows (`nas.lan`, private
+/// reverse zones, bare device names) with the resolver of the current physical interface,
+/// never with the tunnel's. Called from `handle_packets`, so it must only start the lookup.
+/// Each call must be followed by exactly one [`Engine::complete_local`] with the same `id`;
+/// a query not completed within [`EngineOptions::local_deadline`] gets SERVFAIL.
+#[uniffi::export(foreign)]
+pub trait LocalResolver: Send + Sync {
+    /// `name` is in presentation form with the final dot; `rtype` and `rclass` are the
+    /// numeric record type and class of the question.
+    fn resolve(&self, id: u64, name: String, rtype: u16, rclass: u16);
+}
+
+/// One record from the local network's resolver: type, class, TTL and the record data in
+/// wire form, with any names in it uncompressed (as `DNSServiceQueryRecord` returns it).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DnsRecord {
+    pub rtype: u16,
+    pub rclass: u16,
+    pub ttl: u32,
+    pub data: Vec<u8>,
+}
+
+impl From<DnsRecord> for LocalRecord {
+    fn from(r: DnsRecord) -> LocalRecord {
+        LocalRecord {
+            rtype: r.rtype,
+            rclass: r.rclass,
+            ttl: r.ttl,
+            data: r.data,
+        }
+    }
+}
+
+/// Local network queries handed to the [`LocalResolver`], by id.
+#[derive(Default)]
+struct LocalJobs {
+    next_id: u64,
+    waiting: HashMap<u64, (ForwardJob, Instant)>,
 }
 
 /// Counters since the engine was created. Mirrors `tollgate_common::stats::StatsSnapshot`.
@@ -98,6 +147,9 @@ pub struct EngineOptions {
     /// How often the running engine checks whether the learned pins changed and saves
     /// them. `stop` saves them too, but jetsam or a crash ends the extension without it.
     pub pins_save_interval: Duration,
+    /// How long a local network query waits for [`Engine::complete_local`] before it is
+    /// answered SERVFAIL (checked when the next local query arrives).
+    pub local_deadline: Duration,
 }
 
 impl Default for EngineOptions {
@@ -107,6 +159,7 @@ impl Default for EngineOptions {
             forward_queue: FORWARD_QUEUE,
             forward_in_flight: tollgate_dns::MAX_IN_FLIGHT,
             pins_save_interval: PINS_SAVE_INTERVAL,
+            local_deadline: LOCAL_DEADLINE,
         }
     }
 }
@@ -146,6 +199,8 @@ pub struct Engine {
     proxy: Arc<ProxyContext>,
     pins: Arc<PinsFile>,
     running: Mutex<Option<Running>>,
+    local_resolver: Mutex<Option<Arc<dyn LocalResolver>>>,
+    local_jobs: Mutex<LocalJobs>,
 }
 
 #[uniffi::export]
@@ -271,6 +326,41 @@ impl Engine {
         });
     }
 
+    /// Where local network names are looked up; `None` answers them SERVFAIL. They are
+    /// never sent to the DoH upstreams, which only know that they do not exist.
+    pub fn set_local_resolver(&self, resolver: Option<Arc<dyn LocalResolver>>) {
+        let _ = catch_panic(|| {
+            *lock(&self.local_resolver) = resolver;
+            Ok(())
+        });
+    }
+
+    /// Names the network the local resolver answers for, such as the interface name and
+    /// its gateways. A different name drops the local answers kept so far.
+    pub fn set_network(&self, network: String) {
+        let _ = catch_panic(|| {
+            self.dns.set_network(&network);
+            Ok(())
+        });
+    }
+
+    /// Answers the local network query `id` from a [`LocalResolver::resolve`] call:
+    /// `records` holds the records found (empty when the name or type does not exist
+    /// there), `None` means the lookup failed or timed out. Returns the reply packet to
+    /// write to the tunnel, or nothing when `id` was already answered or has expired.
+    pub fn complete_local(&self, id: u64, records: Option<Vec<DnsRecord>>) -> Vec<Vec<u8>> {
+        catch_panic(|| {
+            let Some((job, _)) = lock(&self.local_jobs).waiting.remove(&id) else {
+                return Ok(Vec::new());
+            };
+            let records: Option<Vec<LocalRecord>> =
+                records.map(|records| records.into_iter().map(LocalRecord::from).collect());
+            let now = clock::now_secs();
+            Ok(vec![self.dns.complete_local(job, records.as_deref(), now)])
+        })
+        .unwrap_or_default()
+    }
+
     /// Whether HTTPS connections can be intercepted: `mitm_enabled` in the config, a CA and
     /// `engine.dat` were all present when the engine was created.
     pub fn mitm_active(&self) -> bool {
@@ -372,6 +462,8 @@ impl Engine {
             proxy,
             pins,
             running: Mutex::new(None),
+            local_resolver: Mutex::new(None),
+            local_jobs: Mutex::new(LocalJobs::default()),
         }))
     }
 
@@ -384,10 +476,12 @@ impl Engine {
         let jobs = self.running().as_ref().map(|r| r.jobs.clone());
         let now = clock::now_secs();
         let mut replies = Vec::new();
+        let mut local = Vec::new();
         for packet in packets {
             match self.dns.handle_packet(packet, now) {
                 Outcome::Reply(reply) => replies.push(reply),
                 Outcome::Drop => {}
+                Outcome::Local(job) => local.push(job),
                 Outcome::Forward(job) => {
                     let failed = match &jobs {
                         None => Some((job, DohError::Stopped)),
@@ -403,7 +497,62 @@ impl Engine {
                 }
             }
         }
+        if !local.is_empty() {
+            replies.extend(self.resolve_locally(local, now));
+        }
         replies
+    }
+
+    /// Hands local network queries to the [`LocalResolver`]. Returns SERVFAIL replies for
+    /// queries that cannot wait (no resolver, [`LOCAL_PENDING`] already waiting) and for
+    /// waiting ones past their deadline.
+    fn resolve_locally(&self, jobs: Vec<ForwardJob>, now: u64) -> Vec<Vec<u8>> {
+        let resolver = lock(&self.local_resolver).clone();
+        let mut failed = Vec::new();
+        let mut calls = Vec::new();
+        {
+            let mut local = lock(&self.local_jobs);
+            let deadline = self.options.local_deadline;
+            let expired: Vec<u64> = local
+                .waiting
+                .iter()
+                .filter(|(_, (_, since))| since.elapsed() >= deadline)
+                .map(|(&id, _)| id)
+                .collect();
+            for id in expired {
+                if let Some((job, _)) = local.waiting.remove(&id) {
+                    log::debug!("local DNS query {id} got no answer in time");
+                    failed.push(job);
+                }
+            }
+            for job in jobs {
+                if resolver.is_none() || local.waiting.len() >= LOCAL_PENDING {
+                    failed.push(job);
+                    continue;
+                }
+                let id = local.next_id;
+                local.next_id += 1;
+                let (rtype, rclass) = job.record_type_and_class();
+                calls.push((id, job.name().to_string(), rtype, rclass));
+                local.waiting.insert(id, (job, Instant::now()));
+            }
+        }
+        // Outside the lock: Swift may answer from inside the call.
+        if let Some(resolver) = resolver {
+            for (id, name, rtype, rclass) in calls {
+                let call = AssertUnwindSafe(|| resolver.resolve(id, name, rtype, rclass));
+                if let Err(payload) = catch_unwind(call) {
+                    log::error!(
+                        "LocalResolver.resolve panicked: {}",
+                        panic_message(payload.as_ref())
+                    );
+                }
+            }
+        }
+        failed
+            .into_iter()
+            .map(|job| self.dns.complete_local(job, None, now))
+            .collect()
     }
 
     fn resolver(&self) -> Result<DohResolver, TollgateError> {
@@ -502,6 +651,10 @@ impl Drop for Engine {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn load_filter(dir: &Path) -> Result<Option<Arc<FilterEngine>>, TollgateError> {

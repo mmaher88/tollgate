@@ -70,7 +70,7 @@ impl Requester {
         }
     }
 
-    fn qtype_and_class(&self) -> (u16, u16) {
+    pub fn qtype_and_class(&self) -> (u16, u16) {
         let n = self.question.len();
         (
             u16::from_be_bytes([self.question[n - 4], self.question[n - 3]]),
@@ -224,6 +224,11 @@ impl UpstreamAnswer {
         matches!(self.bytes[3] & 0x0f, NOERROR | NXDOMAIN)
             && self.bytes[2] & 0x02 == 0
             && self.bytes.len() + OPT_LEN <= usize::from(MAX_UDP_PAYLOAD)
+    }
+
+    /// Whether the answer section holds any record.
+    pub fn has_answers(&self) -> bool {
+        self.bytes[6..8] != [0, 0]
     }
 
     /// Smallest TTL of any record, or 0 without records.

@@ -47,6 +47,19 @@ fn engine_methods_have_the_expected_swift_names() {
             "func forgetPins(hosts: [String]) -> UInt32",
         ),
         ("func resetConnections(", "func resetConnections()"),
+        (
+            "func setLocalResolver(",
+            "func setLocalResolver(resolver: LocalResolver?)",
+        ),
+        ("func setNetwork(", "func setNetwork(network: String)"),
+        (
+            "func completeLocal(",
+            "func completeLocal(id: UInt64, records: [DnsRecord]?) -> [Data]",
+        ),
+        (
+            "func resolve(",
+            "func resolve(id: UInt64, name: String, rtype: UInt16, rclass: UInt16)",
+        ),
     ] {
         let found = declarations(&swift, needle);
         assert!(
@@ -114,6 +127,10 @@ fn records_have_the_expected_swift_fields() {
     assert_eq!(
         struct_fields(&swift, "LearnedPin"),
         ["host:String", "learnedAt:UInt64"]
+    );
+    assert_eq!(
+        struct_fields(&swift, "DnsRecord"),
+        ["rtype:UInt16", "rclass:UInt16", "ttl:UInt32", "data:Data"]
     );
     let start = swift.find("public enum EventKind").expect("enum EventKind");
     let body = &swift[start..start + swift[start..].find('}').unwrap()];

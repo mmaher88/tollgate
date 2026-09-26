@@ -285,6 +285,7 @@ fn dnssec_answers_are_only_served_to_requesters_that_set_do() {
                 assert!(!has_rrsig(&message), "{edns:?}");
             }
             tollgate_dns::Outcome::Drop => panic!("dropped"),
+            tollgate_dns::Outcome::Local(_) => panic!("sent to the local resolver"),
         }
     }
 

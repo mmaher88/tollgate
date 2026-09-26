@@ -53,6 +53,10 @@ impl PayloadHandler {
                 payload_of(&reply).map_or(PayloadOutcome::Drop, PayloadOutcome::Reply)
             }
             Outcome::Forward(job) => PayloadOutcome::Forward(job),
+            // The devproxy has no local network resolver to ask: SERVFAIL, as on a phone
+            // whose tunnel has none.
+            Outcome::Local(job) => payload_of(&self.handler.complete_local(job, None, now))
+                .map_or(PayloadOutcome::Drop, PayloadOutcome::Reply),
             Outcome::Drop => PayloadOutcome::Drop,
         }
     }

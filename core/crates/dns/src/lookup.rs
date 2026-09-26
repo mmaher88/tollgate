@@ -13,6 +13,7 @@ use tollgate_common::resolve::{LookupFuture, Resolve};
 
 use crate::cache::MIN_CACHE_TTL;
 use crate::doh::DohResolver;
+use crate::local::is_local_name;
 
 /// Host names whose addresses are kept.
 pub const LOOKUP_CACHE_CAPACITY: usize = 256;
@@ -28,7 +29,9 @@ struct Entry {
 }
 
 /// Looks up A and AAAA records through a [`DohResolver`], IPv4 first, and keeps the
-/// addresses for their smallest TTL (10 s to 5 min). Failures are not kept.
+/// addresses for their smallest TTL (10 s to 5 min). Failures are not kept. Local network
+/// names ([`crate::is_local_name`]) are never sent to DoH: their lookup is empty, so the
+/// proxy uses the system resolver.
 pub struct HostResolver {
     doh: DohResolver,
     cache: Mutex<LruCache<String, Entry>>,
@@ -62,6 +65,11 @@ impl HostResolver {
         let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
         if let Ok(ip) = host.parse::<IpAddr>() {
             return vec![ip];
+        }
+        if is_local_name(&host) {
+            // Only the network's resolver knows it; the caller falls back to the system
+            // resolver, whose query the tunnel sends there.
+            return Vec::new();
         }
         let now = (self.clock)();
         {
