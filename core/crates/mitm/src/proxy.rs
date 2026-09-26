@@ -2,8 +2,8 @@
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
@@ -27,7 +27,7 @@ use crate::body::{Body, DoneBody};
 use crate::idle::{self, Activity, InFlight};
 use crate::limits::{
     H1_MAX_BUF, H2_CONNECTION_WINDOW, H2_MAX_SEND_BUF, H2_STREAM_WINDOW, KEEP_ALIVE_TIMEOUT,
-    MAX_HEADER_LIST, MAX_HEADERS,
+    MAX_HEADER_LIST, MAX_HEADERS, MIN_IDLE_TO_RECLAIM,
 };
 use crate::shutdown::{self, Shutdown};
 use crate::upstream::{Pool, PoolOptions};
@@ -71,10 +71,49 @@ pub(crate) struct State {
     pub(crate) pool: Pool,
     pub(crate) shutdown: Shutdown,
     pub(crate) intercept_slots: Arc<Semaphore>,
+    /// The intercepted connections past their TLS handshake, for reclaiming the slot of an
+    /// idle one when the table is full.
+    pub(crate) intercepted: Mutex<Vec<Weak<Activity>>>,
     pub(crate) provider: Arc<CryptoProvider>,
     pub(crate) sessions: Arc<dyn StoresServerSessions>,
     /// Serves intercepted connections: HTTP/1.1 or HTTP/2, with the mandatory limits.
     pub(crate) server: auto::Builder<TokioExecutor>,
+}
+
+impl State {
+    fn intercepted(&self) -> std::sync::MutexGuard<'_, Vec<Weak<Activity>>> {
+        let mut list = self
+            .intercepted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        list.retain(|activity| activity.strong_count() > 0);
+        list
+    }
+
+    /// Records an intercepted connection that completed its TLS handshake.
+    pub(crate) fn add_intercepted(&self, activity: &Arc<Activity>) {
+        self.intercepted().push(Arc::downgrade(activity));
+    }
+
+    /// Asks the intercepted connection that has had nothing in flight the longest, and for
+    /// at least [`MIN_IDLE_TO_RECLAIM`], to close. False when there is none.
+    pub(crate) fn close_longest_idle(&self) -> bool {
+        let now = tokio::time::Instant::now();
+        let oldest = self
+            .intercepted()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter_map(|activity| Some((activity.idle_since()?, activity)))
+            .filter(|(since, _)| now.saturating_duration_since(*since) >= MIN_IDLE_TO_RECLAIM)
+            .min_by_key(|(since, _)| *since);
+        match oldest {
+            Some((_, activity)) => {
+                activity.request_close();
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// Delay after the given number of consecutive `accept` errors: 10 ms, doubling, at most
@@ -141,6 +180,7 @@ pub async fn serve_with_options(
         .keep_alive_timeout(KEEP_ALIVE_TIMEOUT);
     let state = Arc::new(State {
         intercept_slots: Arc::new(Semaphore::new(ctx.max_intercepted)),
+        intercepted: Mutex::new(Vec::new()),
         ctx,
         pool,
         shutdown: tasks.clone(),

@@ -57,6 +57,10 @@ pub mod limits {
     pub const MAX_H1_PER_HOST: usize = 6;
     /// An HTTP/2 connection whose keep-alive ping is not answered in time is closed.
     pub const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+    /// When every interception slot is taken, an intercepted client connection that has had
+    /// nothing in flight for this long may be closed to make room for a new one. Shorter
+    /// gaps are normal while a page loads.
+    pub const MIN_IDLE_TO_RECLAIM: Duration = Duration::from_secs(3);
 }
 
 /// Errors from the certificate authority.

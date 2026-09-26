@@ -97,6 +97,7 @@ pub(crate) async fn intercept<C>(
     };
 
     let activity = Activity::new();
+    state.add_intercepted(&activity);
     let requests = Arc::new(AtomicU64::new(0));
     let origin = Arc::new(origin);
     let service = {

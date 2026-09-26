@@ -8,9 +8,11 @@
 //! Non-TLS traffic, and a client that waits for the server to speak first, is tunneled
 //! with those bytes replayed. For TLS the SNI is classified as well; passthrough, TLS
 //! without an HTTP protocol, low memory and a full interception table also tunnel, with
-//! the ClientHello replayed.
+//! the ClientHello replayed. A full table first closes its longest idle connection, if one
+//! has been idle for a while, and takes over its slot.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
@@ -32,6 +34,9 @@ use crate::limits::LOW_MEMORY_BYTES;
 use crate::proxy::State;
 use crate::rewind::Rewind;
 use crate::upstream::{UpstreamError, connect_tcp};
+
+/// How long a new connection waits for the slot of an idle one it asked to close.
+const RECLAIM_WAIT: Duration = Duration::from_millis(100);
 
 pub(crate) async fn connect(state: &Arc<State>, request: Request<Incoming>) -> Response<Body> {
     let Some(authority) = request.uri().authority() else {
@@ -159,7 +164,7 @@ where
     if (state.ctx.available_memory)().is_some_and(|bytes| bytes < LOW_MEMORY_BYTES) {
         return Plan::Tunnel(format!("{:?}", PassthroughReason::LowMemory));
     }
-    let Ok(permit) = state.intercept_slots.clone().try_acquire_owned() else {
+    let Some(permit) = intercept_slot(state).await else {
         return Plan::Tunnel(format!("{:?}", PassthroughReason::Capacity));
     };
     match state.ctx.ca.leaf(&name) {
@@ -173,6 +178,21 @@ where
         }
         Err(e) => Plan::Tunnel(format!("no certificate for {name}: {e}")),
     }
+}
+
+/// A free interception slot, or the slot of the longest idle intercepted connection, which
+/// is asked to close (one per new connection, so a burst cannot close them all).
+async fn intercept_slot(state: &State) -> Option<OwnedSemaphorePermit> {
+    if let Ok(permit) = state.intercept_slots.clone().try_acquire_owned() {
+        return Some(permit);
+    }
+    if !state.close_longest_idle() {
+        return None;
+    }
+    tokio::time::timeout(RECLAIM_WAIT, state.intercept_slots.clone().acquire_owned())
+        .await
+        .ok()?
+        .ok()
 }
 
 /// Tunnels `client`, whose replay buffer (if any) goes upstream first.

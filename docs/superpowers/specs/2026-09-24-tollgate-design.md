@@ -343,8 +343,10 @@ drops redundant children of blocked parents. The false positive rate is about 5e
   the ClientHello replayed.
 - Flow control limits are mandatory: HTTP/2 stream window 128 KiB, connection window 256 KiB,
   server send buffer 128 KiB, HTTP/1 read buffer 128 KiB.
-- At most 32 intercepted client connections (about 0.35 MiB each) instead of 64; above the cap,
-  or when less than 8 MiB of memory is available, new connections pass through. Upstream
+- At most 32 intercepted client connections (about 0.35 MiB each) instead of 64. When all 32
+  are taken, a new connection closes the one that has had nothing in flight the longest (at
+  least 3 s) and waits up to 100 ms for its slot; without one, or when less than 8 MiB of
+  memory is available, new connections pass through. Upstream
   connections are pooled per host and shared across client connections: at most 6 HTTP/1.1
   connections per host and 64 upstream connections in total. An HTTP/2 origin shares one
   connection, except that one whose stalled streams (responses whose clients stopped reading

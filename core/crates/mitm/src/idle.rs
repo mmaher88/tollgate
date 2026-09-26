@@ -4,7 +4,8 @@
 //! sent or dropped. Once nothing is in flight for the idle timeout, the connection is shut
 //! down gracefully, so idle browsers cannot hold interception slots forever. A request can
 //! also ask for the connection to be shut down, for example once its host is passed
-//! through, so the client's next request opens a new `CONNECT`.
+//! through, so the client's next request opens a new `CONNECT`, and so can a new
+//! connection that needs the interception slot of one that has been idle for a while.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -48,6 +49,15 @@ impl Activity {
     pub(crate) fn start(self: &Arc<Self>) -> InFlight {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         InFlight(self.clone())
+    }
+
+    /// Since when nothing has been in flight; `None` while a request is in flight or once a
+    /// close was requested.
+    pub(crate) fn idle_since(&self) -> Option<Instant> {
+        if self.in_flight.load(Ordering::Relaxed) > 0 || self.close_requested() {
+            return None;
+        }
+        Some(*self.last.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// When the connection becomes idle, or `None` while a request is in flight.

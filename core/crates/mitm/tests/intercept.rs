@@ -309,6 +309,65 @@ async fn idle_intercepted_connections_give_back_their_slot() {
 }
 
 #[tokio::test]
+async fn a_full_table_closes_the_longest_idle_connection_for_a_new_one() {
+    let ca = Arc::new(CertAuthority::generate("Tollgate Test CA").unwrap());
+    let origin_ca = Arc::new(CertAuthority::generate("Origin CA").unwrap());
+    let origin = tls_origin::https(origin_ca.clone(), &[b"h2"]).await;
+    let mut ctx = proxy::context(ca.clone(), &Config::default(), None);
+    ctx.max_intercepted = 2;
+    let proxy = proxy::start(ctx, tls_origin::trusting(&origin_ca)).await;
+    let target = format!("127.0.0.1:{}", origin.port());
+    let url = |path: &str| format!("https://www.tollgate.test:{}{path}", origin.port());
+    let client = || async {
+        let tcp = connect(proxy.addr, &target).await;
+        let tls = tls(tcp, tls_config(&[&ca], &[b"h2"]), "www.tollgate.test")
+            .await
+            .unwrap();
+        http2(tls).await
+    };
+
+    // One client has a slow request in flight the whole time; the other is done.
+    let mut busy = client().await;
+    let slow = url("/?delay=6000");
+    let in_flight = tokio::spawn(async move { send2(&mut busy, get(&slow, &[])).await });
+    let mut idle = client().await;
+    assert_eq!(
+        send2(&mut idle, get(&url("/"), &[])).await.status,
+        StatusCode::OK
+    );
+    tokio::time::sleep(limits::MIN_IDLE_TO_RECLAIM + Duration::from_millis(300)).await;
+
+    // The table is full: the idle connection is closed to make room.
+    let tcp = connect(proxy.addr, &target).await;
+    let tls = tls(tcp, tls_config(&[&ca], &[b"h2"]), "www.tollgate.test")
+        .await
+        .unwrap();
+    assert_eq!(peer_issuer(&tls), "CN=Tollgate Test CA, O=Tollgate");
+    let mut third = http2(tls).await;
+    assert_eq!(
+        send2(&mut third, get(&url("/"), &[])).await.status,
+        StatusCode::OK
+    );
+    wait_for("the idle connection to close", || idle.is_closed()).await;
+    assert_eq!(proxy.stats().connections_intercepted, 3);
+    assert_eq!(proxy.stats().connections_passthrough, 0);
+
+    // Now one connection is busy and the other was idle only briefly: neither is closed,
+    // and a new connection is passed through.
+    let issuer = issuer_via(proxy.addr, &target, &[&ca, &origin_ca], "www.tollgate.test").await;
+    assert_eq!(issuer, "CN=Origin CA, O=Tollgate");
+    assert_eq!(proxy.stats().connections_passthrough, 1);
+    assert!(!third.is_closed());
+    let reply = in_flight.await.unwrap();
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        reply.body.starts_with("GET /?delay=6000 "),
+        "{}",
+        reply.body
+    );
+}
+
+#[tokio::test]
 async fn incomplete_client_hello_times_out() {
     let ca = Arc::new(CertAuthority::generate("Tollgate Test CA").unwrap());
     let ctx = proxy::context(ca, &Config::default(), None);
