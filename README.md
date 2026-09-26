@@ -63,10 +63,15 @@ Everything written by the provisioning tool goes to `tooling/asc/out/`, which is
 ## Install and debug
 
 ```bash
-tooling/scripts/fetch-ipa.sh      # latest successful CI build of main (or pass a branch)
+gh workflow run ios.yml --repo mmaher88/tollgate --ref <branch>   # build the branch tip first
+tooling/scripts/fetch-ipa.sh <branch>   # the CI build of the branch tip (default main)
 tooling/scripts/install.sh        # install on the USB-connected iPhone
 tooling/scripts/logs.sh tunnel    # stream the extension's logs
 ```
+
+`fetch-ipa.sh` refuses a build older than the branch tip unless given `--allow-stale`, and
+prints the run id and commit (kept in `build/ipa/BUILD_INFO`). The app shows the same run
+number and commit under Diagnostics, Build.
 
 The first install of a development-signed app asks for Developer Mode on the phone
 (Settings, Privacy & Security, Developer Mode), followed by a reboot.

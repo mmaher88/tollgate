@@ -12,7 +12,9 @@ settings:
     SWIFT_VERSION: "5.0"
     SWIFT_STRICT_CONCURRENCY: complete
     MARKETING_VERSION: "0.1.0"
+    # CI passes the run number and the commit; local builds show "local".
     CURRENT_PROJECT_VERSION: "1"
+    TOLLGATE_BUILD_COMMIT: local
     SWIFT_INCLUDE_PATHS: $(SRCROOT)/Generated/TollgateFFI
     LIBRARY_SEARCH_PATHS: $(SRCROOT)/Generated/lib
     OTHER_LDFLAGS: -ltollgate_ffi
@@ -33,6 +35,7 @@ targets:
         CFBundleDisplayName: Tollgate
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        TollgateBuildCommit: $(TOLLGATE_BUILD_COMMIT)
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false

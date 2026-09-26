@@ -219,9 +219,18 @@ struct ContentView: View {
 
     // MARK: - Diagnostics
 
+    /// "<CI run number> (<short commit>)", or "1 (local)" for a local build.
+    private static var buildLabel: String {
+        let info = Bundle.main.infoDictionary
+        let number = info?["CFBundleVersion"] as? String ?? "?"
+        let commit = info?["TollgateBuildCommit"] as? String ?? "?"
+        return "\(number) (\(commit))"
+    }
+
     private var diagnosticsSection: some View {
         Section("Diagnostics") {
             LabeledContent("Core version", value: coreVersion())
+            LabeledContent("Build", value: Self.buildLabel)
             if let stats = tunnel.stats {
                 LabeledContent("Tunnel memory available",
                                value: ByteCountFormatter.string(fromByteCount: Int64(stats.availableMemoryBytes), countStyle: .memory))
