@@ -22,6 +22,13 @@ final class TunnelController: ObservableObject {
     /// True while `restartNow` has Connect On Demand turned off on purpose, so `loadNow`
     /// (run by the configuration-change observer meanwhile) does not turn it back on.
     private var restartInProgress = false
+    /// True from `.connecting` until the tunnel connects or stops, to tell a failed start
+    /// from a tunnel that was turned off.
+    private var startPending = false
+    /// True after `stop()` until the tunnel stops, so that stop is not reported as a failure.
+    private var stopRequested = false
+    /// The message shown for the last failed start; cleared once the tunnel connects.
+    private var startFailure: String?
     private var statusObserver: NSObjectProtocol?
     private var configurationObserver: NSObjectProtocol?
     private let log = Logger(subsystem: "dev.tollgate.app", category: "tunnel")
@@ -138,6 +145,8 @@ final class TunnelController: ObservableObject {
         guard !busy else { return }
         busy = true
         defer { busy = false }
+        stopRequested = false
+        lastError = nil
         await load(createIfMissing: true)
         guard let manager else { return }
         do {
@@ -146,8 +155,9 @@ final class TunnelController: ObservableObject {
             manager.isOnDemandEnabled = true
             try await manager.saveToPreferences()
             try await manager.loadFromPreferences()
+            // Only queues the start: a failure arrives later as a status change (see
+            // `track`), and the message shows then.
             try manager.connection.startVPNTunnel()
-            lastError = nil
         } catch {
             report(error, context: "turn on")
         }
@@ -164,6 +174,7 @@ final class TunnelController: ObservableObject {
         UserDefaults.standard.removeObject(forKey: Self.onDemandPausedKey)
         await load()
         guard let manager else { return }
+        stopRequested = true
         do {
             manager.isOnDemandEnabled = false
             try await manager.saveToPreferences()
@@ -269,7 +280,13 @@ final class TunnelController: ObservableObject {
             report(error, context: "restart")
             return
         }
-        _ = await wait(for: .connected, on: manager, tries: 100)
+        let connected = await wait(for: .connected, on: manager, tries: 100)
+        let status = manager.connection.status
+        if !connected, status == .disconnected || status == .invalid {
+            // Reported here, since the status observer ignores changes during a restart.
+            startPending = false
+            reportFailedStart(manager)
+        }
     }
 
     /// Polls every 100 ms until the tunnel reaches `wanted`, at most `tries` times. True when
@@ -445,8 +462,55 @@ final class TunnelController: ObservableObject {
                 guard let self, let manager = self.manager else { return }
                 self.status = manager.connection.status
                 if self.status != .connected { self.stats = nil }
+                self.track(self.status, on: manager)
             }
         }
+    }
+
+    /// Notices a start that failed: the tunnel went from `.connecting` to `.disconnected`
+    /// without `stop()` or a restart asking for it. `startVPNTunnel()` only queues the start,
+    /// so this is where the tunnel's error (engine, App Group, network settings) shows up.
+    private func track(_ status: NEVPNStatus, on manager: NETunnelProviderManager) {
+        switch status {
+        case .connecting:
+            startPending = true
+        case .connected:
+            startPending = false
+            stopRequested = false
+            if let startFailure, lastError == startFailure { lastError = nil }
+            startFailure = nil
+        case .disconnected, .invalid:
+            let failed = startPending && !stopRequested && !restartInProgress
+            startPending = false
+            stopRequested = false
+            if failed { reportFailedStart(manager) }
+        default:
+            break
+        }
+    }
+
+    /// Shows why the last start failed: the reason the tunnel recorded in the App Group,
+    /// else the error iOS kept for the connection. Nothing when neither says anything.
+    private func reportFailedStart(_ manager: NETunnelProviderManager) {
+        if let reason = TunnelStartFailure.take() {
+            showStartFailure(reason)
+            return
+        }
+        manager.connection.fetchLastDisconnectError { [weak self] error in
+            guard let error else { return }
+            let underlying = (error as NSError).userInfo[NSUnderlyingErrorKey] as? Error
+            let reason = (underlying ?? error).localizedDescription
+            Task { @MainActor in self?.showStartFailure(reason) }
+        }
+    }
+
+    /// One message per failure: on-demand retries that fail the same way do not change it.
+    private func showStartFailure(_ reason: String) {
+        let message = "Protection could not start: \(reason)"
+        guard message != lastError else { return }
+        log.error("\(message, privacy: .public)")
+        startFailure = message
+        lastError = message
     }
 
     private static func removeLearnedPins() {

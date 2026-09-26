@@ -232,7 +232,11 @@ intercepting new connections (passthrough only) until memory recovers.
 
 ## Failure handling
 
-- Engine creation fails: `startTunnel` completes with an error that the app shows.
+- Engine creation fails: `startTunnel` completes with an error that the app shows. The
+  tunnel also writes the reason to `core/last-start-error.txt` in the App Group (removed on
+  a successful start), since the provider's error may not reach the app intact; the app
+  shows "Protection could not start: ..." when the tunnel goes from connecting to off
+  without the app asking, from that file or else from `fetchLastDisconnectError`.
 - No compiled lists: the app compiles the bundled snapshots on first launch; the tunnel runs
   DNS-only if `engine.dat` is still missing.
 - DoH upstream unreachable: next upstream, then SERVFAIL; counted in stats.

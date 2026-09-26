@@ -130,6 +130,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             port = try engine.start(sink: FlowSink(flow: packetFlow))
         } catch {
             log.error("engine start failed: \(String(describing: error), privacy: .public)")
+            TunnelStartFailure.record("the filter engine did not start (\(String(describing: error))).")
             completionHandler(error)
             return
         }
@@ -152,11 +153,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let self else { return }
             if let error {
                 self.log.error("setTunnelNetworkSettings failed: \(error.localizedDescription, privacy: .public)")
+                TunnelStartFailure.record("iOS did not accept the tunnel's network settings (\(error.localizedDescription)).")
                 self.takeAndStopEngine()
                 completionHandler(error)
                 return
             }
             self.log.info("tunnel up")
+            TunnelStartFailure.clear()
             self.observeNetworkChanges()
             // Started only now that engineState is set, so the first batch finds the engine.
             Self.readPackets(engineState: self.engineState, flow: self.packetFlow, log: self.log)
@@ -348,8 +351,15 @@ extension TunnelEvent {
     }
 }
 
-enum TunnelError: Error {
+enum TunnelError: LocalizedError {
     case appGroupUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .appGroupUnavailable:
+            return "the tunnel cannot open the App Group container; check that its provisioning profile includes the App Group."
+        }
+    }
 }
 
 /// Delivers answers produced on the core's runtime thread. Captures only the packet flow,
