@@ -138,6 +138,8 @@ final class ListUpdater: ObservableObject {
         try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
         var inputs: [ListInput] = []
         var allDownloaded = true
+        /// A list that could not be downloaded and has no cached copy, so it is left out.
+        var missingList = false
         for (index, source) in sources.enumerated() {
             state = .downloading(done: index, total: sources.count)
             let cached = cache.appendingPathComponent(source.cacheKey + ".txt")
@@ -157,6 +159,7 @@ final class ListUpdater: ObservableObject {
                     allDownloaded = false
                     log.error("download \(source.name, privacy: .public) failed: \(String(describing: error), privacy: .public)")
                     text = try? String(contentsOf: cached, encoding: .utf8)
+                    if text == nil { missingList = true }
                     problems.append(text == nil
                         ? "\(source.name): \(error.localizedDescription)"
                         : "\(source.name): using the last downloaded copy (\(error.localizedDescription))")
@@ -168,7 +171,7 @@ final class ListUpdater: ObservableObject {
         }
         if !sources.isEmpty, inputs.isEmpty {
             warnings = problems
-            if refresh { recordAttempt(partial: true) }
+            if refresh || missingList { recordAttempt(partial: true) }
             state = .failed(problems.first ?? "No list could be downloaded")
             return false
         }
@@ -202,6 +205,10 @@ final class ListUpdater: ObservableObject {
                     lastUpdated = now
                     UserDefaults.standard.set(now, forKey: Self.lastUpdatedKey)
                 }
+            } else if missingList {
+                // A newly added list could not be downloaded (Apply changes now): show the
+                // partial status and retry with a full update in an hour, not in a day.
+                recordAttempt(partial: true)
             }
             if ListSettings.load() == settings {
                 pendingSettingsChange = false
