@@ -120,6 +120,17 @@ pub(crate) fn needs_passthrough(error: &UpstreamError) -> bool {
     )
 }
 
+/// True when no connection to the server could be made for this request: the name did not
+/// resolve, the connection was refused, reset or timed out. TLS failures are not included;
+/// neither is a failure on a connection that was already open, or a lack of permits.
+pub(crate) fn is_unreachable(error: &UpstreamError) -> bool {
+    match error {
+        UpstreamError::Timeout => true,
+        UpstreamError::Connect(_) => rustls_error(error).is_none(),
+        _ => false,
+    }
+}
+
 /// The rustls error behind `error`, if any. tokio-rustls reports TLS errors as an
 /// `io::Error` wrapping the rustls error, and hyper wraps that `io::Error` in turn.
 fn rustls_error(error: &UpstreamError) -> Option<&rustls::Error> {
@@ -1043,6 +1054,14 @@ mod tests {
             ))));
         }
         assert!(!needs_passthrough(&UpstreamError::Timeout));
+        assert!(is_unreachable(&UpstreamError::Timeout));
+        assert!(is_unreachable(&UpstreamError::Connect(io::Error::from(
+            io::ErrorKind::ConnectionRefused
+        ))));
+        assert!(!is_unreachable(&UpstreamError::Connect(alert(
+            AlertDescription::HandshakeFailure
+        ))));
+        assert!(!is_unreachable(&UpstreamError::Exhausted));
         assert!(!needs_passthrough(&UpstreamError::Connect(
             io::Error::from(io::ErrorKind::ConnectionRefused)
         )));

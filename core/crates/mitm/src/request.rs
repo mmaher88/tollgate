@@ -1,6 +1,5 @@
 //! One request on an intercepted connection.
 
-use std::convert::Infallible;
 use std::sync::Arc;
 
 use http_body_util::BodyExt;
@@ -15,17 +14,34 @@ use crate::filtering::is_blocked;
 use crate::idle::InFlight;
 use crate::intercept::Origin;
 use crate::proxy::State;
-use crate::upstream::learn_from_failure;
+use crate::upstream::{UpstreamError, is_unreachable, learn_from_failure};
 use crate::websocket;
 
+/// Ends a request without a response. hyper closes an HTTP/1.1 connection and resets an
+/// HTTP/2 stream, so the client sees a connection failure, as it would without the proxy.
+#[derive(Debug, thiserror::Error)]
+#[error("no response: the upstream is unreachable")]
+pub(crate) struct NoResponse;
+
+/// The service for one request on an intercepted connection. An upstream that cannot be
+/// reached gets [`NoResponse`] rather than a `502`: the proxy answered the `CONNECT` and
+/// the TLS handshake itself, so a `502` over its trusted leaf would be an ordinary server
+/// response to the browser, shown as an empty page, and would keep it from falling back
+/// from `https://` to `http://`.
 pub(crate) async fn handle(
     state: Arc<State>,
     origin: Arc<Origin>,
     in_flight: InFlight,
     request: Request<Incoming>,
-) -> Result<Response<Body>, Infallible> {
+) -> Result<Response<Body>, NoResponse> {
     let http1 = request.version() < Version::HTTP_2;
-    let (mut response, close) = respond(&state, &origin, request).await;
+    let (mut response, close) = match respond(&state, &origin, request).await {
+        Ok(answer) => answer,
+        Err(e) => {
+            drop(in_flight);
+            return Err(e);
+        }
+    };
     // An upgraded WebSocket no longer belongs to the HTTP connection; leave it alone.
     if close && response.status() != StatusCode::SWITCHING_PROTOCOLS {
         // HTTP/2 gets GOAWAY; HTTP/1.1 closes after this response, which says so.
@@ -46,13 +62,13 @@ async fn respond(
     state: &State,
     origin: &Origin,
     request: Request<Incoming>,
-) -> (Response<Body>, bool) {
+) -> Result<(Response<Body>, bool), NoResponse> {
     let passed_through = matches!(
         state.ctx.policy.classify(&origin.name, unix_secs()),
         Decision::Passthrough(_)
     );
-    let (response, untrusted) = forward(state, origin, request).await;
-    (response, passed_through || untrusted)
+    let (response, untrusted) = forward(state, origin, request).await?;
+    Ok((response, passed_through || untrusted))
 }
 
 /// Filters and forwards one request. The flag is true when the upstream TLS failed in a way
@@ -61,14 +77,14 @@ async fn forward(
     state: &State,
     origin: &Origin,
     mut request: Request<Incoming>,
-) -> (Response<Body>, bool) {
+) -> Result<(Response<Body>, bool), NoResponse> {
     // An HTTP/2 client may reuse this connection for another host it believes shares the
     // certificate. The leaf and the upstream belong to one origin, so send it elsewhere.
     if request.version() == Version::HTTP_2
         && let Some(authority) = request.uri().authority()
         && !origin.matches(authority)
     {
-        return (status(StatusCode::MISDIRECTED_REQUEST), false);
+        return Ok((status(StatusCode::MISDIRECTED_REQUEST), false));
     }
     let path_and_query = request
         .uri()
@@ -89,10 +105,10 @@ async fn forward(
         request.headers(),
         forced_type,
     ) {
-        return (blocked(), false);
+        return Ok((blocked(), false));
     }
     if websocket {
-        return websocket::forward(state, origin.target(), request).await;
+        return Ok(websocket::forward(state, origin.target(), request).await);
     }
     if let Ok(uri) = url.parse::<Uri>() {
         *request.uri_mut() = uri;
@@ -102,11 +118,28 @@ async fn forward(
         .send(&origin.target(), request.map(|b| b.boxed_unsync()))
         .await
     {
-        Ok(response) => (response, false),
+        Ok(response) => Ok((response, false)),
         Err(e) => {
-            log::debug!("upstream {}: {e}", origin.authority());
-            let untrusted = learn_from_failure(&state.ctx, &origin.name, &e);
-            (status(StatusCode::BAD_GATEWAY), untrusted)
+            state.log_upstream_failure(&origin.authority(), &e);
+            failure(state, origin, &e)
         }
     }
+}
+
+/// The answer to a request the upstream pool could not send. A TLS failure gets `502`
+/// (and may teach the proxy to pass the host through), no free upstream connection `503`,
+/// and an upstream that cannot be reached at all no response.
+fn failure(
+    state: &State,
+    origin: &Origin,
+    error: &UpstreamError,
+) -> Result<(Response<Body>, bool), NoResponse> {
+    if is_unreachable(error) {
+        return Err(NoResponse);
+    }
+    if let UpstreamError::Exhausted = error {
+        return Ok((status(StatusCode::SERVICE_UNAVAILABLE), false));
+    }
+    let untrusted = learn_from_failure(&state.ctx, &origin.name, error);
+    Ok((status(StatusCode::BAD_GATEWAY), untrusted))
 }

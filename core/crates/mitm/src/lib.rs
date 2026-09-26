@@ -19,6 +19,7 @@ mod proxy;
 mod request;
 mod rewind;
 mod shutdown;
+mod throttle;
 mod tunnel;
 mod upstream;
 mod websocket;

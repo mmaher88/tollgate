@@ -30,11 +30,14 @@ use crate::limits::{
     MAX_HEADER_LIST, MAX_HEADERS, MIN_IDLE_TO_RECLAIM,
 };
 use crate::shutdown::{self, Shutdown};
-use crate::upstream::{Pool, PoolOptions};
+use crate::throttle::LogThrottle;
+use crate::upstream::{Pool, PoolOptions, UpstreamError, is_unreachable};
 use crate::{CertAuthority, ServeOptions, connect, forward};
 
 /// TLS sessions remembered for resumption across intercepted connections.
 const TLS_SESSION_CACHE: usize = 256;
+/// An unreachable upstream host is logged at most once in this interval.
+const UNREACHABLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Everything the proxy needs from the engine that owns it.
 pub struct ProxyContext {
@@ -90,6 +93,8 @@ pub(crate) struct State {
     pub(crate) sessions: Arc<dyn StoresServerSessions>,
     /// Serves intercepted connections: HTTP/1.1 or HTTP/2, with the mandatory limits.
     pub(crate) server: auto::Builder<TokioExecutor>,
+    /// Keeps unreachable upstream hosts to one log line per host a minute.
+    pub(crate) unreachable_log: LogThrottle,
 }
 
 impl State {
@@ -100,6 +105,19 @@ impl State {
             .unwrap_or_else(PoisonError::into_inner);
         list.retain(|activity| activity.strong_count() > 0);
         list
+    }
+
+    /// Logs a failed upstream request to `authority`. An unreachable host is logged at info
+    /// level, which the tunnel's log shows, at most once a minute per host; anything else at
+    /// debug level.
+    pub(crate) fn log_upstream_failure(&self, authority: &str, error: &UpstreamError) {
+        if is_unreachable(error) {
+            if self.unreachable_log.allow(authority) {
+                log::info!("upstream {authority}: unreachable ({error})");
+            }
+        } else {
+            log::debug!("upstream {authority}: {error}");
+        }
     }
 
     /// Records an intercepted connection that completed its TLS handshake.
@@ -201,6 +219,7 @@ pub async fn serve_with_options(
         provider: Arc::new(rustls::crypto::ring::default_provider()),
         sessions: ServerSessionMemoryCache::new(TLS_SESSION_CACHE),
         server,
+        unreachable_log: LogThrottle::new(UNREACHABLE_LOG_INTERVAL),
         options,
     });
 

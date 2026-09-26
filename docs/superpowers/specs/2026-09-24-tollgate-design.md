@@ -385,6 +385,13 @@ about 5e-14 per lookup.
   at once when the provider wakes or the default network path changes. A GET, HEAD or
   OPTIONS without a body that fails on a reused connection before its response starts is
   sent once more on a new connection.
+- An intercepted connection is answered (`CONNECT` 200 and TLS with our leaf) before the
+  upstream is dialed. When the dial for a request then fails without TLS being involved
+  (the name does not resolve, the connection is refused, reset or times out), the request
+  gets no response: HTTP/1.1 closes the connection and HTTP/2 resets the stream, so the
+  browser shows its own error page or falls back from `https://` to `http://`, as without
+  the proxy. The host is logged at info level, at most once a minute. No free upstream
+  connection gets `503`; upstream TLS failures get `502` (see pin learning).
 - WebSockets over intercepted HTTPS are forwarded over a dedicated HTTP/1.1 upstream
   connection.
 - Passthrough tunnels and WebSocket relays outlive a wake or a path change unless their

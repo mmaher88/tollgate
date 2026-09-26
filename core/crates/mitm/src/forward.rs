@@ -42,7 +42,7 @@ pub(crate) async fn forward(state: &State, request: Request<Incoming>) -> Respon
     {
         Ok(response) => response,
         Err(e) => {
-            log::debug!("upstream {}: {e}", target.authority());
+            state.log_upstream_failure(&target.authority(), &e);
             // No connection to close: requests here are not tunneled.
             let _ = learn_from_failure(&state.ctx, &target.server_name, &e);
             status(StatusCode::BAD_GATEWAY)
