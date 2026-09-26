@@ -1,5 +1,6 @@
 import Foundation
 import NetworkExtension
+import UIKit
 import os
 
 /// Owns the single NETunnelProviderManager for the Tollgate tunnel.
@@ -18,9 +19,20 @@ final class TunnelController: ObservableObject {
     private var loading: Task<Void, Never>?
     /// The last `restartIfRunning` call, so restarts do not overlap.
     private var restarting: Task<Void, Never>?
+    /// True while `restartNow` has Connect On Demand turned off on purpose, so `loadNow`
+    /// (run by the configuration-change observer meanwhile) does not turn it back on.
+    private var restartInProgress = false
     private var statusObserver: NSObjectProtocol?
     private var configurationObserver: NSObjectProtocol?
     private let log = Logger(subsystem: "dev.tollgate.app", category: "tunnel")
+
+    /// Set while a restart has Connect On Demand turned off. If the app is suspended or
+    /// killed before the restart turns it back on, the next load does, so the tunnel does
+    /// not stay off until the user notices.
+    private static let onDemandPausedKey = "tunnel.onDemandPausedForRestart"
+    /// Set when new lists were compiled in the background and the tunnel needed a restart
+    /// to use them; the next time the app is active, `applyPendingListUpdate` does it.
+    private static let listsPendingKey = "tunnel.listsPendingRestart"
 
     private var tunnelBundleIdentifier: String {
         (Bundle.main.bundleIdentifier ?? "") + ".tunnel"
@@ -66,6 +78,7 @@ final class TunnelController: ObservableObject {
                     try? await duplicate.removeFromPreferences()
                 }
                 attach(existing)
+                await restoreOnDemandAfterInterruptedRestart(existing)
                 return
             }
             guard createIfMissing else {
@@ -85,6 +98,28 @@ final class TunnelController: ObservableObject {
             attach(manager)
         } catch {
             report(error, context: createIfMissing ? "turn on" : "load")
+        }
+    }
+
+    /// Turns Connect On Demand back on, and starts the tunnel, when a restart turned it off
+    /// and did not get to turn it on again (the app was suspended or killed meanwhile).
+    private func restoreOnDemandAfterInterruptedRestart(_ manager: NETunnelProviderManager) async {
+        let defaults = UserDefaults.standard
+        guard !restartInProgress, defaults.bool(forKey: Self.onDemandPausedKey) else { return }
+        defaults.removeObject(forKey: Self.onDemandPausedKey)
+        guard !manager.isOnDemandEnabled else { return }
+        log.info("turning Connect On Demand back on after an interrupted restart")
+        do {
+            manager.isEnabled = true
+            manager.onDemandRules = [NEOnDemandRuleConnect()]
+            manager.isOnDemandEnabled = true
+            try await manager.saveToPreferences()
+            try await manager.loadFromPreferences()
+            if manager.connection.status == .disconnected || manager.connection.status == .invalid {
+                try manager.connection.startVPNTunnel()
+            }
+        } catch {
+            report(error, context: "turning protection back on")
         }
     }
 
@@ -124,6 +159,9 @@ final class TunnelController: ObservableObject {
         guard !busy else { return }
         busy = true
         defer { busy = false }
+        // An explicit Turn off wins over an interrupted restart, so the load below does not
+        // turn Connect On Demand back on first.
+        UserDefaults.standard.removeObject(forKey: Self.onDemandPausedKey)
         await load()
         guard let manager else { return }
         do {
@@ -178,6 +216,10 @@ final class TunnelController: ObservableObject {
             return
         }
 
+        // The restart must finish even if the user leaves the app right away (as after
+        // "Never block"); if iOS still suspends it, the next load turns on-demand back on.
+        let backgroundTime = BackgroundTime(name: "tunnel-restart")
+        defer { backgroundTime.end() }
         if clearingLearnedPins, manager.connection.status == .connected,
            case .engine(let learned) = await pins(), !learned.isEmpty {
             // A second safeguard: the engine saves the empty set at once and again on stop.
@@ -186,12 +228,16 @@ final class TunnelController: ObservableObject {
         // Without this, iOS starts a new tunnel as soon as this one stops, and its engine
         // would read learned-pins.json before it is removed.
         let onDemand = manager.isOnDemandEnabled
+        restartInProgress = true
+        defer { restartInProgress = false }
         if onDemand {
+            UserDefaults.standard.set(true, forKey: Self.onDemandPausedKey)
             manager.isOnDemandEnabled = false
             do {
                 try await manager.saveToPreferences()
             } catch {
                 manager.isOnDemandEnabled = true
+                UserDefaults.standard.removeObject(forKey: Self.onDemandPausedKey)
                 report(error, context: "restart")
                 return
             }
@@ -210,8 +256,10 @@ final class TunnelController: ObservableObject {
             manager.isOnDemandEnabled = true
             do {
                 try await manager.saveToPreferences()
+                UserDefaults.standard.removeObject(forKey: Self.onDemandPausedKey)
                 try await manager.loadFromPreferences()
             } catch {
+                // The flag stays set, so the next load tries again.
                 report(error, context: "restart: turning Connect On Demand back on")
             }
         }
@@ -238,21 +286,42 @@ final class TunnelController: ObservableObject {
     /// Applies freshly compiled lists. The core only enables HTTPS filtering when the engine
     /// is created (it needs engine.dat then), so a running engine that could not enable it,
     /// or one that was still starting, is restarted; otherwise the lists are reloaded in place.
+    /// In the background (the refresh task) a restart is left for the next time the app is
+    /// active (`applyPendingListUpdate`): it could be cut short when the background time
+    /// runs out, and would leave protection off until then.
     func listsUpdated() async {
+        UserDefaults.standard.removeObject(forKey: Self.listsPendingKey)
         switch status {
         case .connected:
             await refreshStats()
             if CoreConfig.load().mitmEnabled, stats?.httpsFilteringActive == false {
-                await restartIfRunning()
+                await restartUnlessInBackground()
             } else if let data = await send(.reloadLists) {
                 let reply = String(decoding: data, as: UTF8.self)
                 if reply != "ok" { lastError = "reload lists: \(reply)" }
             }
         case .connecting, .reasserting:
-            await restartIfRunning()
+            await restartUnlessInBackground()
         default:
             break // off: the next start loads the new files
         }
+    }
+
+    private func restartUnlessInBackground() async {
+        if UIApplication.shared.applicationState == .background {
+            log.info("new lists need a tunnel restart; leaving it for the next time the app is active")
+            UserDefaults.standard.set(true, forKey: Self.listsPendingKey)
+            return
+        }
+        await restartIfRunning()
+    }
+
+    /// Applies lists compiled in the background whose restart was left for later. Call it
+    /// when the app becomes active.
+    func applyPendingListUpdate() async {
+        guard UserDefaults.standard.bool(forKey: Self.listsPendingKey) else { return }
+        await load()
+        await listsUpdated()
     }
 
     func refreshStats() async {
@@ -388,5 +457,25 @@ final class TunnelController: ObservableObject {
     private func report(_ error: Error, context: String) {
         log.error("\(context, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
         lastError = "\(context): \(error.localizedDescription)"
+    }
+}
+
+/// Background execution time for work that must not stop halfway, such as a tunnel
+/// restart. Ended by `end()` or when the time runs out, whichever comes first.
+@MainActor
+private final class BackgroundTime {
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+
+    init(name: String) {
+        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            // Out of time: the work goes on when the app is next resumed.
+            MainActor.assumeIsolated { self?.end() }
+        }
+    }
+
+    func end() {
+        guard identifier != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(identifier)
+        identifier = .invalid
     }
 }

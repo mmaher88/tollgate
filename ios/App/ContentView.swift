@@ -25,6 +25,7 @@ struct ContentView: View {
                 await certificate.prepare()
                 enforceTrust()
                 updateListsIfMissing()
+                await tunnel.applyPendingListUpdate()
             }
             .task(id: tunnel.status) {
                 heartbeat = TunnelHeartbeat.read()
@@ -40,6 +41,7 @@ struct ContentView: View {
                     await certificate.refreshTrust()
                     enforceTrust()
                     updateListsIfMissing()
+                    await tunnel.applyPendingListUpdate()
                 }
             }
         }
