@@ -138,7 +138,7 @@ impl State {
             .min_by_key(|(since, _)| *since);
         match oldest {
             Some((_, activity)) => {
-                activity.request_close();
+                activity.request_reclaim();
                 true
             }
             None => false,
@@ -280,8 +280,10 @@ async fn serve_client(state: Arc<State>, tcp: TcpStream) {
         conn.graceful_shutdown()
     })
     .await;
-    if let Err(e) = result {
-        log::debug!("client connection: {e}");
+    match result {
+        Some(Err(e)) => log::debug!("client connection: {e}"),
+        Some(Ok(())) => {}
+        None => log::debug!("client connection did not close in time, dropped"),
     }
 }
 

@@ -3,13 +3,16 @@
 
 mod support;
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use hyper::{StatusCode, Version};
 use rustls::ClientConnection;
 use rustls::pki_types::ServerName;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tollgate_mitm::{CertAuthority, limits};
 use tollgate_policy::Config;
 
@@ -365,6 +368,91 @@ async fn a_full_table_closes_the_longest_idle_connection_for_a_new_one() {
         "{}",
         reply.body
     );
+}
+
+/// IO that stops reading and writing once frozen, like a client whose app iOS suspended.
+struct Freezable<T> {
+    io: T,
+    frozen: Arc<AtomicBool>,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Freezable<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.frozen.load(Ordering::Relaxed) {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Freezable<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.frozen.load(Ordering::Relaxed) {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.frozen.load(Ordering::Relaxed) {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.frozen.load(Ordering::Relaxed) {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn a_full_table_reclaims_the_slot_of_a_suspended_http2_client() {
+    let ca = Arc::new(CertAuthority::generate("Tollgate Test CA").unwrap());
+    let origin_ca = Arc::new(CertAuthority::generate("Origin CA").unwrap());
+    let origin = tls_origin::https(origin_ca.clone(), &[b"h2"]).await;
+    let mut ctx = proxy::context(ca.clone(), &Config::default(), None);
+    ctx.max_intercepted = 1;
+    let proxy = proxy::start(ctx, tls_origin::trusting(&origin_ca)).await;
+    let target = format!("127.0.0.1:{}", origin.port());
+    let url = format!("https://www.tollgate.test:{}/", origin.port());
+
+    // One request, then the client neither reads nor writes: it never answers the ping of
+    // a graceful HTTP/2 shutdown.
+    let tcp = connect(proxy.addr, &target).await;
+    let tls = tls(tcp, tls_config(&[&ca], &[b"h2"]), "www.tollgate.test")
+        .await
+        .unwrap();
+    let frozen = Arc::new(AtomicBool::new(false));
+    let mut suspended = http2(Freezable {
+        io: tls,
+        frozen: frozen.clone(),
+    })
+    .await;
+    assert_eq!(
+        send2(&mut suspended, get(&url, &[])).await.status,
+        StatusCode::OK
+    );
+    frozen.store(true, Ordering::Relaxed);
+    tokio::time::sleep(limits::MIN_IDLE_TO_RECLAIM + Duration::from_millis(300)).await;
+
+    let issuer = issuer_via(proxy.addr, &target, &[&ca, &origin_ca], "www.tollgate.test").await;
+    assert_eq!(issuer, "CN=Tollgate Test CA, O=Tollgate");
+    let stats = proxy.stats();
+    assert_eq!(stats.connections_intercepted, 2);
+    assert_eq!(stats.connections_passthrough, 0);
+    assert_eq!(stats.tls_abandoned_after_handshake, 0);
+    drop(suspended);
 }
 
 #[tokio::test]

@@ -40,8 +40,10 @@ use crate::rewind::Rewind;
 use crate::tunnel::{Ended, copy_until_idle, until_path_gone};
 use crate::upstream::{UpstreamError, connect_tcp};
 
-/// How long a new connection waits for the slot of an idle one it asked to close.
+/// How long a new connection waits for the slot of an idle one it asked to close. Longer
+/// than the connection may take to close before it is dropped.
 const RECLAIM_WAIT: Duration = Duration::from_millis(100);
+const _: () = assert!(crate::idle::RECLAIM_GRACE.as_millis() * 2 <= RECLAIM_WAIT.as_millis());
 
 pub(crate) async fn connect(state: &Arc<State>, request: Request<Incoming>) -> Response<Body> {
     let Some(authority) = request.uri().authority() else {

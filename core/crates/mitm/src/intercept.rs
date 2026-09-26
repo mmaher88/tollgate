@@ -126,8 +126,13 @@ pub(crate) async fn intercept<C>(
             origin.name
         );
     }
-    if let Err(e) = result {
-        log::debug!("intercepted connection to {}: {e}", origin.name);
+    match result {
+        Some(Err(e)) => log::debug!("intercepted connection to {}: {e}", origin.name),
+        Some(Ok(())) => {}
+        None => log::debug!(
+            "intercepted connection to {}: the client did not close in time, dropped",
+            origin.name
+        ),
     }
 }
 
