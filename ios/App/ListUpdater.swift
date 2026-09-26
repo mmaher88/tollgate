@@ -56,12 +56,13 @@ final class ListUpdater: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
-        lastUpdated = defaults.object(forKey: Self.lastUpdatedKey) as? Date
+        let updated = defaults.object(forKey: Self.lastUpdatedKey) as? Date
+        pendingSettingsChange = defaults.bool(forKey: Self.pendingKey)
+        lastUpdated = updated
         // Installs from before attempts were recorded: their last success was an attempt.
-        lastAttempt = defaults.object(forKey: Self.lastAttemptKey) as? Date ?? lastUpdated
+        lastAttempt = defaults.object(forKey: Self.lastAttemptKey) as? Date ?? updated
         lastAttemptPartial = defaults.bool(forKey: Self.lastAttemptPartialKey)
         warnings = defaults.stringArray(forKey: Self.warningsKey) ?? []
-        pendingSettingsChange = defaults.bool(forKey: Self.pendingKey)
     }
 
     /// Whether an automatic full update is due. Based on the last attempt, not the last
