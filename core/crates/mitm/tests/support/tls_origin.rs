@@ -127,6 +127,22 @@ pub async fn failing(ca: Arc<CertAuthority>, alpn: &[&[u8]]) -> Origin {
     .await
 }
 
+/// An HTTP/2 TLS origin that resets every request's stream with `reason` before any
+/// response, as IIS does with HTTP_1_1_REQUIRED for Windows authentication.
+pub async fn h2_reset(ca: Arc<CertAuthority>, reason: h2::Reason) -> Origin {
+    let acceptor = acceptor(ca, &[b"h2"], rustls::DEFAULT_VERSIONS, ClientAuth::None);
+    serve_tls(acceptor, move |tls, _, counters| async move {
+        let Ok(mut conn) = h2::server::handshake(tls).await else {
+            return;
+        };
+        while let Some(Ok((_, mut respond))) = conn.accept().await {
+            counters.requests.fetch_add(1, Ordering::SeqCst);
+            respond.send_reset(reason);
+        }
+    })
+    .await
+}
+
 fn acceptor(
     ca: Arc<CertAuthority>,
     alpn: &[&[u8]],

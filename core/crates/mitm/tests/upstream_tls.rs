@@ -9,8 +9,9 @@ use std::sync::Arc;
 use hyper::StatusCode;
 use rustls::SupportedProtocolVersion;
 use rustls::version::{TLS12, TLS13};
+use tollgate_common::clock::unix_secs;
 use tollgate_mitm::CertAuthority;
-use tollgate_policy::Config;
+use tollgate_policy::{Config, Decision, PassthroughReason};
 
 use support::client::{get, proxy_get, proxy_get_raw, wait_for};
 use support::tls_origin::{self, ClientAuth, HangUp};
@@ -210,4 +211,44 @@ async fn a_closed_port_is_still_not_learned() {
     let response = proxy_get_raw(proxy.addr, &format!("https://localhost:{port}/")).await;
     assert_eq!(String::from_utf8_lossy(&response), "");
     assert!(learned(&proxy).is_empty());
+}
+
+/// IIS resets a request's stream with HTTP_1_1_REQUIRED when it needs HTTP/1.1, for
+/// Windows authentication or a client certificate. The pool cannot carry that
+/// connection-bound state, so the host is passed through and the client falls back to
+/// HTTP/1.1 itself; the reason is passed on to it. Other resets are not learned.
+#[tokio::test]
+async fn an_http2_server_that_requires_http1_is_learned() {
+    for (reason, learn) in [
+        (h2::Reason::HTTP_1_1_REQUIRED, true),
+        (h2::Reason::PROTOCOL_ERROR, false),
+        (h2::Reason::REFUSED_STREAM, false),
+    ] {
+        let origin_ca = ca("Origin CA");
+        let origin = tls_origin::h2_reset(origin_ca.clone(), reason).await;
+        let tollgate_ca = ca("Tollgate Test CA");
+        let ctx = proxy::context(tollgate_ca.clone(), &Config::default(), None);
+        let proxy = proxy::start(ctx, tls_origin::trusting(&origin_ca)).await;
+        let target = format!("localhost:{}", origin.port());
+        let tcp = connect(proxy.addr, &target).await;
+        let tls = tls(tcp, tls_config(&[&tollgate_ca], &[b"h2"]), "localhost")
+            .await
+            .unwrap();
+        let mut sender = http2(tls).await;
+        let url = format!("https://localhost:{}/", origin.port());
+        let result = sender.send_request(get(&url, &[])).await;
+        let decision = proxy.ctx.policy.classify("localhost", unix_secs());
+        if learn {
+            let error = result.expect_err("no response");
+            assert_eq!(reset_reason(&error), Some(reason));
+            assert_eq!(
+                decision,
+                Decision::Passthrough(PassthroughReason::LearnedPin)
+            );
+            wait_for("the connection to close", || sender.is_closed()).await;
+        } else {
+            assert_eq!(decision, Decision::Intercept, "{reason:?}");
+            assert!(learned(&proxy).is_empty(), "{reason:?}");
+        }
+    }
 }

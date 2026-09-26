@@ -435,10 +435,14 @@ about 5e-14 per lookup.
   intermediate fetching), a server the proxy's TLS client shares no version or cipher suite
   with, or one that requires a client certificate (it asked for one and then failed the
   TLS 1.2 handshake, or sent a fatal TLS 1.3 alert in place of the first response; any
-  other failure after an optional request, such as a reset, teaches nothing) makes the SNI
+  other failure after an optional request, such as a reset, teaches nothing), or an HTTP/2
+  server that resets a request's stream with HTTP_1_1_REQUIRED (IIS with Windows
+  authentication or client certificate renegotiation: the shared pool cannot carry that
+  connection-bound state, and there is no HTTP/1.1 fallback inside it) makes the SNI
   name a learned pin at once;
   the request that failed gets no response (HTTP/1.1 closes the connection; HTTP/2 resets
-  the stream with REFUSED_STREAM, since the upstream never processed it, and sends GOAWAY),
+  the stream with REFUSED_STREAM, since the upstream never processed it, or with
+  HTTP_1_1_REQUIRED when that was the server's answer, and sends GOAWAY),
   so the browser retries on a new connection or shows its own error page (and may fall back
   from `https://` to `http://`) instead of an empty `502`, and later connections are passed
   through for the client to handle. When such a failure is not learned (the burst guard

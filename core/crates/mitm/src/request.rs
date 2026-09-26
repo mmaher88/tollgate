@@ -15,7 +15,7 @@ use crate::idle::InFlight;
 use crate::intercept::Origin;
 use crate::proxy::State;
 use crate::upstream::{
-    UpstreamError, certificate_problem, closed_without_response, is_unreachable,
+    UpstreamError, certificate_problem, closed_without_response, http11_required, is_unreachable,
     is_unverified_certificate, learn_from_failure, needs_passthrough,
 };
 use crate::websocket;
@@ -177,8 +177,19 @@ fn failure(
     if let UpstreamError::Exhausted = error {
         return Ok((status(StatusCode::SERVICE_UNAVAILABLE), false));
     }
+    let http11 = http11_required(error);
     if learn_from_failure(&state.ctx, &origin.name, error) {
-        return Err(NoResponse::passed_through(h2::Reason::REFUSED_STREAM));
+        // An HTTP/2 client that learns HTTP/1.1 is required retries over HTTP/1.1 on a new
+        // connection, which is now passed through, so it talks to the server itself.
+        let reason = if http11 {
+            h2::Reason::HTTP_1_1_REQUIRED
+        } else {
+            h2::Reason::REFUSED_STREAM
+        };
+        return Err(NoResponse::passed_through(reason));
+    }
+    if http11 {
+        return Err(NoResponse::Closed);
     }
     Ok((bad_gateway(error), false))
 }
@@ -202,7 +213,7 @@ pub(crate) fn bad_gateway(error: &UpstreamError) -> Response<Body> {
             format!("Tollgate: the server's certificate {problem}, so this site was not loaded.\n"),
         );
     }
-    if needs_passthrough(error) {
+    if needs_passthrough(error) && !http11_required(error) {
         let what = if is_unverified_certificate(error) {
             "the server's certificate could not be verified"
         } else {

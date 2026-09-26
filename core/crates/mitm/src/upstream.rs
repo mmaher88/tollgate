@@ -100,12 +100,16 @@ impl Target {
 /// probably would not have: the server's certificate could not be verified (unknown
 /// issuer, missing intermediate, a root only the system trusts), the server shares no
 /// protocol version or cipher suite with the proxy's TLS client (old TLS, CBC-only), or
-/// it requires a client certificate the proxy cannot present. Timeouts, connection
-/// failures, HTTP errors and other TLS alerts are not, and neither is a certificate for
-/// another name, outside its validity dates, revoked or for another purpose: the client
-/// would reject it too, and it is what a captive portal or a wrong device clock produces.
+/// it requires a client certificate the proxy cannot present. So is an HTTP/2 server that
+/// requires HTTP/1.1 (see [`http11_required`]). Timeouts, connection failures, other HTTP
+/// errors and other TLS alerts are not, and neither is a certificate for another name,
+/// outside its validity dates, revoked or for another purpose: the client would reject it
+/// too, and it is what a captive portal or a wrong device clock produces.
 pub(crate) fn needs_passthrough(error: &UpstreamError) -> bool {
     if let UpstreamError::ClientCertificate(_) = error {
+        return true;
+    }
+    if http11_required(error) {
         return true;
     }
     if let Some(rustls::Error::InvalidCertificate(certificate)) = rustls_error(error) {
@@ -187,16 +191,38 @@ pub(crate) fn is_unreachable(error: &UpstreamError) -> bool {
     }
 }
 
+/// True when the server reset the HTTP/2 stream (or sent GOAWAY) with HTTP_1_1_REQUIRED,
+/// as IIS does for Windows authentication (NTLM, Negotiate) or TLS renegotiation for a
+/// client certificate. A direct client retries such a request over HTTP/1.1, on a
+/// connection it keeps for that state; the shared pool cannot carry connection-bound
+/// authentication faithfully, so the host is passed through instead.
+pub(crate) fn http11_required(error: &UpstreamError) -> bool {
+    let UpstreamError::Http(http) = error else {
+        return false;
+    };
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(http);
+    while let Some(error) = next {
+        if let Some(h2) = error.downcast_ref::<h2::Error>() {
+            return (h2.is_reset() || h2.is_go_away())
+                && h2.is_remote()
+                && h2.reason() == Some(h2::Reason::HTTP_1_1_REQUIRED);
+        }
+        next = error.source();
+    }
+    false
+}
+
 /// True when the server took the request and then closed or reset the connection, reset
 /// the HTTP/2 stream or sent GOAWAY, before any response: the client, talking to the server
 /// itself, would have seen a closed connection too. A TLS alert, a malformed response, a
-/// stream reset with PROTOCOL_ERROR (which the proxy may have caused) and a lack of
-/// permits are not included, and neither is a client certificate requirement.
+/// stream reset with PROTOCOL_ERROR (which the proxy may have caused) or HTTP_1_1_REQUIRED
+/// (see [`http11_required`]) and a lack of permits are not included, and neither is a
+/// client certificate requirement.
 pub(crate) fn closed_without_response(error: &UpstreamError) -> bool {
     let UpstreamError::Http(http) = error else {
         return false;
     };
-    if rustls_error(error).is_some() {
+    if rustls_error(error).is_some() || http11_required(error) {
         return false;
     }
     // hyper reports a connection that closed before the request was written as canceled,
@@ -268,7 +294,11 @@ pub(crate) fn learn_from_failure(ctx: &ProxyContext, name: &str, error: &Upstrea
     }
     let now = tollgate_common::clock::unix_secs();
     if ctx.policy.learn_upstream_untrusted(name, now) {
-        log::info!("{name}: upstream TLS failed ({error}); passing it through from now on");
+        if http11_required(error) {
+            log::info!("{name}: requires HTTP/1.1 (connection-bound auth); passing through");
+        } else {
+            log::info!("{name}: upstream TLS failed ({error}); passing it through from now on");
+        }
     }
     // Not a pin when the failure was part of a burst (see `learn_upstream_untrusted`).
     matches!(ctx.policy.classify(name, now), Decision::Passthrough(_))
