@@ -20,7 +20,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tollgate_common::events::EventLog;
 use tollgate_common::stats::Stats;
-use tollgate_filter::FilterEngine;
+use tollgate_filter::{DomainSet, FilterEngine};
 use tollgate_policy::Policy;
 
 use crate::body::{Body, DoneBody};
@@ -39,6 +39,9 @@ const TLS_SESSION_CACHE: usize = 256;
 pub struct ProxyContext {
     pub policy: Arc<Policy>,
     pub filter: ArcSwapOption<FilterEngine>,
+    /// The DNS blocklist, the same one the tunnel's DNS responder uses. Clients using the
+    /// proxy do not look names up themselves, so the proxy refuses blocked hosts itself.
+    pub domains: ArcSwapOption<DomainSet>,
     pub ca: Arc<CertAuthority>,
     pub stats: Arc<Stats>,
     pub max_intercepted: usize,

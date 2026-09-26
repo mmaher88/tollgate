@@ -351,6 +351,12 @@ drops redundant children of blocked parents. The false positive rate is about 5e
   sent once more on a new connection.
 - WebSockets over intercepted HTTPS are forwarded over a dedicated HTTP/1.1 upstream
   connection.
+- Clients using the proxy send it host names instead of looking them up, so the proxy checks
+  the DNS blocklist itself (`ProxyContext::domains`, the same `DomainSet` the DNS responder
+  uses, swapped together on reload): the `CONNECT` host before classification (passthrough
+  hosts included), a TLS server name that differs from it, and absolute-form hosts. A block
+  answers `403` (or closes the tunnel for a server name), never dials, counts in
+  `dns_blocked` and is recorded as a DNS block. The allowlist applies.
 - HTTP/2 requests whose authority does not match the connection's SNI get `421 Misdirected
   Request`.
 - The CA certificate and key are stored as PEM; leaves are issued from the stored certificate

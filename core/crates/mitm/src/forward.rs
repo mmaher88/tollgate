@@ -5,7 +5,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 
 use crate::body::{Body, blocked, status};
-use crate::filtering::is_blocked;
+use crate::filtering::{is_blocked, is_domain_blocked};
 use crate::http::bare_host;
 use crate::proxy::State;
 use crate::upstream::Target;
@@ -22,6 +22,9 @@ pub(crate) async fn forward(state: &State, request: Request<Incoming>) -> Respon
     let Some(host) = uri.host().map(bare_host) else {
         return status(StatusCode::BAD_REQUEST);
     };
+    if is_domain_blocked(&state.ctx, host) {
+        return blocked();
+    }
     let target = Target {
         tls,
         host: host.to_string(),

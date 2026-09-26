@@ -1,4 +1,7 @@
-//! Checking one request against the allowlist and the filter engine.
+//! Checking one request against the allowlist and the filter engine, and a host against
+//! the DNS blocklist.
+
+use std::net::IpAddr;
 
 use hyper::HeaderMap;
 use tollgate_common::clock::unix_secs;
@@ -60,6 +63,41 @@ pub(crate) fn is_blocked(
             true
         }
     }
+}
+
+/// True when the DNS blocklist blocks `host` and the allowlist does not cover it: the same
+/// decision the tunnel's DNS responder makes for a lookup of the name. Clients that use the
+/// proxy send it the name instead of looking it up, so without this check names that only
+/// the DNS lists block would load. A block counts in `dns_blocked` and is recorded as a DNS
+/// block. IP addresses are never blocked.
+pub(crate) fn is_domain_blocked(ctx: &ProxyContext, host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if bare.is_empty() || bare.parse::<IpAddr>().is_ok() {
+        return false;
+    }
+    let domains = ctx.domains.load();
+    let Some(domains) = domains.as_ref() else {
+        return false;
+    };
+    if !domains.is_blocked(bare) || ctx.policy.is_allowlisted(bare) {
+        return false;
+    }
+    Stats::inc(&ctx.stats.dns_blocked);
+    log::debug!("blocked host {bare} by the DNS blocklist");
+    if let Some(events) = &ctx.events {
+        events.record(BlockEvent {
+            unix_secs: unix_secs(),
+            kind: EventKind::Dns,
+            host: bare.to_ascii_lowercase(),
+            url: None,
+            source_host: None,
+        });
+    }
+    true
 }
 
 /// The host of an absolute URL, without userinfo, port, IPv6 brackets or a trailing dot.

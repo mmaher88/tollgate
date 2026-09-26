@@ -45,6 +45,7 @@ pub fn context(ca: Arc<CertAuthority>, config: &Config, rules: Option<&str>) -> 
     ProxyContext {
         policy: Arc::new(Policy::new(config, None).unwrap()),
         filter: ArcSwapOption::new(filter),
+        domains: ArcSwapOption::empty(),
         ca,
         stats: Arc::new(Stats::default()),
         max_intercepted: config.max_intercepted_connections as usize,

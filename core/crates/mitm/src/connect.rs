@@ -1,5 +1,8 @@
 //! `CONNECT`: classify, then tunnel the bytes untouched or intercept TLS.
 //!
+//! A host the DNS blocklist blocks gets `403`, whether it would be intercepted or passed
+//! through, and so does a TLS server name that differs from it.
+//!
 //! The host is classified from the `CONNECT` target first; a passthrough host is tunneled
 //! without reading anything. Otherwise the first bytes are read and kept for replay.
 //! Non-TLS traffic, and a client that waits for the server to speak first, is tunneled
@@ -20,7 +23,8 @@ use tollgate_common::clock::unix_secs;
 use tollgate_common::stats::Stats;
 use tollgate_policy::{Decision, PassthroughReason};
 
-use crate::body::{Body, status};
+use crate::body::{Body, blocked, status};
+use crate::filtering::is_domain_blocked;
 use crate::hello::{self, HelloError};
 use crate::http::bare_host;
 use crate::intercept::{self, Origin};
@@ -36,6 +40,9 @@ pub(crate) async fn connect(state: &Arc<State>, request: Request<Incoming>) -> R
     let host = bare_host(authority.host()).to_string();
     let port = authority.port_u16().unwrap_or(443);
 
+    if is_domain_blocked(&state.ctx, &host) {
+        return blocked();
+    }
     if let Decision::Passthrough(reason) = state.ctx.policy.classify(&host, unix_secs()) {
         // Dial before answering, so an unreachable host gets 502 instead of a dead tunnel.
         let upstream = match dial(state, &host, port).await {
@@ -138,10 +145,13 @@ where
         .server_name
         .clone()
         .unwrap_or_else(|| host.to_string());
-    if !name.eq_ignore_ascii_case(host)
-        && let Decision::Passthrough(reason) = state.ctx.policy.classify(&name, unix_secs())
-    {
-        return Plan::Tunnel(format!("{reason:?} for {name}"));
+    if !name.eq_ignore_ascii_case(host) {
+        if is_domain_blocked(&state.ctx, &name) {
+            return Plan::Close;
+        }
+        if let Decision::Passthrough(reason) = state.ctx.policy.classify(&name, unix_secs()) {
+            return Plan::Tunnel(format!("{reason:?} for {name}"));
+        }
     }
     if !hello.offers_http() {
         return not_tls();

@@ -198,6 +198,8 @@ impl Engine {
                 domains.as_ref().map_or(0, |set| set.len())
             );
             self.proxy.filter.store(filter);
+            // One set for both: the proxy checks the hosts proxied clients never look up.
+            self.proxy.domains.store(domains.clone());
             self.dns.set_blocklist(domains);
             Ok(())
         })
@@ -335,6 +337,7 @@ impl Engine {
         let proxy = Arc::new(ProxyContext {
             policy: Arc::new(policy),
             filter: ArcSwapOption::new(filter),
+            domains: ArcSwapOption::new(domains.clone()),
             ca: Arc::new(ca),
             stats: stats.clone(),
             max_intercepted: config.max_intercepted_connections as usize,

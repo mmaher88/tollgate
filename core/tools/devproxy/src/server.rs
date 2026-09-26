@@ -147,12 +147,15 @@ impl DevProxy {
             .map(|p| HostPattern::parse(p))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
+        let domains = domains.map(Arc::new);
         let stats = Arc::new(Stats::default());
         // One blocked log for the proxy and the DNS responder, like the tunnel.
         let events = Arc::new(EventLog::new());
         let ctx = Arc::new(ProxyContext {
             policy: Arc::new(policy),
             filter: ArcSwapOption::new(filter.map(Arc::new)),
+            // The same set as the DNS responder, like the tunnel.
+            domains: ArcSwapOption::new(domains.clone()),
             ca: Arc::new(ca),
             stats: stats.clone(),
             max_intercepted: config.max_intercepted_connections as usize,
@@ -160,7 +163,7 @@ impl DevProxy {
             events: Some(events.clone()),
             upstream_resets: Default::default(),
         });
-        let dns = Arc::new(DnsHandler::new(domains.map(Arc::new), stats));
+        let dns = Arc::new(DnsHandler::new(domains, stats));
         dns.set_allowlist(allowlist);
         dns.set_events(Some(events));
         let dns_socket = bind_udp(args.dns).map_err(text(format!("DNS listener {}", args.dns)))?;
