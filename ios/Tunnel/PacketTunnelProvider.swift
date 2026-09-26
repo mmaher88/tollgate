@@ -11,6 +11,8 @@ import os
 /// which filters requests and passes pinned and Apple hosts through untouched.
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let log = Logger(subsystem: "dev.tollgate.tunnel", category: "provider")
+    /// Shown as "Tunnel started" in the app, from the heartbeat and from each stats reply.
+    private let startedAt = Date()
     /// Read from the packet-flow callback queue and written from the provider queue. The
     /// packet read loop ends once it is nil.
     private let engineState = OSAllocatedUnfairLock<Engine?>(initialState: nil)
@@ -142,7 +144,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let available = os_proc_available_memory()
         log.info("startTunnel core=\(version, privacy: .public) proxy=\(port, privacy: .public) https_filtering=\(filtering, privacy: .public) available=\(available, privacy: .public)")
         try? TunnelHeartbeat(
-            startedAt: Date(), coreVersion: version,
+            startedAt: startedAt, coreVersion: version,
             sha256Probe: sha256Hex(data: Data("tollgate".utf8)), availableMemoryBytes: available
         ).write()
 
@@ -305,7 +307,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func currentStats() -> TunnelStats {
-        guard let engine else { return TunnelStats(availableMemoryBytes: os_proc_available_memory()) }
+        guard let engine else {
+            return TunnelStats(availableMemoryBytes: os_proc_available_memory(), tunnelStartedAt: startedAt)
+        }
         let s = engine.stats()
         return TunnelStats(
             dnsQueries: s.dnsQueries, dnsBlocked: s.dnsBlocked, dnsCacheHits: s.dnsCacheHits,
@@ -313,7 +317,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             httpRequests: s.httpRequests, httpBlocked: s.httpBlocked,
             connectionsIntercepted: s.connectionsIntercepted, connectionsPassthrough: s.connectionsPassthrough,
             tlsClientRejections: s.tlsClientRejections, tlsAbandonedAfterHandshake: s.tlsAbandonedAfterHandshake,
-            httpsFilteringActive: engine.mitmActive(), availableMemoryBytes: os_proc_available_memory())
+            httpsFilteringActive: engine.mitmActive(), availableMemoryBytes: os_proc_available_memory(),
+            tunnelStartedAt: startedAt)
     }
 
     /// Experiment E3. Allocates and dirties 4 MiB per step until jetsam kills the process.

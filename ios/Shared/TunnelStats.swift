@@ -18,4 +18,8 @@ struct TunnelStats: Codable, Equatable {
     var tlsAbandonedAfterHandshake: UInt64 = 0
     var httpsFilteringActive = false
     var availableMemoryBytes = 0
+    /// When the tunnel process that answered was created. Unlike the heartbeat file, it
+    /// always comes from the process that is running, so a restart the app did not see
+    /// (a jetsam kill and an on-demand restart while the app was suspended) still shows.
+    var tunnelStartedAt: Date?
 }

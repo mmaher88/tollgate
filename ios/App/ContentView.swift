@@ -31,13 +31,18 @@ struct ContentView: View {
                 heartbeat = TunnelHeartbeat.read()
                 if tunnel.status == .connected { updateListsIfMissing() }
                 while tunnel.status == .connected, !Task.isCancelled {
+                    // Read every time: a tunnel restarted while the app was suspended may
+                    // report the same status before and after.
+                    heartbeat = TunnelHeartbeat.read()
                     await tunnel.refreshStats()
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                 }
             }
             .onChange(of: scenePhase) { _, phase in
                 guard phase == .active else { return }
+                heartbeat = TunnelHeartbeat.read()
                 Task {
+                    await tunnel.refreshStats()
                     await certificate.refreshTrust()
                     enforceTrust()
                     updateListsIfMissing()
@@ -239,8 +244,8 @@ struct ContentView: View {
                 LabeledContent("DNS failures", value: stats.dnsFailed.formatted())
                 LabeledContent("Certificate rejections", value: stats.tlsClientRejections.formatted())
             }
-            if let heartbeat {
-                LabeledContent("Tunnel started", value: heartbeat.startedAt.formatted(date: .omitted, time: .standard))
+            if let startedAt = tunnel.stats?.tunnelStartedAt ?? heartbeat?.startedAt {
+                LabeledContent("Tunnel started", value: startedAt.formatted(date: .omitted, time: .standard))
             }
             Button("Ping tunnel") { Task { await tunnel.sendForDisplay(.ping) } }
                 .disabled(tunnel.status != .connected)
