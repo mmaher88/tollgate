@@ -321,7 +321,12 @@ drops redundant children of blocked parents. The false positive rate is about 5e
   closed connection is retried once, then the next upstream is tried, then the answer is
   SERVFAIL. At most 128 queries are in flight.
 - Responses are normalized to the requester: OPT is echoed only if the query had one, and
-  answers larger than the requester's UDP size are truncated with TC set.
+  answers larger than the requester's UDP size are trimmed: authority and additional records
+  go first, then answer records from the end, keeping the CNAME chain and as many whole
+  records of the final RRset as fit, without TC (RFC 2181 section 9). Nothing answers DNS
+  over TCP on the tunnel address, so a TC reply could not be retried; it is sent only when
+  not one record of the queried type fits. The cache key includes the requester's DO bit, so
+  answers with DNSSEC records never reach requesters that did not ask for them.
 
 **mitm.**
 - Built directly on hyper, hyper-util, tokio-rustls, rustls (ring provider only) and rcgen, not

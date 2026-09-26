@@ -43,6 +43,18 @@ pub struct ForwardJob {
     key: Box<[u8]>,
 }
 
+/// The cache key for a question: [`wire::question_key`] followed by the requester's DO bit.
+/// Answers to queries with DO carry DNSSEC records that RFC 3225 does not allow in replies
+/// to requesters without it, and the query goes upstream as the requester sent it, so the
+/// two kinds are cached apart.
+fn cache_key(key: &[u8], requester: &Requester) -> Box<[u8]> {
+    let dnssec_ok = requester.edns.is_some_and(|edns| edns.dnssec_ok);
+    let mut out = Vec::with_capacity(key.len() + 1);
+    out.extend_from_slice(key);
+    out.push(u8::from(dnssec_ok));
+    out.into_boxed_slice()
+}
+
 impl ForwardJob {
     /// The DNS message as the client sent it.
     pub fn query(&self) -> &[u8] {
@@ -167,7 +179,7 @@ impl DnsHandler {
             return reply(requester.blocked());
         }
         let key = wire::question_key(query, question_end);
-        if let Some((cached, elapsed)) = self.cache().get(&key, now) {
+        if let Some((cached, elapsed)) = self.cache().get(&cache_key(&key, &requester), now) {
             Stats::inc(&self.stats.dns_cache_hits);
             return reply(cached.render(&requester, elapsed));
         }
@@ -204,6 +216,7 @@ impl DnsHandler {
             Ok(upstream) => {
                 let payload = upstream.render(&requester, 0);
                 if upstream.cacheable() {
+                    let key = cache_key(&key, &requester);
                     self.cache().insert(key, upstream, now);
                 }
                 payload

@@ -1,6 +1,11 @@
 //! Writing replies. Local answers are built from the requester's own question bytes, and
 //! upstream answers are adapted to the requester, so both keep the requester's id, letter
 //! case and EDNS, and both are cut to the requester's UDP size.
+//!
+//! Nothing answers DNS over TCP on the tunnel's address, so a client that gets a truncated
+//! reply (TC) has no way to retry. Replies that are too big are trimmed instead: RFC 2181
+//! section 9 allows leaving out records that do not fit without setting TC, and a client
+//! that gets some of a name's addresses connects fine.
 
 use hickory_proto::op::Message;
 
@@ -21,6 +26,7 @@ pub(crate) const NOTIMP: u8 = 4;
 
 const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
+const TYPE_ANY: u16 = 255;
 const CLASS_IN: u16 = 1;
 const OPT_LEN: usize = 11;
 
@@ -140,11 +146,32 @@ impl Requester {
         self.build(self.local_flags(NOERROR), &record, 1)
     }
 
-    /// `reply` if it fits the requester's UDP size, otherwise the same header with TC set,
-    /// the question and OPT, and no records.
+    /// `reply` if it fits the requester's UDP size. Otherwise the authority and additional
+    /// records go, then answer records from the end, so the reply keeps the CNAME chain and
+    /// as many whole records of the final RRset as fit, without TC. Only when no record of
+    /// the queried type fits is it the same header with TC set, the question and OPT, and no
+    /// records. `reply` holds the requester's question (see [`Requester::build`]).
     fn fit(&self, reply: Vec<u8>) -> Vec<u8> {
-        if reply.len() <= self.udp_limit() {
+        let limit = self.udp_limit();
+        if reply.len() <= limit {
             return reply;
+        }
+        let question_end = HEADER_LEN + self.question.len();
+        let budget = limit - self.opt().map_or(0, |_| OPT_LEN);
+        if let Some(answers) = wire::answer_records(&reply, question_end) {
+            let (qtype, _) = self.qtype_and_class();
+            let fitting = answers.iter().take_while(|r| r.end <= budget).count();
+            let kept = &answers[..fitting];
+            let usable =
+                answers.is_empty() || kept.iter().any(|r| r.rtype == qtype || qtype == TYPE_ANY);
+            if usable {
+                // Compression pointers only point backwards, and the kept records start at
+                // the same offset in the new reply, so cutting at a record boundary keeps
+                // every name intact.
+                let end = kept.last().map_or(question_end, |r| r.end);
+                let flags = [reply[2] & !0x02, reply[3]];
+                return self.build(flags, &reply[question_end..end], fitting as u16);
+            }
         }
         self.build([reply[2] | 0x02, reply[3]], &[], 0)
     }
@@ -191,8 +218,8 @@ impl UpstreamAnswer {
     }
 
     /// NOERROR or NXDOMAIN, not truncated, and small enough that some requester gets it
-    /// whole. Larger answers (up to 64 KiB from DoH) always render truncated, so keeping
-    /// them would only cost memory.
+    /// whole. Larger answers (up to 64 KiB from DoH) would still render, trimmed, but the
+    /// cap keeps the cache within its memory budget (2,000 entries of at most 1,221 bytes).
     pub fn cacheable(&self) -> bool {
         matches!(self.bytes[3] & 0x0f, NOERROR | NXDOMAIN)
             && self.bytes[2] & 0x02 == 0

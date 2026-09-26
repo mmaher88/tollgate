@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use hickory_proto::op::{Edns, ResponseCode};
 use hickory_proto::rr::rdata::opt::EdnsOption;
-use hickory_proto::rr::rdata::{A, SOA};
+use hickory_proto::rr::rdata::{A, CNAME, NS, SOA, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use support::{
     a_record, checked_reply, client_v4, client_v6, decode, dns_v4, dns_v6, expect_forward, query,
@@ -127,8 +127,10 @@ fn opt_is_added_when_the_upstream_sent_none() {
 }
 
 #[test]
-fn large_answers_are_truncated_to_the_client_udp_size() {
-    // 40 A records: 12 + 17 + 40 * 16 = 669 bytes without OPT.
+fn large_answers_are_trimmed_to_the_client_udp_size() {
+    // 40 A records: 12 + 17 + 40 * 16 = 669 bytes without OPT. The tunnel has no DNS over
+    // TCP, so a truncated (TC) reply would leave the client with nothing: it gets as many
+    // whole records as fit instead, without TC.
     let cases = [
         (None, true),
         (Some((512, false)), true),
@@ -136,23 +138,30 @@ fn large_answers_are_truncated_to_the_client_udp_size() {
         (Some((1232, false)), false),
         (Some((4096, false)), false),
     ];
-    for (edns, truncated) in cases {
+    for (edns, trimmed) in cases {
         let (handler, _) = handler();
         let job = forward(&handler, 77, "Big.Example.", edns);
         let answer = upstream_answer(job.query(), many_a_records(40));
         let reply = checked_reply(&handler.complete(job, Ok(answer), NOW));
         let message = decode(&reply.payload);
-        assert_eq!(message.metadata.truncation, truncated, "{edns:?}");
+        assert!(!message.metadata.truncation, "{edns:?}");
         assert_eq!(message.metadata.id, 77);
         assert_eq!(message.queries[0].name().to_ascii(), "Big.Example.");
         assert_eq!(message.edns.is_some(), edns.is_some());
-        if truncated {
-            assert!(message.answers.is_empty());
-            let limit = edns.map_or(512, |(size, _)| usize::from(size.clamp(512, 1232)));
-            assert!(reply.payload.len() <= limit);
+        let limit = edns.map_or(512, |(size, _)| usize::from(size.clamp(512, 1232)));
+        assert!(reply.payload.len() <= limit, "{edns:?}");
+        if trimmed {
+            assert!(!message.answers.is_empty(), "{edns:?}");
+            assert!(message.answers.len() < 40, "{edns:?}");
         } else {
             assert_eq!(message.answers.len(), 40);
         }
+        assert!(
+            message
+                .answers
+                .iter()
+                .all(|r| r.record_type() == RecordType::A)
+        );
     }
 }
 
@@ -163,10 +172,110 @@ fn replies_never_exceed_1232_bytes() {
     // 12 + 17 + 100 * 16 + 11 = 1640 bytes.
     let answer = upstream_answer(job.query(), many_a_records(100));
     let reply = checked_reply(&handler.complete(job, Ok(answer), NOW));
+    assert!(reply.payload.len() <= 1232);
+    let message = decode(&reply.payload);
+    assert!(!message.metadata.truncation);
+    assert!(!message.answers.is_empty());
+    assert_eq!(message.edns.map(|e| e.max_payload()), Some(1232));
+}
+
+fn ns_record(name: &str, host: &str) -> Record {
+    Record::from_rdata(
+        Name::from_ascii(name).unwrap(),
+        300,
+        RData::NS(NS(Name::from_ascii(host).unwrap())),
+    )
+}
+
+#[test]
+fn authority_and_additional_records_go_before_answers() {
+    let (handler, _) = handler();
+    let job = forward(&handler, 8, "www.example.com.", None);
+    let answer = upstream_answer(job.query(), |answer| {
+        answer.add_answer(a_record("www.example.com.", 300, [192, 0, 2, 1]));
+        answer.add_answer(a_record("www.example.com.", 300, [192, 0, 2, 2]));
+        for i in 0..20 {
+            let host = format!("a-rather-long-name-server-{i}.example.net.");
+            answer.add_authority(ns_record("example.com.", &host));
+            answer.add_additional(a_record(&host, 300, [198, 51, 100, i]));
+        }
+    });
+    assert!(answer.len() > 512);
+    let reply = checked_reply(&handler.complete(job, Ok(answer), NOW));
+    assert!(reply.payload.len() <= 512);
+    let message = decode(&reply.payload);
+    assert!(!message.metadata.truncation);
+    assert_eq!(message.answers.len(), 2);
+    assert!(message.authorities.is_empty());
+    assert!(message.additionals.is_empty());
+}
+
+#[test]
+fn trimming_keeps_the_cname_chain() {
+    let (handler, _) = handler();
+    let job = forward(&handler, 8, "www.example.com.", None);
+    let answer = upstream_answer(job.query(), |answer| {
+        answer.add_answer(Record::from_rdata(
+            Name::from_ascii("www.example.com.").unwrap(),
+            300,
+            RData::CNAME(CNAME(Name::from_ascii("edge.cdn.example.net.").unwrap())),
+        ));
+        for i in 0..40 {
+            answer.add_answer(a_record("edge.cdn.example.net.", 60, [203, 0, 113, i]));
+        }
+    });
+    let reply = checked_reply(&handler.complete(job, Ok(answer), NOW));
+    assert!(reply.payload.len() <= 512);
+    let message = decode(&reply.payload);
+    assert!(!message.metadata.truncation);
+    assert_eq!(message.answers[0].record_type(), RecordType::CNAME);
+    assert!(message.answers.len() > 2);
+    assert!(
+        message.answers[1..]
+            .iter()
+            .all(|r| r.record_type() == RecordType::A)
+    );
+    assert_eq!(message.answers[1].name.to_ascii(), "edge.cdn.example.net.");
+}
+
+#[test]
+fn a_negative_answer_loses_its_authority_records_not_its_rcode() {
+    let (handler, _) = handler();
+    let job = forward(&handler, 8, "missing.example.", None);
+    let answer = upstream_answer(job.query(), |answer| {
+        answer.metadata.response_code = ResponseCode::NXDomain;
+        for i in 0..20 {
+            let host = format!("a-rather-long-name-server-{i}.example.net.");
+            answer.add_authority(ns_record("example.", &host));
+        }
+    });
+    assert!(answer.len() > 512);
+    let reply = checked_reply(&handler.complete(job, Ok(answer), NOW));
+    let message = decode(&reply.payload);
+    assert!(!message.metadata.truncation);
+    assert_eq!(message.metadata.response_code, ResponseCode::NXDomain);
+    assert!(message.authorities.is_empty());
+}
+
+#[test]
+fn a_reply_without_room_for_one_answer_record_is_truncated() {
+    let (handler, _) = handler();
+    let job = expect_forward(
+        handler.handle_packet(&query_packet(8, "txt.example.", RecordType::TXT, None), NOW),
+    );
+    let answer = upstream_answer(job.query(), |answer| {
+        let text = vec!["x".repeat(250), "y".repeat(250), "z".repeat(100)];
+        answer.add_answer(Record::from_rdata(
+            Name::from_ascii("txt.example.").unwrap(),
+            300,
+            RData::TXT(TXT::new(text)),
+        ));
+    });
+    let reply = checked_reply(&handler.complete(job, Ok(answer), NOW));
+    assert!(reply.payload.len() <= 512);
     let message = decode(&reply.payload);
     assert!(message.metadata.truncation);
     assert!(message.answers.is_empty());
-    assert_eq!(message.edns.map(|e| e.max_payload()), Some(1232));
 }
 
 #[test]

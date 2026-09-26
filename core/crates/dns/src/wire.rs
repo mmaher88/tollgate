@@ -110,3 +110,28 @@ pub(crate) fn records(msg: &[u8], question_end: usize) -> Option<Records> {
     found.end = at;
     Some(found)
 }
+
+/// One record of the answer section: its type and the offset just past it.
+pub(crate) struct AnswerRecord {
+    pub rtype: u16,
+    pub end: usize,
+}
+
+/// The records of the answer section, in order. `None` if one runs past the end of the
+/// message.
+pub(crate) fn answer_records(msg: &[u8], question_end: usize) -> Option<Vec<AnswerRecord>> {
+    let answers = usize::from(u16_at(msg, 6)?);
+    let mut found = Vec::with_capacity(answers);
+    let mut at = question_end;
+    for _ in 0..answers {
+        at = skip_name(msg, at, true)?;
+        let rtype = u16_at(msg, at)?;
+        let end = at + 10 + usize::from(u16_at(msg, at + 8)?);
+        if end > msg.len() {
+            return None;
+        }
+        found.push(AnswerRecord { rtype, end });
+        at = end;
+    }
+    Some(found)
+}
