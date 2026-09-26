@@ -91,7 +91,10 @@ struct ContentView: View {
 
     /// HTTPS filtering with an untrusted root breaks every intercepted site, so it is turned
     /// off whenever trust is missing (the toggle's onChange saves and restarts the tunnel).
+    /// Only after a real trust check: at launch the scene can become active before the
+    /// certificate is loaded, and "not checked yet" must not turn the setting off.
     private func enforceTrust() {
+        guard certificate.evaluated else { return }
         if httpsFiltering, !certificate.trusted { httpsFiltering = false }
     }
 

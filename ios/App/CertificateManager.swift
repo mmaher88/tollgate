@@ -9,6 +9,9 @@ final class CertificateManager: ObservableObject {
     @Published private(set) var info: CaInfo?
     /// True once iOS trusts the root for TLS (full trust enabled in Settings).
     @Published private(set) var trusted = false
+    /// True once trust has actually been checked. Until then `trusted` is only the default,
+    /// so nothing may be switched off because of it.
+    @Published private(set) var evaluated = false
     @Published private(set) var lastError: String?
     /// A copy of the profile for the share sheet, written once by `prepare()`.
     @Published private(set) var profileURL: URL?
@@ -32,14 +35,14 @@ final class CertificateManager: ObservableObject {
         await refreshTrust()
     }
 
+    /// Checks trust again. Before `prepare()` has loaded the CA there is nothing to check,
+    /// and `trusted` and `evaluated` are left alone.
     func refreshTrust() async {
-        guard info != nil, let directory = AppGroup.coreDirectory else {
-            trusted = false
-            return
-        }
+        guard info != nil, let directory = AppGroup.coreDirectory else { return }
         trusted = await Task.detached(priority: .userInitiated) {
             RootTrust.isTrustedForTLS(coreDirectory: directory)
         }.value
+        evaluated = true
     }
 
     /// Serves the profile from a short-lived local web server and opens it in Safari, the
