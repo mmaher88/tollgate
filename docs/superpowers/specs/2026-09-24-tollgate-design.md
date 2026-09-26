@@ -427,7 +427,10 @@ about 5e-14 per lookup.
   the request that failed gets `502`, its client connection is closed, and later
   connections are passed through for the client to handle. A certificate for another name,
   expired, not yet valid, revoked or for another purpose only gets `502`: the client would
-  reject it too. Such failures can come from the network rather than the server (a captive
+  reject it too. The client accepted the proxy's leaf, so it cannot show its own
+  certificate warning; the `502` carries a short plain-text body (`Cache-Control:
+  no-store`) that names the problem, for example "Tollgate: the server's certificate has
+  expired", instead. Such failures can come from the network rather than the server (a captive
   portal before login, a filter that intercepts HTTPS), which makes every host fail. So
   when a third different host would be learned this way within 60 s, it is not, the
   upstream pins from that minute are taken back, and upstream failures teach nothing for

@@ -146,6 +146,27 @@ fn client_rejects_too(error: &rustls::CertificateError) -> bool {
     )
 }
 
+/// What is wrong with the server's certificate, for a failure the client would have too
+/// (see `client_rejects_too`), completing "the server's certificate ...".
+pub(crate) fn certificate_problem(error: &UpstreamError) -> Option<&'static str> {
+    use rustls::CertificateError as E;
+    let Some(rustls::Error::InvalidCertificate(certificate)) = rustls_error(error) else {
+        return None;
+    };
+    if !client_rejects_too(certificate) {
+        return None;
+    }
+    Some(match certificate {
+        E::NotValidForName | E::NotValidForNameContext { .. } => "is for another name",
+        E::Expired | E::ExpiredContext { .. } => "has expired (or this device's clock is wrong)",
+        E::NotValidYet | E::NotValidYetContext { .. } => {
+            "is not valid yet (or this device's clock is wrong)"
+        }
+        E::InvalidPurpose | E::InvalidPurposeContext { .. } => "is not meant for a web server",
+        _ => "has been revoked, or its revocation status is unknown",
+    })
+}
+
 /// True when no connection to the server could be made for this request: the name did not
 /// resolve, the connection was refused, reset or timed out. TLS failures are not included;
 /// neither is a failure on a connection that was already open, or a lack of permits.

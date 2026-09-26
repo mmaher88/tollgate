@@ -5,9 +5,9 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Frame, SizeHint};
-use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue};
+use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, HeaderValue};
 use hyper::{Response, StatusCode};
 
 /// Every body the proxy sends or forwards.
@@ -23,6 +23,22 @@ pub(crate) fn empty() -> Body {
 pub(crate) fn status(code: StatusCode) -> Response<Body> {
     let mut response = Response::new(empty());
     *response.status_mut() = code;
+    response
+}
+
+/// A short plain-text response with this status, which the client must not cache.
+pub(crate) fn text(code: StatusCode, message: String) -> Response<Body> {
+    let body = Full::new(Bytes::from(message))
+        .map_err(|never| match never {})
+        .boxed_unsync();
+    let mut response = Response::new(body);
+    *response.status_mut() = code;
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 

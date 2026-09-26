@@ -9,12 +9,12 @@ use hyper::{Request, Response, StatusCode, Uri, Version};
 use tollgate_common::clock::unix_secs;
 use tollgate_policy::Decision;
 
-use crate::body::{Body, DoneBody, blocked, status};
+use crate::body::{Body, DoneBody, blocked, status, text};
 use crate::filtering::is_blocked;
 use crate::idle::InFlight;
 use crate::intercept::Origin;
 use crate::proxy::State;
-use crate::upstream::{UpstreamError, is_unreachable, learn_from_failure};
+use crate::upstream::{UpstreamError, certificate_problem, is_unreachable, learn_from_failure};
 use crate::websocket;
 
 /// Ends a request without a response. hyper closes an HTTP/1.1 connection and resets an
@@ -127,8 +127,8 @@ async fn forward(
 }
 
 /// The answer to a request the upstream pool could not send. A TLS failure gets `502`
-/// (and may teach the proxy to pass the host through), no free upstream connection `503`,
-/// and an upstream that cannot be reached at all no response.
+/// (and may teach the proxy to pass the host through, see [`bad_gateway`]), no free
+/// upstream connection `503`, and an upstream that cannot be reached at all no response.
 fn failure(
     state: &State,
     origin: &Origin,
@@ -141,5 +141,78 @@ fn failure(
         return Ok((status(StatusCode::SERVICE_UNAVAILABLE), false));
     }
     let untrusted = learn_from_failure(&state.ctx, &origin.name, error);
-    Ok((status(StatusCode::BAD_GATEWAY), untrusted))
+    Ok((bad_gateway(error), untrusted))
+}
+
+/// `502` for a failed upstream request. The client accepted the proxy's certificate, so it
+/// cannot show its own warning for a server certificate that is expired or for another
+/// name; a short text says what is wrong instead of an empty page. Anything else gets an
+/// empty `502`.
+fn bad_gateway(error: &UpstreamError) -> Response<Body> {
+    match certificate_problem(error) {
+        Some(problem) => text(
+            StatusCode::BAD_GATEWAY,
+            format!("Tollgate: the server's certificate {problem}, so this site was not loaded.\n"),
+        ),
+        None => status(StatusCode::BAD_GATEWAY),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use http_body_util::BodyExt;
+    use hyper::header::{CACHE_CONTROL, CONTENT_TYPE};
+    use rustls::CertificateError;
+
+    use super::*;
+
+    fn certificate(error: CertificateError) -> UpstreamError {
+        UpstreamError::Connect(io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(error),
+        ))
+    }
+
+    async fn text(response: Response<Body>) -> String {
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_certificate_the_client_would_reject_gets_a_502_that_says_so() {
+        for (error, says) in [
+            (CertificateError::Expired, "expired"),
+            (CertificateError::NotValidForName, "another name"),
+            (CertificateError::NotValidYet, "not valid yet"),
+            (CertificateError::Revoked, "revoked"),
+            (
+                CertificateError::InvalidPurpose,
+                "not meant for a web server",
+            ),
+        ] {
+            let response = bad_gateway(&certificate(error.clone()));
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let headers = response.headers();
+            assert_eq!(headers[CONTENT_TYPE], "text/plain; charset=utf-8");
+            assert_eq!(headers[CACHE_CONTROL], "no-store");
+            let body = text(response).await;
+            assert!(body.starts_with("Tollgate: "), "{error:?}: {body}");
+            assert!(body.contains(says), "{error:?}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn other_upstream_failures_get_an_empty_502() {
+        for error in [
+            certificate(CertificateError::UnknownIssuer),
+            UpstreamError::Connect(io::Error::from(io::ErrorKind::ConnectionReset)),
+        ] {
+            let response = bad_gateway(&error);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert!(response.headers().get(CONTENT_TYPE).is_none());
+            assert_eq!(text(response).await, "");
+        }
+    }
 }
