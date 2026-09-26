@@ -677,7 +677,11 @@ sections, this section wins.
   Settings live in the App Group as `lists.json`, owned by the app.
 - **Automatic updates.** A background app refresh task (`dev.tollgate.lists-refresh`) runs
   about daily; the app also updates on launch and on returning to the foreground when the
-  lists are more than 24 hours old. After an update the tunnel reloads the lists.
+  lists are more than 24 hours old. After an attempt that could not download every list it
+  retries after an hour, and after 15 minutes while nothing is compiled; the background
+  task is asked for at that time too (iOS decides when it actually runs), so a failed
+  refresh is retried while the app stays closed. After an update the tunnel reloads the
+  lists.
 - Config changes (allowlist, passthrough) are saved to `config.json` and applied by
   restarting the tunnel.
 - **Local network names.** The tunnel is the resolver for every name, and the DoH upstreams

@@ -55,10 +55,11 @@ final class AppModel {
 enum ListRefresh {
     static let identifier = "dev.tollgate.lists-refresh"
 
-    /// Asks iOS to run the refresh task in about a day. Resubmitting replaces the request.
-    static func schedule() {
+    /// Asks iOS to run the refresh task no earlier than `date` (usually
+    /// `ListUpdater.nextRefreshDate`). Resubmitting replaces the request.
+    static func schedule(at date: Date) {
         let request = BGAppRefreshTaskRequest(identifier: identifier)
-        request.earliestBeginDate = Date(timeIntervalSinceNow: ListUpdater.maxAge)
+        request.earliestBeginDate = date
         try? BGTaskScheduler.shared.submit(request)
     }
 }
@@ -79,11 +80,15 @@ struct TollgateApp: App {
                 .environmentObject(AppModel.shared.certificate)
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .background { ListRefresh.schedule() }
+            if phase == .background { ListRefresh.schedule(at: AppModel.shared.lists.nextRefreshDate) }
         }
         .backgroundTask(.appRefresh(ListRefresh.identifier)) {
-            ListRefresh.schedule()
+            // A follow-up in case this run is cut short; replaced once it finishes.
+            ListRefresh.schedule(at: Date(timeIntervalSinceNow: ListUpdater.partialRetry))
             await AppModel.shared.refreshInBackground(deadline: Date().addingTimeInterval(20))
+            // After the run, so a failed or partial one is retried with the short backoff.
+            let next = await MainActor.run { AppModel.shared.lists.nextRefreshDate }
+            ListRefresh.schedule(at: next)
         }
     }
 }

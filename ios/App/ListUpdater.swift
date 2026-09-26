@@ -47,12 +47,14 @@ final class ListUpdater: ObservableObject {
     /// the background refresh task.
     nonisolated static let maxAge: TimeInterval = 24 * 60 * 60
     /// Retry delay after a full update that could not download some lists.
-    static let partialRetry: TimeInterval = 60 * 60
+    nonisolated static let partialRetry: TimeInterval = 60 * 60
     /// Retry delay while no compiled lists exist (offline at first launch).
     static let missingRetry: TimeInterval = 15 * 60
     /// A last attempt this far in the future means the clock was set back (for example
     /// after moving the date forward to test updates); the lists then count as stale.
     static let clockTolerance: TimeInterval = 5 * 60
+    /// The soonest the background refresh is asked for.
+    static let minimumRefreshDelay: TimeInterval = 60
 
     init() {
         let defaults = UserDefaults.standard
@@ -79,6 +81,21 @@ final class ListUpdater: ObservableObject {
     }
 
     var needsWork: Bool { isStale || pendingSettingsChange }
+
+    /// When the background refresh task should next run: when `needsWork` becomes true,
+    /// with the same backoff as `isStale` (15 minutes while nothing is compiled, an hour
+    /// after a partial attempt, otherwise a day), and at least a minute from now.
+    var nextRefreshDate: Date {
+        let now = Date()
+        let soonest = now.addingTimeInterval(Self.minimumRefreshDelay)
+        guard let lastAttempt, !pendingSettingsChange,
+              now.timeIntervalSince(lastAttempt) >= -Self.clockTolerance
+        else { return soonest }
+        let delay = !compiled ? Self.missingRetry
+            : lastAttemptPartial ? Self.partialRetry
+            : Self.maxAge
+        return max(lastAttempt.addingTimeInterval(delay), soonest)
+    }
 
     var isBusy: Bool {
         switch state {
