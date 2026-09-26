@@ -90,14 +90,19 @@ pub(crate) fn is_untrusted_certificate(error: &UpstreamError) -> bool {
 
 /// After a failed upstream request to the server named `name`: when its certificate could
 /// not be verified, the host is passed through from now on, so the client verifies it.
-pub(crate) fn learn_from_failure(ctx: &ProxyContext, name: &str, error: &UpstreamError) {
-    if is_untrusted_certificate(error)
-        && ctx
-            .policy
-            .learn_upstream_untrusted(name, tollgate_common::clock::unix_secs())
+/// Returns true in that case, also when the host already was a pin (another request may
+/// have learned it at the same time), so the caller closes the client connection.
+pub(crate) fn learn_from_failure(ctx: &ProxyContext, name: &str, error: &UpstreamError) -> bool {
+    if !is_untrusted_certificate(error) {
+        return false;
+    }
+    if ctx
+        .policy
+        .learn_upstream_untrusted(name, tollgate_common::clock::unix_secs())
     {
         log::info!("{name}: upstream certificate not verifiable; passing it through from now on");
     }
+    true
 }
 
 #[derive(Debug, thiserror::Error)]

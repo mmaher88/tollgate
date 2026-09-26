@@ -30,19 +30,31 @@ pub(crate) fn is_upgrade<B>(request: &Request<B>) -> bool {
             .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
 }
 
+/// The response, and whether the upstream certificate could not be verified (the host is
+/// then a learned pin, and the client connection should close).
 pub(crate) async fn forward(
     state: &State,
     target: Target,
-    mut request: Request<Incoming>,
-) -> Response<Body> {
-    let (mut sender, permit) = match dial(state, &target).await {
+    request: Request<Incoming>,
+) -> (Response<Body>, bool) {
+    let (sender, permit) = match dial(state, &target).await {
         Ok(dialed) => dialed,
         Err(e) => {
             log::debug!("WebSocket upstream {}: {e}", target.authority());
-            learn_from_failure(&state.ctx, &target.server_name, &e);
-            return status(StatusCode::BAD_GATEWAY);
+            let untrusted = learn_from_failure(&state.ctx, &target.server_name, &e);
+            return (status(StatusCode::BAD_GATEWAY), untrusted);
         }
     };
+    (upgrade(state, target, request, sender, permit).await, false)
+}
+
+async fn upgrade(
+    state: &State,
+    target: Target,
+    mut request: Request<Incoming>,
+    mut sender: http1::SendRequest<Body>,
+    permit: OwnedSemaphorePermit,
+) -> Response<Body> {
     let client_upgrade = hyper::upgrade::on(&mut request);
     let upgrade = request.headers().get(UPGRADE).cloned();
     let (mut parts, body) = request.into_parts();
