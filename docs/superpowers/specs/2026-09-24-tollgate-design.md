@@ -391,6 +391,10 @@ about 5e-14 per lookup.
   network is gone: on each reset (`ProxyContext::path_resets`) and 2 s later, a relay whose
   upstream socket's source address is no longer assigned to an interface (`getifaddrs`)
   closes both sockets, so the client reconnects through a new `CONNECT` on the new path.
+  Pooled upstream connections that still carry requests (a server-sent events feed, a long
+  poll, a download) get the same check: their socket is wrapped so it can be cut, which
+  fails every request on it (HTTP/1.1 and HTTP/2 alike) instead of leaving the response
+  stalled on the dead path.
 - Clients using the proxy send it host names instead of looking them up, so the proxy checks
   the DNS blocklist itself (`ProxyContext::domains`, the same `DomainSet` the DNS responder
   uses, swapped together on reload): the `CONNECT` host before classification (passthrough

@@ -52,8 +52,9 @@ pub struct ServeOptions {
     /// `None`: the system resolver only.
     pub resolver: Option<Arc<dyn Resolve>>,
     /// Whether an address is still assigned to one of the device's interfaces. When the
-    /// upstream connections are reset (wake, network change), passthrough tunnels and
-    /// WebSockets whose upstream source address is gone are closed. Default
+    /// upstream connections are reset (wake, network change), upstream connections still
+    /// carrying requests, passthrough tunnels and WebSockets whose upstream source address
+    /// is gone are closed. Default
     /// `tollgate_common::net::is_local_address`; tests pass a predicate they control.
     pub local_address_present: fn(IpAddr) -> bool,
 }

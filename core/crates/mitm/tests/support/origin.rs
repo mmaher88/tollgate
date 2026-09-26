@@ -105,6 +105,25 @@ impl Stream for Chunks {
     }
 }
 
+/// `/drip` bodies: a line right away, then another every `every`, never ending.
+struct Drip {
+    sent: usize,
+    every: tokio::time::Interval,
+}
+
+impl Stream for Drip {
+    type Item = Result<Frame<Bytes>, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.every.poll_tick(cx).is_pending() {
+            return Poll::Pending;
+        }
+        self.sent += 1;
+        let line = format!("data: {}\n\n", self.sent);
+        Poll::Ready(Some(Ok(Frame::data(Bytes::from(line)))))
+    }
+}
+
 type OriginBody = BoxBody<Bytes, Infallible>;
 
 fn full(text: impl Into<Bytes>) -> OriginBody {
@@ -137,6 +156,26 @@ fn big(request: &Request<Incoming>, counters: Arc<Counters>) -> Response<OriginB
         counters,
     };
     Response::new(StreamBody::new(chunks).boxed())
+}
+
+/// `/drip?every=<ms>`: a server-sent events stream that never ends, one event right away
+/// and another every `ms` milliseconds (default one hour, so it holds after the first).
+fn drip(request: &Request<Incoming>) -> Response<OriginBody> {
+    let ms = request
+        .uri()
+        .query()
+        .and_then(|q| q.strip_prefix("every="))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(3_600_000);
+    let drip = Drip {
+        sent: 0,
+        every: tokio::time::interval(Duration::from_millis(ms)),
+    };
+    let mut response = Response::new(StreamBody::new(drip).boxed());
+    response
+        .headers_mut()
+        .insert("content-type", "text/event-stream".parse().unwrap());
+    response
 }
 
 /// `/headers?count=N&size=S`: `N` `set-cookie` headers, each with an `S`-byte value.
@@ -177,7 +216,8 @@ impl Drop for Live {
     }
 }
 
-/// Answers `/echo` with [`echo`], `/big` with [`big`], `/headers` with [`headers`], and
+/// Answers `/echo` with [`echo`], `/big` with [`big`], `/headers` with [`headers`], `/drip`
+/// with [`drip`], and
 /// every other request with a line
 /// describing it: `GET /path?q authority=host:port version=HTTP/1.1 conn=1 cookie=a=1|b=2`.
 /// `?delay=<ms>` waits before answering.
@@ -191,6 +231,7 @@ async fn handle(
         "/echo" => return Ok(echo(request).await),
         "/big" => return Ok(big(&request, counters)),
         "/headers" => return Ok(headers(&request)),
+        "/drip" => return Ok(drip(&request)),
         _ => {}
     }
     if let Some(ms) = request

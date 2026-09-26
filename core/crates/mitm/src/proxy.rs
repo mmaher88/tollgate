@@ -61,10 +61,11 @@ impl ProxyContext {
     /// Closes every pooled upstream connection that is not carrying a request, so the next
     /// request dials again. Call it when the device wakes or the network path changes: a
     /// connection on the old path usually still looks open, and a request sent on it would
-    /// hang until TCP gives up. Requests in flight finish on their connections. Passthrough
-    /// tunnels and WebSockets are closed only if their upstream source address is no longer
-    /// assigned to the device (checked now and again shortly after), so the client
-    /// reconnects on the new path while healthy transfers keep going.
+    /// hang until TCP gives up. Connections carrying requests (streaming responses, long
+    /// polls, downloads), passthrough tunnels and WebSockets are closed only if their
+    /// upstream source address is no longer assigned to the device (checked now and again
+    /// shortly after), so the client sees the failure and retries on the new path while
+    /// healthy transfers keep going.
     pub fn reset_upstream_connections(&self) {
         self.upstream_resets.fetch_add(1, Ordering::AcqRel);
         // send_modify works without receivers, unlike send.
@@ -169,6 +170,7 @@ pub async fn serve_with_options(
             max_h1_per_host: options.max_h1_per_host,
             clock: options.clock,
             resolver: options.resolver.clone(),
+            local_address_present: options.local_address_present,
         },
         tasks.clone(),
         ctx.clone(),

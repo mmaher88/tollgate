@@ -15,7 +15,9 @@
 //! tokio's clock stops while the device sleeps, and are checked again when they are taken
 //! from the pool. `ProxyContext::reset_upstream_connections` drops them all after a wake or
 //! a network change, and a safe request that fails on a reused connection before its
-//! response starts is sent once more on a new connection.
+//! response starts is sent once more on a new connection. A connection still carrying
+//! requests is closed by the reset only when its source address is gone from the device
+//! (see `cut`), so its responses fail instead of waiting on a dead path.
 
 use std::collections::HashMap;
 use std::io;
@@ -46,12 +48,14 @@ use tollgate_common::resolve::Resolve;
 
 use crate::ProxyContext;
 use crate::body::{Body, DoneBody};
+use crate::cut::{Cutter, cuttable};
 use crate::http::{authority, join_cookies, strip_hop_by_hop};
 use crate::limits::{
     H1_MAX_BUF, H2_CONNECTION_WINDOW, H2_MAX_SEND_BUF, H2_STREAM_WINDOW, KEEP_ALIVE_TIMEOUT,
     MAX_HEADER_LIST, MAX_HEADERS,
 };
 use crate::shutdown::Shutdown;
+use crate::tunnel::until_path_gone;
 
 /// How often a request waiting for an upstream connection looks for an idle one to close.
 const EVICT_RETRY: Duration = Duration::from_millis(50);
@@ -178,11 +182,14 @@ impl ResolvesClientCert for ClientCertAsked {
 /// A server that requires one and rejects the empty certificate during the handshake
 /// (TLS 1.2) fails here with [`UpstreamError::ClientCertificate`]; over TLS 1.3 the
 /// rejection only arrives with the first request, so the caller checks the flag then.
-pub(crate) async fn connect_tls(
+pub(crate) async fn connect_tls<T>(
     config: &ClientConfig,
     name: ServerName<'static>,
-    tcp: TcpStream,
-) -> Result<(TlsStream<TcpStream>, bool), UpstreamError> {
+    tcp: T,
+) -> Result<(TlsStream<T>, bool), UpstreamError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let asked = Arc::new(ClientCertAsked::default());
     let mut config = config.clone();
     config.client_auth_cert_resolver = asked.clone();
@@ -235,6 +242,8 @@ pub(crate) struct PoolOptions {
     pub(crate) clock: fn() -> u64,
     /// Looks up upstream names before the system resolver is tried.
     pub(crate) resolver: Option<Arc<dyn Resolve>>,
+    /// Whether a source address is still assigned to the device, checked on resets.
+    pub(crate) local_address_present: fn(IpAddr) -> bool,
 }
 
 impl PoolOptions {
@@ -712,6 +721,9 @@ impl Pool {
     ) -> Result<(Sender, Checkout), UpstreamError> {
         let resolver = self.0.options.resolver.as_deref();
         let tcp = connect_tcp(resolver, &target.host, target.port).await?;
+        let local = tcp.local_addr().ok().map(|a| a.ip());
+        let (tcp, cutter) = cuttable(tcp);
+        self.close_when_path_gone(cutter, local, target.authority());
         if !target.tls {
             let h1 = self
                 .start_http1(TokioIo::new(tcp), global, h1_permit)
@@ -782,6 +794,25 @@ impl Pool {
             }
         });
         Ok(h1)
+    }
+
+    /// Watches a new upstream connection until its socket is dropped. When the upstream
+    /// connections are reset and `local`, its source address, is no longer assigned to the
+    /// device, cuts the socket: the requests on it fail at once (releasing their permits)
+    /// instead of waiting on a dead path, where an HTTP/1.1 response would wait forever and
+    /// an HTTP/2 one until the keep-alive ping times out.
+    fn close_when_path_gone(&self, mut cutter: Cutter, local: Option<IpAddr>, authority: String) {
+        let resets = self.0.ctx.path_resets.subscribe();
+        let present = self.0.options.local_address_present;
+        self.0.shutdown.spawn(async move {
+            let gone = until_path_gone(cutter.dropped(), resets, local, present)
+                .await
+                .is_none();
+            if gone {
+                log::debug!("upstream {authority}: network path gone; closing the connection");
+                cutter.cut();
+            }
+        });
     }
 
     fn set_protocol(&self, target: &Target, protocol: Protocol, h2: Option<Shared>) {
