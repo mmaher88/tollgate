@@ -114,6 +114,8 @@ impl Default for EngineOptions {
 struct Running {
     port: u16,
     jobs: mpsc::Sender<ForwardJob>,
+    /// Shares its connections with the runtime's resolver, for `reset_connections`.
+    resolver: DohResolver,
     shutdown: oneshot::Sender<()>,
     thread: JoinHandle<()>,
 }
@@ -252,12 +254,19 @@ impl Engine {
         .unwrap_or_default()
     }
 
-    /// Drops the proxy's pooled upstream connections, so the next requests dial again.
-    /// Call it when the device wakes and when the network path changes: connections from
-    /// before usually still look open while their path is gone.
+    /// Drops the proxy's pooled upstream connections and the DoH connections (used by
+    /// the DNS forwarder and the proxy's name lookups), so the next requests and queries
+    /// connect again. Call it when the device wakes and when the network path changes:
+    /// connections from before usually still look open while their path is gone.
     pub fn reset_connections(&self) {
         let _ = catch_panic(|| {
             self.proxy.reset_upstream_connections();
+            // Clone and release the lock at once, so stop() never waits on us.
+            let resolver = self.running().as_ref().map(|r| r.resolver.clone());
+            if let Some(resolver) = resolver {
+                log::info!("dropping DoH connections");
+                resolver.reset_connections();
+            }
             Ok(())
         });
     }
@@ -419,10 +428,11 @@ impl Engine {
             return Err(TollgateError::AlreadyRunning);
         }
         let (jobs, queue) = mpsc::channel(self.options.forward_queue.max(1));
+        let resolver = self.resolver()?;
         let work = Work {
             proxy: self.proxy.clone(),
             dns: self.dns.clone(),
-            resolver: self.resolver()?,
+            resolver: resolver.clone(),
             sink,
             queue,
             in_flight: self.options.forward_in_flight.max(1),
@@ -441,6 +451,7 @@ impl Engine {
                 *running = Some(Running {
                     port,
                     jobs,
+                    resolver,
                     shutdown,
                     thread,
                 });
@@ -466,6 +477,7 @@ impl Engine {
         let Running {
             port,
             jobs,
+            resolver: _,
             shutdown,
             thread,
         } = running;

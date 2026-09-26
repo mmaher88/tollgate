@@ -178,6 +178,21 @@ impl DohResolver {
         }
     }
 
+    /// Drops every upstream's open connection, so the next query to each opens a new one.
+    /// For a network path change or a wake from sleep: a connection made on the old path
+    /// would otherwise be reused for up to [`MAX_IDLE`] and cost each query the warm
+    /// deadline before it fails. Queries already in flight on the old connection finish or
+    /// time out as before. Safe to call from any thread, inside or outside the runtime.
+    pub fn reset_connections(&self) {
+        for upstream in &self.inner.upstreams {
+            let mut slot = upstream.slot();
+            if slot.sender.take().is_some() {
+                // A late touch or discard from a query on the old connection is a no-op.
+                slot.generation += 1;
+            }
+        }
+    }
+
     /// Sends `query` (a DNS message) to each upstream in turn until one answers, and returns
     /// the answer with the query's id. The error is the last upstream's.
     pub async fn resolve(&self, query: &[u8]) -> Result<Vec<u8>, DohError> {

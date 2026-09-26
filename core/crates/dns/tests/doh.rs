@@ -88,6 +88,31 @@ async fn reuses_one_connection() {
 }
 
 #[tokio::test]
+async fn reset_connections_makes_the_next_query_open_a_new_connection() {
+    let server = TestServer::start().await;
+    let resolver = trusting(vec![server.upstream()], &[&server]);
+    resolver
+        .resolve(&query(1, "example.com.", RecordType::A, None))
+        .await
+        .unwrap();
+    assert_eq!(server.connections(), 1);
+    // The network path changed: the warm connection is not trusted any more. A clone
+    // shares the connections, so resetting it resets them for every holder.
+    resolver.clone().reset_connections();
+    resolver
+        .resolve(&query(2, "example.com.", RecordType::A, None))
+        .await
+        .unwrap();
+    assert_eq!(server.connections(), 2);
+    // The new connection is reused as usual.
+    resolver
+        .resolve(&query(3, "example.com.", RecordType::A, None))
+        .await
+        .unwrap();
+    assert_eq!(server.connections(), 2);
+}
+
+#[tokio::test]
 async fn concurrent_queries_do_not_wait_for_each_other() {
     let server = TestServer::start().await;
     server.set_mode(Mode::Gated);

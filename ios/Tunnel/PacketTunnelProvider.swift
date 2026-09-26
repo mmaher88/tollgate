@@ -51,8 +51,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         completionHandler()
     }
 
-    /// Pooled upstream connections from before sleep usually still look open, but after a
-    /// network change while asleep their path is gone and a request sent on one would hang.
+    /// Pooled upstream connections and DoH connections from before sleep usually still look
+    /// open, but after a network change while asleep their path is gone and a request or
+    /// query sent on one would hang. The core drops both.
     override func wake() {
         log.info("wake: dropping pooled upstream connections")
         engine?.resetConnections()
@@ -155,8 +156,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    /// Drops the proxy's pooled upstream connections when the default path changes (for
-    /// example from Wi-Fi to cellular), like apps connecting directly would lose theirs.
+    /// Drops the proxy's pooled upstream connections and the DoH connections when the
+    /// default path changes (for example from Wi-Fi to cellular), like apps connecting
+    /// directly would lose theirs.
     /// The first value and changes to an unsatisfied path are ignored.
     private func observeNetworkChanges() {
         pathObservation?.invalidate()

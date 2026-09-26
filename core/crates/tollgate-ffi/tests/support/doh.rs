@@ -26,6 +26,7 @@ pub struct DohServer {
     /// The test CA, to pass in `EngineOptions::doh_roots`.
     pub ca_der: Vec<u8>,
     requests: Arc<AtomicUsize>,
+    connections: Arc<AtomicUsize>,
     gate: Option<Arc<Semaphore>>,
 }
 
@@ -69,7 +70,8 @@ impl DohServer {
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
-        let (counter, held) = (requests.clone(), gate.clone());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let (counter, held, accepted) = (requests.clone(), gate.clone(), connections.clone());
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -81,12 +83,17 @@ impl DohServer {
                     let Ok((tcp, _)) = listener.accept().await else {
                         continue;
                     };
-                    let (acceptor, counter, held) =
-                        (acceptor.clone(), counter.clone(), held.clone());
+                    let (acceptor, counter, held, accepted) = (
+                        acceptor.clone(),
+                        counter.clone(),
+                        held.clone(),
+                        accepted.clone(),
+                    );
                     tokio::spawn(async move {
                         let Ok(tls) = acceptor.accept(tcp).await else {
                             return;
                         };
+                        accepted.fetch_add(1, Ordering::SeqCst);
                         let service = service_fn(move |request| {
                             answer(request, counter.clone(), held.clone())
                         });
@@ -101,6 +108,7 @@ impl DohServer {
             addr,
             ca_der: ca_cert.der().to_vec(),
             requests,
+            connections,
             gate,
         }
     }
@@ -117,6 +125,11 @@ impl DohServer {
     /// Requests received so far.
     pub fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    /// TLS connections accepted so far.
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
     }
 
     /// Lets every held and future request answer.

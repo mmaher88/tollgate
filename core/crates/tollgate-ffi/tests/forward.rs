@@ -68,6 +68,31 @@ fn answers_arrive_through_the_sink_and_are_cached() {
 }
 
 #[test]
+fn reset_connections_also_drops_the_doh_connection() {
+    let server = DohServer::start();
+    let (_dir, engine) = engine_for(&server, EngineOptions::default());
+    let (sink, answers) = sink();
+    engine.start(sink).unwrap();
+    engine
+        .handle_packets(vec![query(1, "one.example.", RecordType::A)])
+        .unwrap();
+    answers.recv_timeout(WAIT).unwrap();
+    assert_eq!(server.connections(), 1);
+
+    // A wake or a network path change: the next query must not wait on a connection
+    // from the old path.
+    engine.reset_connections();
+    engine
+        .handle_packets(vec![query(2, "two.example.", RecordType::A)])
+        .unwrap();
+    answers.recv_timeout(WAIT).unwrap();
+    assert_eq!(server.connections(), 2);
+    engine.stop();
+    // Stopped: nothing to reset, and no panic.
+    engine.reset_connections();
+}
+
+#[test]
 fn a_full_queue_answers_servfail_at_once() {
     let server = DohServer::gated();
     let options = EngineOptions {
