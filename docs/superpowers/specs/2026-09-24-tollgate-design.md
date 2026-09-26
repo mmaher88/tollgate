@@ -305,10 +305,15 @@ depend on each other.
 **DNS blocklist (`DomainSet`).** Names are stored as a sorted array of FNV-1a 64-bit hashes of
 the lowercased name in a binary file: magic `TGDS`, format version, entry counts, checksum,
 then block hashes, allow hashes and important hashes. The extension mmaps it and
-binary-searches the host and each parent label. Order of evaluation: important block, then
-allow, then block. The parser accepts `||name^`, `||name`, `.name^`, `@@||name^`, `$important`
-and `$badfilter` rules and hosts-format lines. It skips regex, wildcard and prefix rules, and
-drops redundant children of blocked parents. The false positive rate is about 5e-14 per lookup.
+binary-searches the host and each parent label. The parser accepts `||name^`, `||name`,
+`.name^`, `@@||name^`, the exact-host forms `|name^|` and `|name^` and their `@@` forms,
+`$important` and `$badfilter` rules and hosts-format lines. It skips regex, wildcard and prefix
+rules (such as `|ads.`), and drops redundant children of blocked parents. An exact-host entry
+covers the host only and is stored in the block or allow array as the hash of `|` followed by
+the name, which no name produces, so the AdGuard DNS filter's `@@|cdn.example^|` unblocks that
+host under a blocked `||example^` without unblocking the rest. Order of evaluation: important
+block (host and parents), exact allow, allow (host and parents), exact block, block (host and
+parents). The false positive rate is about 5e-14 per lookup.
 
 **dns.**
 - Only UDP port 53 addressed to `198.18.0.1` or `fd00:7467::1` is handled. Everything else is

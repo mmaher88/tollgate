@@ -13,7 +13,7 @@ fn rules() -> DomainRules {
         important: names(&["forced.example"]),
         allow: names(&["ad.10010.com", "forced.example", "ok.tracker.example"]),
         block: names(&["10010.com", "doubleclick.net", "tracker.example"]),
-        skipped: 0,
+        ..DomainRules::default()
     }
 }
 
@@ -48,7 +48,7 @@ fn file_layout_matches_the_spec() {
         important: names(&["c.example"]),
         allow: names(&["b.example"]),
         block: names(&["a.example", "d.example"]),
-        skipped: 0,
+        ..DomainRules::default()
     }
     .encode();
     assert_eq!(bytes.len(), 32 + 8 * 4);
@@ -240,4 +240,50 @@ fn load_reports_missing_and_short_files() {
 fn domain_set_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<DomainSet>();
+}
+
+fn build(text: &str) -> DomainSet {
+    DomainSet::from_bytes(DomainSet::build(&[ListSource {
+        name: "dns",
+        text,
+        format: ListFormat::Adblock,
+    }]))
+    .unwrap()
+}
+
+#[test]
+fn exact_exceptions_allow_only_their_host() {
+    let d = build(
+        "||example.com^\n\
+         @@|cdn.example.com^|\n\
+         ||daraz.com^\n\
+         @@|daraz.com^|\n\
+         @@|x.example.com^|\n\
+         @@|x.example.com^|$badfilter\n",
+    );
+    assert!(!d.is_blocked("cdn.example.com"));
+    assert!(!d.is_blocked("CDN.example.com."));
+    assert!(d.is_blocked("x.cdn.example.com"));
+    assert!(d.is_blocked("example.com"));
+    assert!(d.is_blocked("other.example.com"));
+    assert!(!d.is_blocked("daraz.com"));
+    assert!(d.is_blocked("ads.daraz.com"));
+    // Removed by $badfilter.
+    assert!(d.is_blocked("x.example.com"));
+}
+
+#[test]
+fn exact_blocks_cover_only_their_host_and_lose_to_exceptions() {
+    let d = build(
+        "|a.klaviyo.com^\n\
+         @@||fine.org^\n\
+         |ads.fine.org^|\n\
+         ||imp.org^$important\n\
+         @@|a.imp.org^|\n",
+    );
+    assert!(d.is_blocked("a.klaviyo.com"));
+    assert!(!d.is_blocked("x.a.klaviyo.com"));
+    assert!(!d.is_blocked("klaviyo.com"));
+    assert!(!d.is_blocked("ads.fine.org"));
+    assert!(d.is_blocked("a.imp.org"));
 }

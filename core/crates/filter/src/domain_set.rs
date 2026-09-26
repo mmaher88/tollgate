@@ -13,7 +13,9 @@
 //! | 24 | 8 | FNV-1a 64 of every byte after the header |
 //! | 32 | 8 each | block hashes, then allow hashes, then important hashes |
 //!
-//! Each hash is FNV-1a 64 of the lowercase name without a trailing dot. Each section is
+//! Each hash is FNV-1a 64 of the lowercase name without a trailing dot. An entry for one
+//! host only, not its subdomains (`|name^` rules), is stored in the block or allow section
+//! as the hash of `|` followed by the name, which no name can produce. Each section is
 //! sorted ascending with no duplicates. A false positive needs a 64-bit collision: about
 //! 5e-14 per lookup with 250,000 names.
 
@@ -47,9 +49,22 @@ pub enum DomainSetError {
     Unsorted,
 }
 
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+/// Prefix of the name in the hash of an entry for one host only.
+const EXACT_TAG: &[u8] = b"|";
+
 /// FNV-1a 64 over the bytes, lowercasing ASCII letters on the way.
 fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    fnv1a64_from(FNV_OFFSET, bytes)
+}
+
+/// The hash of an entry for exactly `name`.
+fn exact_hash(name: &[u8]) -> u64 {
+    fnv1a64_from(fnv1a64(EXACT_TAG), name)
+}
+
+/// FNV-1a 64 continued from `hash` over more bytes, lowercasing ASCII letters.
+fn fnv1a64_from(mut hash: u64, bytes: &[u8]) -> u64 {
     for b in bytes {
         hash ^= u64::from(b.to_ascii_lowercase());
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -71,8 +86,13 @@ fn read_u32(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
 }
 
-fn sorted_hashes(names: &[String]) -> Vec<u64> {
-    let mut hashes: Vec<u64> = names.iter().map(|n| fnv1a64(n.as_bytes())).collect();
+/// The hashes of `names` and of the one-host entries `exact`, sorted and unique.
+fn sorted_hashes(names: &[String], exact: &[String]) -> Vec<u64> {
+    let mut hashes: Vec<u64> = names
+        .iter()
+        .map(|n| fnv1a64(n.as_bytes()))
+        .chain(exact.iter().map(|n| exact_hash(n.as_bytes())))
+        .collect();
     hashes.sort_unstable();
     hashes.dedup();
     hashes
@@ -82,9 +102,9 @@ impl DomainRules {
     /// The `domains.bin` bytes for these rules.
     pub fn encode(&self) -> Vec<u8> {
         let sections = [
-            sorted_hashes(&self.block),
-            sorted_hashes(&self.allow),
-            sorted_hashes(&self.important),
+            sorted_hashes(&self.block, &self.exact_block),
+            sorted_hashes(&self.allow, &self.exact_allow),
+            sorted_hashes(&self.important, &[]),
         ];
         let total: usize = sections.iter().map(Vec::len).sum();
         let mut out = Vec::with_capacity(HEADER_LEN + 8 * total);
@@ -216,7 +236,8 @@ impl DomainSet {
     }
 
     /// True if an entry covers the host or one of its parents, taking important blocks
-    /// first, then exceptions, then blocks. ASCII case and one trailing dot are ignored.
+    /// first, then exceptions (for the host only, then for it and its parents), then blocks
+    /// (the same way). ASCII case and one trailing dot are ignored.
     pub fn is_blocked(&self, host: &str) -> bool {
         let host = host.strip_suffix('.').unwrap_or(host).as_bytes();
         // The host and each parent that still has a dot: names without a dot are never
@@ -237,13 +258,18 @@ impl DomainSet {
         let covered = |range: &Range<usize>| {
             !range.is_empty() && hashes.iter().any(|&h| self.contains(range, h))
         };
+        if hashes.is_empty() {
+            return false;
+        }
+        let exact = exact_hash(host);
+        let exactly = |range: &Range<usize>| !range.is_empty() && self.contains(range, exact);
         if covered(&self.important) {
             return true;
         }
-        if covered(&self.allow) {
+        if exactly(&self.allow) || covered(&self.allow) {
             return false;
         }
-        covered(&self.block)
+        exactly(&self.block) || covered(&self.block)
     }
 
     /// Number of stored hashes: blocks, exceptions and important blocks together.

@@ -11,9 +11,15 @@ use crate::{ListFormat, ListSource};
 pub struct DomainRules {
     /// `$important` blocks. They win over `allow`.
     pub important: Vec<String>,
-    /// `@@` exceptions. They win over `block`.
+    /// `@@` exceptions. They win over `block` and `exact_block`.
     pub allow: Vec<String>,
     pub block: Vec<String>,
+    /// `@@|name^|` and `@@|name^` exceptions: the host itself, not its subdomains. They win
+    /// over `block`, so a list can unblock one host under a blocked parent. Kept even when
+    /// a parent is in `block`.
+    pub exact_allow: Vec<String>,
+    /// `|name^|` and `|name^`: the host itself, not its subdomains.
+    pub exact_block: Vec<String>,
     /// Lines that are neither comments nor host rules: rules with other options, paths,
     /// wildcards, regexes, and hosts lines without a usable name.
     pub skipped: u64,
@@ -24,6 +30,8 @@ enum Kind {
     Important,
     Allow,
     Block,
+    ExactAllow,
+    ExactBlock,
 }
 
 enum Line {
@@ -41,16 +49,19 @@ struct Builder {
     important: HashSet<String>,
     allow: HashSet<String>,
     block: HashSet<String>,
+    exact_allow: HashSet<String>,
+    exact_block: HashSet<String>,
     badfilter: HashSet<(Kind, String)>,
     skipped: u64,
 }
 
 impl DomainRules {
     /// Adblock lists contribute `||name^`, `||name^|`, `||name` (no caret, when the name
-    /// does not end in a dot), `.name^` (treated as the name and its subdomains), their
-    /// `@@` forms, `$important` and `$badfilter`. Any other option, a path, a wildcard, a
-    /// regex or a `|` prefix rule is skipped. Hosts lists contribute every name on
-    /// `address name...` lines and bare `name` lines.
+    /// does not end in a dot), `.name^` (treated as the name and its subdomains), the
+    /// exact-host forms `|name^|` and `|name^` (the name only), their `@@` forms,
+    /// `$important` (not on exact-host blocks) and `$badfilter`. Any other option, a path,
+    /// a wildcard, a regex or a `|` prefix rule such as `|ads.` is skipped. Hosts lists
+    /// contribute every name on `address name...` lines and bare `name` lines.
     pub fn parse(lists: &[ListSource]) -> DomainRules {
         let mut builder = Builder::default();
         for list in lists {
@@ -83,13 +94,18 @@ impl Builder {
                 self.badfilter.insert((kind, name));
             }
             Line::Rule { kind, name, .. } => {
-                let set = match kind {
-                    Kind::Important => &mut self.important,
-                    Kind::Allow => &mut self.allow,
-                    Kind::Block => &mut self.block,
-                };
-                set.insert(name);
+                self.set(kind).insert(name);
             }
+        }
+    }
+
+    fn set(&mut self, kind: Kind) -> &mut HashSet<String> {
+        match kind {
+            Kind::Important => &mut self.important,
+            Kind::Allow => &mut self.allow,
+            Kind::Block => &mut self.block,
+            Kind::ExactAllow => &mut self.exact_allow,
+            Kind::ExactBlock => &mut self.exact_block,
         }
     }
 
@@ -124,18 +140,15 @@ impl Builder {
     }
 
     fn finish(mut self) -> DomainRules {
-        for (kind, name) in &self.badfilter {
-            let set = match kind {
-                Kind::Important => &mut self.important,
-                Kind::Allow => &mut self.allow,
-                Kind::Block => &mut self.block,
-            };
-            set.remove(name);
+        for (kind, name) in std::mem::take(&mut self.badfilter) {
+            self.set(kind).remove(&name);
         }
         DomainRules {
             important: without_redundant_children(&self.important),
             allow: without_redundant_children(&self.allow),
             block: without_redundant_children(&self.block),
+            exact_allow: sorted(&self.exact_allow),
+            exact_block: sorted(&self.exact_block),
             skipped: self.skipped,
         }
     }
@@ -163,6 +176,7 @@ fn parse_adblock_line(line: &str) -> Line {
             _ => return Line::Skip,
         }
     }
+    let mut exact = false;
     let name = if let Some(rest) = pattern.strip_prefix("||") {
         if let Some(name) = rest.strip_suffix("^|").or_else(|| rest.strip_suffix('^')) {
             name
@@ -177,6 +191,16 @@ fn parse_adblock_line(line: &str) -> Line {
             Some(name) => name,
             None => return Line::Skip,
         }
+    } else if let Some(rest) = pattern.strip_prefix('|') {
+        // `|name^` and `|name^|` match the host name from its start to its end: exactly
+        // that host. Without the caret it would be a prefix (`|ads.` matches `ads.x.com`).
+        match rest.strip_suffix("^|").or_else(|| rest.strip_suffix('^')) {
+            Some(name) => {
+                exact = true;
+                name
+            }
+            None => return Line::Skip,
+        }
     } else {
         return Line::Skip;
     };
@@ -185,10 +209,15 @@ fn parse_adblock_line(line: &str) -> Line {
     };
     // An important exception is kept as a plain exception, so an important block for
     // the same host still wins. adblock would let the exception win; no DNS list uses it.
-    let kind = match (exception, important) {
-        (true, _) => Kind::Allow,
-        (false, true) => Kind::Important,
-        (false, false) => Kind::Block,
+    let kind = match (exception, important, exact) {
+        (true, _, false) => Kind::Allow,
+        (true, _, true) => Kind::ExactAllow,
+        (false, true, false) => Kind::Important,
+        // An important block of one host would need a section of its own; no DNS list
+        // uses it.
+        (false, true, true) => return Line::Skip,
+        (false, false, false) => Kind::Block,
+        (false, false, true) => Kind::ExactBlock,
     };
     Line::Rule {
         kind,
@@ -221,6 +250,12 @@ fn normalize_name(name: &str) -> Option<String> {
         return None;
     }
     Some(name.to_ascii_lowercase())
+}
+
+fn sorted(names: &HashSet<String>) -> Vec<String> {
+    let mut names: Vec<String> = names.iter().cloned().collect();
+    names.sort_unstable();
+    names
 }
 
 /// Sorted names, leaving out any whose parent is also in the set.

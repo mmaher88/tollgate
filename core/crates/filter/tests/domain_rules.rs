@@ -53,6 +53,9 @@ fn adblock_host_rule_shapes() {
 fn non_host_rules_are_skipped() {
     let skipped = [
         "|piwik.",
+        "@@|piwik.",
+        "|prefix.example",
+        "|imp.example^$important",
         "||prefix.",
         "||*.wildcard.example^",
         "/regex-ad[0-9]+/",
@@ -170,4 +173,46 @@ fn redundant_children_are_dropped_and_names_merge_across_lists() {
 fn empty_input_gives_empty_rules() {
     assert_eq!(DomainRules::parse(&[]), DomainRules::default());
     assert_eq!(parse(ListFormat::Hosts, ""), DomainRules::default());
+}
+
+#[test]
+fn single_pipe_rules_ending_in_a_caret_are_exact_hosts() {
+    let rules = parse(
+        ListFormat::Adblock,
+        "@@|cdn.example^|\n\
+         @@|WWW3.Example.net^\n\
+         |a.example^\n\
+         |b.example^|\n\
+         ||example^\n\
+         ||parent.example^\n\
+         @@|child.parent.example^|\n\
+         |piwik.\n",
+    );
+    assert_eq!(
+        rules.exact_allow,
+        names(&["cdn.example", "child.parent.example", "www3.example.net"])
+    );
+    assert_eq!(rules.exact_block, names(&["a.example", "b.example"]));
+    // Exact rules never reach the sets that cover subdomains.
+    assert!(rules.allow.is_empty());
+    assert_eq!(rules.block, names(&["parent.example"]));
+    assert!(rules.important.is_empty());
+    // `||example^` has no dot, and `|piwik.` is a prefix.
+    assert_eq!(rules.skipped, 2);
+}
+
+#[test]
+fn badfilter_cancels_exact_rules() {
+    let rules = parse(
+        ListFormat::Adblock,
+        "@@|gone.example^|\n\
+         @@|gone.example^|$badfilter\n\
+         |gone-block.example^\n\
+         |gone-block.example^$badfilter\n\
+         @@|kept.example^|\n\
+         @@||kept.example^$badfilter\n",
+    );
+    assert_eq!(rules.exact_allow, names(&["kept.example"]));
+    assert!(rules.exact_block.is_empty());
+    assert!(rules.allow.is_empty());
 }
