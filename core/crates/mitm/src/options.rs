@@ -1,5 +1,6 @@
 //! Timeouts and limits for one `serve` call.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +51,11 @@ pub struct ServeOptions {
     /// nothing, or none of its addresses answers, the system resolver is used. Default
     /// `None`: the system resolver only.
     pub resolver: Option<Arc<dyn Resolve>>,
+    /// Whether an address is still assigned to one of the device's interfaces. When the
+    /// upstream connections are reset (wake, network change), passthrough tunnels and
+    /// WebSockets whose upstream source address is gone are closed. Default
+    /// `tollgate_common::net::is_local_address`; tests pass a predicate they control.
+    pub local_address_present: fn(IpAddr) -> bool,
 }
 
 impl Default for ServeOptions {
@@ -68,6 +74,7 @@ impl Default for ServeOptions {
             tunnel_idle_timeout: Duration::from_secs(5 * 60),
             clock: tollgate_common::clock::now_secs,
             resolver: None,
+            local_address_present: tollgate_common::net::is_local_address,
         }
     }
 }

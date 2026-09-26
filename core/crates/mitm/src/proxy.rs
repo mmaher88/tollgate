@@ -17,7 +17,7 @@ use hyper_util::server::conn::auto;
 use rustls::crypto::CryptoProvider;
 use rustls::server::{ServerSessionMemoryCache, StoresServerSessions};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tollgate_common::events::EventLog;
 use tollgate_common::stats::Stats;
 use tollgate_filter::{DomainSet, FilterEngine};
@@ -52,15 +52,23 @@ pub struct ProxyContext {
     pub events: Option<Arc<EventLog>>,
     /// Bumped by [`ProxyContext::reset_upstream_connections`]; start it at 0.
     pub upstream_resets: AtomicU64,
+    /// Bumped with `upstream_resets`, for the relays (passthrough tunnels, WebSockets) to
+    /// check whether their path is gone. Start it with `Default::default()`.
+    pub path_resets: watch::Sender<u64>,
 }
 
 impl ProxyContext {
     /// Closes every pooled upstream connection that is not carrying a request, so the next
     /// request dials again. Call it when the device wakes or the network path changes: a
     /// connection on the old path usually still looks open, and a request sent on it would
-    /// hang until TCP gives up. Requests in flight finish on their connections.
+    /// hang until TCP gives up. Requests in flight finish on their connections. Passthrough
+    /// tunnels and WebSockets are closed only if their upstream source address is no longer
+    /// assigned to the device (checked now and again shortly after), so the client
+    /// reconnects on the new path while healthy transfers keep going.
     pub fn reset_upstream_connections(&self) {
         self.upstream_resets.fetch_add(1, Ordering::AcqRel);
+        // send_modify works without receivers, unlike send.
+        self.path_resets.send_modify(|resets| *resets += 1);
     }
 }
 

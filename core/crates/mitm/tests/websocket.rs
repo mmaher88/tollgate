@@ -152,3 +152,51 @@ async fn websocket_rules_block_upgrades_only() {
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     assert_eq!(proxy.stats().http_blocked, 1);
 }
+
+static WS_ADDRESS_PRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn ws_address_present(_: std::net::IpAddr) -> bool {
+    WS_ADDRESS_PRESENT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A WebSocket relay has no idle limit, so after a network change it would stay open on
+/// a dead path until the page's own heartbeat notices. A reset closes it when its upstream
+/// source address is gone, and keeps it otherwise.
+#[tokio::test]
+async fn a_reset_closes_websockets_whose_source_address_is_gone() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let ca = Arc::new(CertAuthority::generate("Tollgate Test CA").unwrap());
+    let origin_ca = Arc::new(CertAuthority::generate("Origin CA").unwrap());
+    let port = echo_origin(origin_ca.clone()).await;
+    let ctx = proxy::context(ca.clone(), &Config::default(), Some(RULES));
+    let mut options = tls_origin::trusting(&origin_ca);
+    options.local_address_present = ws_address_present;
+    let proxy = proxy::start(ctx, options).await;
+
+    let tcp = connect(proxy.addr, &format!("127.0.0.1:{port}")).await;
+    let tls = tls(tcp, tls_config(&[&ca], &[b"http/1.1"]), "ws.tollgate.test")
+        .await
+        .unwrap();
+    let mut h1 = http1(tls).await;
+    let mut response = h1.send_request(upgrade_request("/chat")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    let mut socket = TokioIo::new(hyper::upgrade::on(&mut response).await.unwrap());
+
+    proxy.ctx.reset_upstream_connections();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    socket.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    socket.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"ping", "a healthy WebSocket survives a reset");
+
+    WS_ADDRESS_PRESENT.store(false, Ordering::SeqCst);
+    proxy.ctx.reset_upstream_connections();
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(1), socket.read(&mut byte)).await;
+    assert!(
+        matches!(read, Ok(Ok(0) | Err(_))),
+        "the WebSocket is closed: {read:?}"
+    );
+}

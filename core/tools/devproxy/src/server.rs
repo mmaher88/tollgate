@@ -162,6 +162,7 @@ impl DevProxy {
             available_memory: || None,
             events: Some(events.clone()),
             upstream_resets: Default::default(),
+            path_resets: Default::default(),
         });
         let dns = Arc::new(DnsHandler::new(domains, stats));
         dns.set_allowlist(allowlist);

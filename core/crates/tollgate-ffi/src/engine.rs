@@ -475,6 +475,7 @@ impl Engine {
             available_memory,
             events: Some(events.clone()),
             upstream_resets: Default::default(),
+            path_resets: Default::default(),
         });
         let dns = Arc::new(DnsHandler::new(domains, stats.clone()));
         dns.set_allowlist(allowlist);

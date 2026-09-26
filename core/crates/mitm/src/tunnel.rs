@@ -1,15 +1,68 @@
 //! Copying bytes both ways between a client and an upstream connection until either side
 //! closes, or until nothing has moved for the idle timeout, so half-dead tunnels do not keep
-//! their sockets and their slot forever.
+//! their sockets and their slot forever; and ending such relays when their network is gone.
 
+use std::future::Future;
 use std::io;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::watch;
 use tokio::time::Instant;
+
+/// After a reset, how long until the source address is checked once more: when Wi-Fi goes
+/// away, its address can disappear a moment after the path change is reported.
+pub(crate) const PATH_RECHECK: Duration = Duration::from_secs(2);
+
+/// Runs `relay` until it ends, and returns its output. Each time the upstream connections
+/// are reset (`resets` changes), and again [`PATH_RECHECK`] later, checks whether `local`,
+/// the relay's upstream source address, is still `present` on the device; when it is not,
+/// drops `relay` (closing both of its sockets, so the client reconnects on the new path)
+/// and returns `None`. Without a source address it only runs `relay`.
+pub(crate) async fn until_path_gone<F: Future>(
+    relay: F,
+    mut resets: watch::Receiver<u64>,
+    local: Option<IpAddr>,
+    present: fn(IpAddr) -> bool,
+) -> Option<F::Output> {
+    let Some(local) = local else {
+        return Some(relay.await);
+    };
+    let mut relay = std::pin::pin!(relay);
+    let mut recheck: Option<Instant> = None;
+    loop {
+        let at = recheck;
+        let check = async move {
+            match at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            output = &mut relay => return Some(output),
+            changed = resets.changed() => {
+                if changed.is_err() {
+                    // The proxy is going away; it stops the relay itself.
+                    return Some(relay.await);
+                }
+                if !present(local) {
+                    return None;
+                }
+                recheck = Some(Instant::now() + PATH_RECHECK);
+            }
+            () = check => {
+                recheck = None;
+                if !present(local) {
+                    return None;
+                }
+            }
+        }
+    }
+}
 
 /// How a tunnel ended.
 #[derive(Debug, PartialEq, Eq)]

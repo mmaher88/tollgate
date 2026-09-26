@@ -377,6 +377,10 @@ parents). The false positive rate is about 5e-14 per lookup.
   sent once more on a new connection.
 - WebSockets over intercepted HTTPS are forwarded over a dedicated HTTP/1.1 upstream
   connection.
+- Passthrough tunnels and WebSocket relays outlive a wake or a path change unless their
+  network is gone: on each reset (`ProxyContext::path_resets`) and 2 s later, a relay whose
+  upstream socket's source address is no longer assigned to an interface (`getifaddrs`)
+  closes both sockets, so the client reconnects through a new `CONNECT` on the new path.
 - Clients using the proxy send it host names instead of looking them up, so the proxy checks
   the DNS blocklist itself (`ProxyContext::domains`, the same `DomainSet` the DNS responder
   uses, swapped together on reload): the `CONNECT` host before classification (passthrough

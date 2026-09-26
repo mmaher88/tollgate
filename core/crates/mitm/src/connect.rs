@@ -37,7 +37,7 @@ use crate::intercept::{self, Origin};
 use crate::limits::LOW_MEMORY_BYTES;
 use crate::proxy::State;
 use crate::rewind::Rewind;
-use crate::tunnel::{Ended, copy_until_idle};
+use crate::tunnel::{Ended, copy_until_idle, until_path_gone};
 use crate::upstream::{UpstreamError, connect_tcp};
 
 /// How long a new connection waits for the slot of an idle one it asked to close.
@@ -68,11 +68,13 @@ pub(crate) async fn connect(state: &Arc<State>, request: Request<Incoming>) -> R
         };
         Stats::inc(&state.ctx.stats.connections_passthrough);
         log::debug!("passthrough {host}:{port} ({reason:?})");
-        let idle = state.options.tunnel_idle_timeout;
+        let task_state = state.clone();
         state.shutdown.spawn(async move {
             let _slot = slot;
             match hyper::upgrade::on(request).await {
-                Ok(client) => tunnel(TokioIo::new(client), upstream, idle, &host, port).await,
+                Ok(client) => {
+                    tunnel(&task_state, TokioIo::new(client), upstream, &host, port).await;
+                }
                 Err(e) => log::debug!("CONNECT upgrade: {e}"),
             }
         });
@@ -225,14 +227,7 @@ where
         Ok(upstream) => {
             Stats::inc(&state.ctx.stats.connections_passthrough);
             log::debug!("passthrough {host}:{port} ({why})");
-            tunnel(
-                client,
-                upstream,
-                state.options.tunnel_idle_timeout,
-                host,
-                port,
-            )
-            .await;
+            tunnel(state, client, upstream, host, port).await;
         }
         Err(e) => log::debug!("passthrough {host}:{port} ({why}): {e}"),
     }
@@ -248,13 +243,20 @@ async fn dial(state: &State, host: &str, port: u16) -> Result<TcpStream, Upstrea
     .map_err(UpstreamError::from)
 }
 
-async fn tunnel<C>(mut client: C, mut upstream: TcpStream, idle: Duration, host: &str, port: u16)
+/// Copies until either side closes, the tunnel is idle for `tunnel_idle_timeout`, or a
+/// reset finds that the upstream socket's source address is gone.
+async fn tunnel<C>(state: &State, mut client: C, mut upstream: TcpStream, host: &str, port: u16)
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    match copy_until_idle(&mut client, &mut upstream, idle).await {
-        Ok(Ended::Closed) => {}
-        Ok(Ended::Idle) => log::debug!("tunnel {host}:{port}: idle for {idle:?}, closing"),
-        Err(e) => log::debug!("tunnel {host}:{port}: {e}"),
+    let idle = state.options.tunnel_idle_timeout;
+    let resets = state.ctx.path_resets.subscribe();
+    let local = upstream.local_addr().ok().map(|addr| addr.ip());
+    let copy = copy_until_idle(&mut client, &mut upstream, idle);
+    match until_path_gone(copy, resets, local, state.options.local_address_present).await {
+        None => log::debug!("tunnel {host}:{port}: its network is gone, closing"),
+        Some(Ok(Ended::Closed)) => {}
+        Some(Ok(Ended::Idle)) => log::debug!("tunnel {host}:{port}: idle for {idle:?}, closing"),
+        Some(Err(e)) => log::debug!("tunnel {host}:{port}: {e}"),
     }
 }

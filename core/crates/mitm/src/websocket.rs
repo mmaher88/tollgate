@@ -2,7 +2,10 @@
 //!
 //! Each upgrade gets its own HTTP/1.1 upstream connection (ALPN `http/1.1` only), because
 //! an upgraded connection can never go back to the pool. After both sides answer `101`,
-//! the two upgraded streams are copied into each other untouched.
+//! the two upgraded streams are copied into each other untouched, until either closes or
+//! a reset of the upstream connections finds that the upstream's network is gone.
+
+use std::net::IpAddr;
 
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
@@ -17,6 +20,7 @@ use crate::body::{Body, DoneBody, empty, status};
 use crate::http::strip_hop_by_hop;
 use crate::limits::{H1_MAX_BUF, MAX_HEADERS};
 use crate::proxy::State;
+use crate::tunnel::until_path_gone;
 use crate::upstream::{Target, UpstreamError, connect_tcp, connect_tls, learn_from_failure};
 
 pub(crate) fn is_upgrade<B>(request: &Request<B>) -> bool {
@@ -34,7 +38,7 @@ pub(crate) async fn forward(
     target: Target,
     request: Request<Incoming>,
 ) -> (Response<Body>, bool) {
-    let (sender, permit) = match dial(state, &target).await {
+    let (sender, permit, local) = match dial(state, &target).await {
         Ok(dialed) => dialed,
         Err(e) => {
             log::debug!("WebSocket upstream {}: {e}", target.authority());
@@ -42,16 +46,33 @@ pub(crate) async fn forward(
             return (status(StatusCode::BAD_GATEWAY), untrusted);
         }
     };
-    (upgrade(state, target, request, sender, permit).await, false)
+    let upstream = Upstream {
+        sender,
+        permit,
+        local,
+    };
+    (upgrade(state, target, request, upstream).await, false)
+}
+
+/// A dialed upstream connection for one upgrade.
+struct Upstream {
+    sender: http1::SendRequest<Body>,
+    permit: OwnedSemaphorePermit,
+    /// The TCP connection's source address.
+    local: Option<IpAddr>,
 }
 
 async fn upgrade(
     state: &State,
     target: Target,
     mut request: Request<Incoming>,
-    mut sender: http1::SendRequest<Body>,
-    permit: OwnedSemaphorePermit,
+    upstream: Upstream,
 ) -> Response<Body> {
+    let Upstream {
+        mut sender,
+        permit,
+        local,
+    } = upstream;
     let client_upgrade = hyper::upgrade::on(&mut request);
     let upgrade = request.headers().get(UPGRADE).cloned();
     let (mut parts, body) = request.into_parts();
@@ -86,14 +107,19 @@ async fn upgrade(
     }
     let upstream_upgrade = hyper::upgrade::on(&mut response);
     let authority = target.authority();
+    let resets = state.ctx.path_resets.subscribe();
+    let present = state.options.local_address_present;
     state.shutdown.spawn(async move {
         let _permit = permit;
         match tokio::join!(client_upgrade, upstream_upgrade) {
             (Ok(client), Ok(upstream)) => {
                 let mut client = TokioIo::new(client);
                 let mut upstream = TokioIo::new(upstream);
-                if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
-                    log::debug!("WebSocket {authority}: {e}");
+                let copy = tokio::io::copy_bidirectional(&mut client, &mut upstream);
+                match until_path_gone(copy, resets, local, present).await {
+                    None => log::debug!("WebSocket {authority}: its network is gone, closing"),
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => log::debug!("WebSocket {authority}: {e}"),
                 }
             }
             (client, upstream) => {
@@ -113,11 +139,19 @@ async fn upgrade(
 async fn dial(
     state: &State,
     target: &Target,
-) -> Result<(http1::SendRequest<Body>, OwnedSemaphorePermit), UpstreamError> {
+) -> Result<
+    (
+        http1::SendRequest<Body>,
+        OwnedSemaphorePermit,
+        Option<IpAddr>,
+    ),
+    UpstreamError,
+> {
     let permit = state.pool.global_permit().await?;
     let connect = async {
         let resolver = state.options.resolver.as_deref();
         let tcp = connect_tcp(resolver, &target.host, target.port).await?;
+        let local = tcp.local_addr().ok().map(|addr| addr.ip());
         let mut config = (*state.options.upstream_tls).clone();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let name = ServerName::try_from(target.server_name.clone())
@@ -133,10 +167,10 @@ async fn dial(
                 log::debug!("WebSocket upstream connection: {e}");
             }
         });
-        Ok::<_, UpstreamError>(sender)
+        Ok::<_, UpstreamError>((sender, local))
     };
-    let sender = tokio::time::timeout(state.options.connect_timeout, connect)
+    let (sender, local) = tokio::time::timeout(state.options.connect_timeout, connect)
         .await
         .map_err(|_| UpstreamError::Timeout)??;
-    Ok((sender, permit))
+    Ok((sender, permit, local))
 }

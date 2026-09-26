@@ -268,3 +268,70 @@ async fn busy_tunnels_outlive_the_idle_timeout() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+static TUNNEL_ADDRESS_PRESENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+fn tunnel_address_present(_: std::net::IpAddr) -> bool {
+    TUNNEL_ADDRESS_PRESENT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+async fn echoes(tunnel: &mut tokio::net::TcpStream, byte: u8) -> bool {
+    if tunnel.write_all(&[byte]).await.is_err() {
+        return false;
+    }
+    let mut got = [0u8; 1];
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), tunnel.read_exact(&mut got)).await,
+        Ok(Ok(_)) if got[0] == byte
+    )
+}
+
+async fn closes_within(tunnel: &mut tokio::net::TcpStream, limit: Duration) -> bool {
+    let mut byte = [0u8; 1];
+    matches!(
+        tokio::time::timeout(limit, tunnel.read(&mut byte)).await,
+        Ok(Ok(0) | Err(_))
+    )
+}
+
+/// After a wake or a network change, a passthrough tunnel whose upstream socket's source
+/// address is gone is closed, so the app reconnects on the new path instead of sending
+/// into a dead one. Tunnels whose address is still there keep going.
+#[tokio::test]
+async fn a_reset_closes_tunnels_whose_source_address_is_gone() {
+    use std::sync::atomic::Ordering;
+
+    let s = setup_with(
+        localhost_passes_through(),
+        |_| {},
+        |options| options.local_address_present = tunnel_address_present,
+    )
+    .await;
+    let echo = format!("localhost:{}", raw_origin(true).await);
+
+    // A reset while the address is still assigned keeps the tunnel.
+    let mut kept = connect(s.proxy.addr, &echo).await;
+    assert!(echoes(&mut kept, 1).await);
+    s.proxy.ctx.reset_upstream_connections();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        echoes(&mut kept, 2).await,
+        "a healthy tunnel survives a reset"
+    );
+
+    // The address can disappear a moment after the path change: checked again shortly.
+    TUNNEL_ADDRESS_PRESENT.store(false, Ordering::SeqCst);
+    assert!(
+        closes_within(&mut kept, Duration::from_secs(5)).await,
+        "closed once its address is gone"
+    );
+
+    // A tunnel whose address is gone at the reset is closed at once.
+    TUNNEL_ADDRESS_PRESENT.store(true, Ordering::SeqCst);
+    let mut gone = connect(s.proxy.addr, &echo).await;
+    assert!(echoes(&mut gone, 3).await);
+    TUNNEL_ADDRESS_PRESENT.store(false, Ordering::SeqCst);
+    s.proxy.ctx.reset_upstream_connections();
+    assert!(closes_within(&mut gone, Duration::from_millis(500)).await);
+}

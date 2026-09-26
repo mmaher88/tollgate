@@ -52,6 +52,7 @@ pub fn context(ca: Arc<CertAuthority>, config: &Config, rules: Option<&str>) -> 
         available_memory: || None,
         events: None,
         upstream_resets: Default::default(),
+        path_resets: Default::default(),
     }
 }
 
