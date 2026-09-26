@@ -16,6 +16,8 @@ final class TunnelController: ObservableObject {
     /// The last `load` call. Loads run one after another, so two of them never both create
     /// a configuration, or both remove duplicates and keep different ones.
     private var loading: Task<Void, Never>?
+    /// The last `restartIfRunning` call, so restarts do not overlap.
+    private var restarting: Task<Void, Never>?
     private var statusObserver: NSObjectProtocol?
     private var configurationObserver: NSObjectProtocol?
     private let log = Logger(subsystem: "dev.tollgate.app", category: "tunnel")
@@ -137,25 +139,100 @@ final class TunnelController: ObservableObject {
     /// Restarts a running tunnel so it picks up a new configuration, and waits until it is
     /// connected again. With `clearingLearnedPins`, forgets hosts learned as pinned while the
     /// old configuration was running (for example while the certificate was untrusted).
+    /// Restarts run one after another, and never at the same time as `start()` or `stop()`.
     func restartIfRunning(clearingLearnedPins: Bool = false) async {
-        guard isOn, let manager else {
+        let previous = restarting
+        let task = Task { @MainActor in
+            await previous?.value
+            await self.restartNow(clearingLearnedPins: clearingLearnedPins)
+        }
+        restarting = task
+        await task.value
+    }
+
+    private func restartNow(clearingLearnedPins: Bool) async {
+        while busy { try? await Task.sleep(nanoseconds: 100_000_000) }
+        busy = true
+        defer { busy = false }
+        await load()
+        guard let manager else {
             if clearingLearnedPins { Self.removeLearnedPins() }
             return
         }
-        manager.connection.stopVPNTunnel()
-        for _ in 0..<50 where manager.connection.status != .disconnected {
-            try? await Task.sleep(nanoseconds: 100_000_000)
+        switch manager.connection.status {
+        case .connected, .connecting, .reasserting:
+            break
+        case .disconnecting:
+            // Being turned off: no restart, but the stopping engine saves its pins on the
+            // way out, so the file is removed only once it is gone.
+            if clearingLearnedPins {
+                if await wait(for: .disconnected, on: manager, tries: 50) {
+                    Self.removeLearnedPins()
+                } else {
+                    lastError = "Learned certificate pins were not cleared: the tunnel is still stopping."
+                }
+            }
+            return
+        default:
+            if clearingLearnedPins { Self.removeLearnedPins() }
+            return
         }
-        if clearingLearnedPins { Self.removeLearnedPins() }
+
+        if clearingLearnedPins, manager.connection.status == .connected,
+           case .engine(let learned) = await pins(), !learned.isEmpty {
+            // A second safeguard: the engine saves the empty set at once and again on stop.
+            _ = await forgetPins(learned.map(\.host))
+        }
+        // Without this, iOS starts a new tunnel as soon as this one stops, and its engine
+        // would read learned-pins.json before it is removed.
+        let onDemand = manager.isOnDemandEnabled
+        if onDemand {
+            manager.isOnDemandEnabled = false
+            do {
+                try await manager.saveToPreferences()
+            } catch {
+                manager.isOnDemandEnabled = true
+                report(error, context: "restart")
+                return
+            }
+        }
+        manager.connection.stopVPNTunnel()
+        let stopped = await wait(for: .disconnected, on: manager, tries: 50)
+        if clearingLearnedPins {
+            if stopped {
+                Self.removeLearnedPins()
+            } else {
+                lastError = "Learned certificate pins were not cleared: the tunnel did not stop in time."
+            }
+        }
+        if onDemand {
+            manager.onDemandRules = [NEOnDemandRuleConnect()]
+            manager.isOnDemandEnabled = true
+            do {
+                try await manager.saveToPreferences()
+                try await manager.loadFromPreferences()
+            } catch {
+                report(error, context: "restart: turning Connect On Demand back on")
+            }
+        }
         do {
             try manager.connection.startVPNTunnel()
         } catch {
             report(error, context: "restart")
             return
         }
-        for _ in 0..<100 where manager.connection.status != .connected {
+        _ = await wait(for: .connected, on: manager, tries: 100)
+    }
+
+    /// Polls every 100 ms until the tunnel reaches `wanted`, at most `tries` times. True when
+    /// it did.
+    private func wait(for wanted: NEVPNStatus, on manager: NETunnelProviderManager, tries: Int) async -> Bool {
+        var polls = 0
+        while manager.connection.status != wanted, polls < tries {
             try? await Task.sleep(nanoseconds: 100_000_000)
+            polls += 1
         }
+        return manager.connection.status == wanted
     }
 
     /// Applies freshly compiled lists. The core only enables HTTPS filtering when the engine
