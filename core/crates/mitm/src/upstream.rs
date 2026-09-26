@@ -306,12 +306,13 @@ impl Pool {
                     }
                 }
             };
-            match error.take_message() {
-                Some(unsent) if !fresh => {
+            if !fresh {
+                if let Some(unsent) = error.take_message() {
                     request = unsent;
                     fresh_only = true;
+                    continue;
                 }
-                None if !fresh && let Some(copy) = replay.take() => {
+                if let Some(copy) = replay.take() {
                     log::debug!(
                         "upstream {}: {} on a reused connection; retrying on a new one",
                         target.authority(),
@@ -320,9 +321,10 @@ impl Pool {
                     request =
                         copy.map(|()| Empty::new().map_err(|never| match never {}).boxed_unsync());
                     fresh_only = true;
+                    continue;
                 }
-                _ => return Err(error.into_error().into()),
             }
+            return Err(error.into_error().into());
         }
     }
 
