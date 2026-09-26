@@ -10,10 +10,9 @@ import os
 /// which filters requests and passes pinned and Apple hosts through untouched.
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let log = Logger(subsystem: "dev.tollgate.tunnel", category: "provider")
-    /// Read from the packet-flow callback queue and written from the provider queue.
+    /// Read from the packet-flow callback queue and written from the provider queue. The
+    /// packet read loop ends once it is nil.
     private let engineState = OSAllocatedUnfairLock<Engine?>(initialState: nil)
-    /// Ends the packet read loop when the tunnel stops.
-    private let reading = OSAllocatedUnfairLock(initialState: false)
 
     private var engine: Engine? { engineState.withLock { $0 } }
     /// Watches `defaultPath` while the core runs.
@@ -150,8 +149,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             self.log.info("tunnel up")
             self.observeNetworkChanges()
-            self.reading.withLock { $0 = true }
-            Self.readPackets(engine: engine, flow: self.packetFlow, reading: self.reading, log: self.log)
+            // Started only now that engineState is set, so the first batch finds the engine.
+            Self.readPackets(engineState: self.engineState, flow: self.packetFlow, log: self.log)
             completionHandler(nil)
         }
     }
@@ -188,7 +187,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Clears the reference under the lock, then stops outside it (stop joins a thread).
     private func takeAndStopEngine() {
-        reading.withLock { $0 = false }
         let running = engineState.withLock { state -> Engine? in
             defer { state = nil }
             return state
@@ -225,11 +223,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// DNS packets go to the core. Answers it can give at once are written here; answers
     /// that need an upstream lookup arrive later through `FlowSink`. The loop captures only
-    /// Sendable values, never the provider.
-    private static func readPackets(engine: Engine, flow: NEPacketTunnelFlow,
-                                    reading: OSAllocatedUnfairLock<Bool>, log: Logger) {
-        flow.readPackets { packets, _ in
-            guard reading.withLock({ $0 }) else { return }
+    /// the engine's lock and a weak flow, never the provider or the engine: the read that is
+    /// still pending after stopTunnel keeps neither the stopped engine (with its lists) nor
+    /// the flow alive, and ends the loop when it completes.
+    private static func readPackets(engineState: OSAllocatedUnfairLock<Engine?>,
+                                    flow: NEPacketTunnelFlow, log: Logger) {
+        flow.readPackets { [weak flow] packets, _ in
+            // Copy the engine out and call it outside the lock: takeAndStopEngine takes the
+            // same lock on the provider queue.
+            guard let flow, let engine = engineState.withLock({ $0 }) else { return }
             do {
                 let replies = try engine.handlePackets(packets: packets)
                 if !replies.isEmpty {
@@ -238,7 +240,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             } catch {
                 log.error("handlePackets failed: \(String(describing: error), privacy: .public)")
             }
-            readPackets(engine: engine, flow: flow, reading: reading, log: log)
+            readPackets(engineState: engineState, flow: flow, log: log)
         }
     }
 
