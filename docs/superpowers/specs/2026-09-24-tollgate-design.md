@@ -107,8 +107,10 @@ tollgate/
   ECH hints.
 - Everything else: forward over DNS-over-HTTPS (RFC 8484, POST `application/dns-message`,
   HTTP/2) to upstreams reached by IP with the TLS name set explicitly, defaults Cloudflare
-  `1.1.1.1` (`cloudflare-dns.com`) and Quad9 `9.9.9.9` (`dns.quad9.net`). Sockets opened by
-  the extension bypass the tunnel, so upstream traffic cannot loop.
+  `1.1.1.1` (`cloudflare-dns.com`) and Quad9 `9.9.9.9` (`dns.quad9.net`), then the same two
+  over IPv6 (`2606:4700:4700::1111`, `2620:fe::fe`) for IPv6-only networks with NAT64 and no
+  CLAT, where a direct connect to an IPv4 literal fails. Sockets opened by the extension
+  bypass the tunnel, so upstream traffic cannot loop.
 - LRU cache of 2,000 answers keyed by (name, type, class), honoring the minimum TTL, clamped
   to 10 s to 1 h.
 - On upstream failure: try the next upstream, then answer SERVFAIL.
@@ -441,7 +443,8 @@ pub struct DohUpstream { pub ip: std::net::IpAddr, pub port: u16, pub tls_name: 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub doh_upstreams: Vec<DohUpstream>,     // default: Cloudflare 1.1.1.1, Quad9 9.9.9.9
+    pub doh_upstreams: Vec<DohUpstream>,     // default: Cloudflare 1.1.1.1, Quad9 9.9.9.9,
+                                             // then 2606:4700:4700::1111, 2620:fe::fe
     pub passthrough: Vec<String>,            // user host patterns
     pub mitm_enabled: bool,                  // default true
     pub max_intercepted_connections: u32,    // default 32

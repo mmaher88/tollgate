@@ -21,8 +21,25 @@ fn defaults_match_the_spec() {
                 tls_name: "dns.quad9.net".into(),
                 path: "/dns-query".into(),
             },
+            DohUpstream {
+                ip: "2606:4700:4700::1111".parse().unwrap(),
+                port: 443,
+                tls_name: "cloudflare-dns.com".into(),
+                path: "/dns-query".into(),
+            },
+            DohUpstream {
+                ip: "2620:fe::fe".parse().unwrap(),
+                port: 443,
+                tls_name: "dns.quad9.net".into(),
+                path: "/dns-query".into(),
+            },
         ]
     );
+    // An IPv6-only network with NAT64 but no CLAT cannot reach the IPv4 literals.
+    assert!(config.doh_upstreams.iter().any(|u| u.ip.is_ipv6()));
+    // IPv4 first, so a dual-stack network with broken IPv6 only pays for the IPv6
+    // attempts when both IPv4 upstreams are already down.
+    assert!(config.doh_upstreams[..2].iter().all(|u| u.ip.is_ipv4()));
     assert!(config.passthrough.is_empty());
     assert!(config.allowlist.is_empty());
     assert!(config.mitm_enabled);
@@ -37,7 +54,9 @@ fn default_json_has_stable_field_names() {
         json!({
             "doh_upstreams": [
                 {"ip": "1.1.1.1", "port": 443, "tls_name": "cloudflare-dns.com", "path": "/dns-query"},
-                {"ip": "9.9.9.9", "port": 443, "tls_name": "dns.quad9.net", "path": "/dns-query"}
+                {"ip": "9.9.9.9", "port": 443, "tls_name": "dns.quad9.net", "path": "/dns-query"},
+                {"ip": "2606:4700:4700::1111", "port": 443, "tls_name": "cloudflare-dns.com", "path": "/dns-query"},
+                {"ip": "2620:fe::fe", "port": 443, "tls_name": "dns.quad9.net", "path": "/dns-query"}
             ],
             "passthrough": [],
             "allowlist": [],

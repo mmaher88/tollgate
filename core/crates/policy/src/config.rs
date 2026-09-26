@@ -1,6 +1,6 @@
 //! `config.json`, written by the app and read by the tunnel.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,26 @@ impl DohUpstream {
             path: "/dns-query".to_string(),
         }
     }
+
+    /// Cloudflare over IPv6, `2606:4700:4700::1111` as `cloudflare-dns.com`.
+    pub fn cloudflare_v6() -> DohUpstream {
+        DohUpstream {
+            ip: IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+            port: 443,
+            tls_name: "cloudflare-dns.com".to_string(),
+            path: "/dns-query".to_string(),
+        }
+    }
+
+    /// Quad9 over IPv6, `2620:fe::fe` as `dns.quad9.net`.
+    pub fn quad9_v6() -> DohUpstream {
+        DohUpstream {
+            ip: IpAddr::V6(Ipv6Addr::new(0x2620, 0xfe, 0, 0, 0, 0, 0, 0xfe)),
+            port: 443,
+            tls_name: "dns.quad9.net".to_string(),
+            path: "/dns-query".to_string(),
+        }
+    }
 }
 
 /// Tunnel configuration. Missing fields take their defaults and unknown fields are
@@ -53,7 +73,11 @@ impl DohUpstream {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Tried in order. Default: Cloudflare, then Quad9.
+    /// Tried in order. Default: Cloudflare, then Quad9, then the same two over IPv6. The
+    /// resolver connects to these addresses directly, and iOS synthesizes NAT64 addresses
+    /// only through getaddrinfo, so on an IPv6-only network without CLAT only the IPv6
+    /// upstreams are reachable. The IPv4 ones come first so that a dual-stack network with
+    /// broken IPv6 pays for the IPv6 attempts only when both IPv4 upstreams are down.
     pub doh_upstreams: Vec<DohUpstream>,
     /// User host patterns that are never intercepted, see [`crate::HostPattern`].
     pub passthrough: Vec<String>,
@@ -70,7 +94,12 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
-            doh_upstreams: vec![DohUpstream::cloudflare(), DohUpstream::quad9()],
+            doh_upstreams: vec![
+                DohUpstream::cloudflare(),
+                DohUpstream::quad9(),
+                DohUpstream::cloudflare_v6(),
+                DohUpstream::quad9_v6(),
+            ],
             passthrough: Vec::new(),
             allowlist: Vec::new(),
             mitm_enabled: true,

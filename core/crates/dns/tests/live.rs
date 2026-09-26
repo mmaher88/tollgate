@@ -1,5 +1,5 @@
 //! Queries the real default upstreams. Needs network access to 1.1.1.1:443 and
-//! 9.9.9.9:443. Run with:
+//! 9.9.9.9:443, and IPv6 for the IPv6 upstreams. Run with:
 //!   cargo test -p tollgate-dns --test live -- --ignored
 
 mod support;
@@ -18,7 +18,17 @@ use tollgate_policy::{Config, DohUpstream};
 #[tokio::test]
 #[ignore = "needs network access to 1.1.1.1:443 and 9.9.9.9:443"]
 async fn each_default_upstream_answers() {
-    for upstream in [DohUpstream::cloudflare(), DohUpstream::quad9()] {
+    each_answers([DohUpstream::cloudflare(), DohUpstream::quad9()]).await;
+}
+
+#[tokio::test]
+#[ignore = "needs IPv6 network access to 2606:4700:4700::1111:443 and 2620:fe::fe:443"]
+async fn each_ipv6_upstream_answers() {
+    each_answers([DohUpstream::cloudflare_v6(), DohUpstream::quad9_v6()]).await;
+}
+
+async fn each_answers(upstreams: [DohUpstream; 2]) {
+    for upstream in upstreams {
         let name = upstream.tls_name.clone();
         let resolver = DohResolver::new(vec![upstream]);
         for (id, rtype) in [(0x4242, RecordType::A), (0x4243, RecordType::AAAA)] {
