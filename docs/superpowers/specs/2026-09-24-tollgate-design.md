@@ -429,7 +429,10 @@ about 5e-14 per lookup.
   statistic only, until E4 shows how iOS clients actually fail. An upstream certificate the
   proxy cannot verify (unknown issuer or missing intermediate: webpki roots, no
   intermediate fetching), a server the proxy's TLS client shares no version or cipher suite
-  with, or one that requires a client certificate makes the SNI name a learned pin at once;
+  with, or one that requires a client certificate (it asked for one and then failed the
+  TLS 1.2 handshake, or sent a fatal TLS 1.3 alert in place of the first response; any
+  other failure after an optional request, such as a reset, teaches nothing) makes the SNI
+  name a learned pin at once;
   the request that failed gets `502`, its client connection is closed, and later
   connections are passed through for the client to handle. A certificate for another name,
   expired, not yet valid, revoked or for another purpose only gets `502`: the client would
