@@ -68,6 +68,24 @@ pub async fn proxy_get(proxy: SocketAddr, url: &str, headers: &[(&str, &str)]) -
     send1(&mut sender, request).await
 }
 
+/// Sends `GET url` to the proxy in absolute form on a new connection and returns every
+/// byte the proxy sends until it closes the connection (within 5 s).
+pub async fn proxy_get_raw(proxy: SocketAddr, url: &str) -> Vec<u8> {
+    use tokio::io::AsyncWriteExt;
+    let host = url
+        .parse::<hyper::Uri>()
+        .unwrap()
+        .authority()
+        .unwrap()
+        .to_string();
+    let mut tcp = TcpStream::connect(proxy).await.unwrap();
+    let request = format!("GET {url} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+    tcp.write_all(request.as_bytes()).await.unwrap();
+    read_to_close(&mut tcp, Duration::from_secs(5))
+        .await
+        .expect("the proxy did not close the connection")
+}
+
 /// Polls `condition` every 10 ms for up to 5 s.
 pub async fn wait_for(what: &str, condition: impl Fn() -> bool) {
     for _ in 0..500 {

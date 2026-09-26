@@ -155,11 +155,11 @@ fn gets_no_response(error: &UpstreamError) -> bool {
     is_unreachable(error) || closed_without_response(error)
 }
 
-/// `502` for a failed upstream request. The client accepted the proxy's certificate, so it
-/// cannot show its own warning for a server certificate that is expired or for another
-/// name; a short text says what is wrong instead of an empty page. Anything else gets an
-/// empty `502`.
-fn bad_gateway(error: &UpstreamError) -> Response<Body> {
+/// `502` for a failed upstream request. The client accepted the proxy's certificate (or,
+/// for an absolute-form `https://` request, left TLS to the proxy), so it cannot show its
+/// own warning for a server certificate that is expired or for another name; a short text
+/// says what is wrong instead of an empty page. Anything else gets an empty `502`.
+pub(crate) fn bad_gateway(error: &UpstreamError) -> Response<Body> {
     match certificate_problem(error) {
         Some(problem) => text(
             StatusCode::BAD_GATEWAY,

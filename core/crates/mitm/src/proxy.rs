@@ -1,6 +1,5 @@
 //! The proxy's listener, its shared state and the first request on each connection.
 
-use std::convert::Infallible;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -29,6 +28,7 @@ use crate::limits::{
     H1_MAX_BUF, H2_CONNECTION_WINDOW, H2_MAX_SEND_BUF, H2_STREAM_WINDOW, KEEP_ALIVE_TIMEOUT,
     MAX_HEADER_LIST, MAX_HEADERS, MIN_IDLE_TO_RECLAIM,
 };
+use crate::request::NoResponse;
 use crate::shutdown::{self, Shutdown};
 use crate::throttle::LogThrottle;
 use crate::upstream::{Pool, PoolOptions, UpstreamError, is_unreachable};
@@ -287,15 +287,17 @@ async fn serve_client(state: Arc<State>, tcp: TcpStream) {
     }
 }
 
+/// The service for one request on a client connection. [`NoResponse`] from a plain
+/// request closes the connection without a response.
 async fn front(
     state: Arc<State>,
     in_flight: InFlight,
     request: Request<Incoming>,
-) -> Result<Response<Body>, Infallible> {
+) -> Result<Response<Body>, NoResponse> {
     let response = if request.method() == Method::CONNECT {
         connect::connect(&state, request).await
     } else {
-        forward::forward(&state, request).await
+        forward::forward(&state, request).await?
     };
     Ok(response.map(|body| DoneBody::new(body, move || drop(in_flight)).boxed_unsync()))
 }

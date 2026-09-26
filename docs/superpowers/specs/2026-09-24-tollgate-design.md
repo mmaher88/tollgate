@@ -123,7 +123,9 @@ tollgate/
   (Built directly on hyper, tokio-rustls, rustls with the `ring` provider, and rcgen. We may
   use `hudsucker` if it fits the memory budget and gives us the hooks we need; the decision is
   made during M1 and recorded in the plan.)
-- Plain HTTP requests: filtered, then forwarded.
+- Plain HTTP requests: filtered, then forwarded. When the upstream cannot be reached, the
+  client connection closes without a response, so Safari shows its own error page as
+  without the proxy, not an empty `502`.
 - `CONNECT host:port`: `Policy::classify` on the host. Passthrough copies bytes both ways
   untouched. Intercept replies `200`, peeks the ClientHello for SNI, terminates TLS with a
   leaf for that name, and serves HTTP/1.1 or HTTP/2 depending on ALPN.
@@ -391,9 +393,11 @@ about 5e-14 per lookup.
   connection before any response (or resets the HTTP/2 stream or sends GOAWAY), without a
   TLS error, the request gets no response: HTTP/1.1 closes the connection and HTTP/2
   resets the stream, so the browser shows its own error page or falls back from
-  `https://` to `http://`, as without the proxy. An unreachable host is logged at info
-  level, at most once a minute. No free upstream connection gets `503`; upstream TLS
-  failures and anything else get `502` (see pin learning).
+  `https://` to `http://`, as without the proxy. Plain absolute-form requests (`http://`
+  through the system proxy) whose upstream cannot be reached get no response either: the
+  client connection closes. An unreachable host is logged at info level, at most once a
+  minute. No free upstream connection gets `503`; upstream TLS failures and anything else
+  get `502` (see pin learning).
 - WebSockets over intercepted HTTPS are forwarded over a dedicated HTTP/1.1 upstream
   connection.
 - Passthrough tunnels and WebSocket relays outlive a wake or a path change unless their

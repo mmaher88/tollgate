@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 use tollgate_mitm::{CertAuthority, ServeOptions, accept_backoff};
 use tollgate_policy::Config;
 
-use support::client::{proxy_get, read_to_close, wait_for};
+use support::client::{proxy_get, proxy_get_raw, read_to_close, wait_for};
 use support::{origin, proxy};
 
 const RULES: &str = "\
@@ -177,12 +177,14 @@ async fn idle_connections_make_room_under_the_global_limit() {
 }
 
 #[tokio::test]
-async fn unreachable_upstream_gets_502_and_bad_requests_400() {
+async fn unreachable_upstream_gets_no_response_and_bad_requests_400() {
     let proxy = start(ServeOptions::default()).await;
     let port = origin::closed_port().await;
 
-    let reply = proxy_get(proxy.addr, &format!("http://127.0.0.1:{port}/"), &[]).await;
-    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    // The connection closes without a response, so the browser shows its own error page
+    // instead of an empty one, as without the proxy.
+    let response = proxy_get_raw(proxy.addr, &format!("http://127.0.0.1:{port}/")).await;
+    assert_eq!(String::from_utf8_lossy(&response), "");
 
     let mut tcp = TcpStream::connect(proxy.addr).await.unwrap();
     tcp.write_all(b"GET /relative HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")

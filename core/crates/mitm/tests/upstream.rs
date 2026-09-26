@@ -9,7 +9,7 @@ use hyper::StatusCode;
 use tollgate_mitm::{CertAuthority, ServeOptions};
 use tollgate_policy::Config;
 
-use support::client::{get, http1, proxy_get, send1, wait_for};
+use support::client::{get, http1, proxy_get, proxy_get_raw, send1, wait_for};
 use support::tunnel::{connect, http2, issuer_via, peer_issuer, send2, tls, tls_config};
 use support::{proxy, tls_origin};
 
@@ -161,8 +161,8 @@ async fn an_intercepted_host_with_an_unverifiable_certificate_is_learned() {
 async fn an_unreachable_origin_is_not_learned() {
     let proxy = start(ServeOptions::default()).await;
     let port = support::origin::closed_port().await;
-    let reply = proxy_get(proxy.addr, &format!("https://localhost:{port}/"), &[]).await;
-    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    let response = proxy_get_raw(proxy.addr, &format!("https://localhost:{port}/")).await;
+    assert_eq!(String::from_utf8_lossy(&response), "");
     assert!(proxy.ctx.policy.learned_pins().is_empty());
 }
 

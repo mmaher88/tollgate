@@ -12,7 +12,7 @@ use rustls::version::{TLS12, TLS13};
 use tollgate_mitm::CertAuthority;
 use tollgate_policy::Config;
 
-use support::client::{get, proxy_get};
+use support::client::{get, proxy_get, proxy_get_raw};
 use support::tls_origin::{self, ClientAuth, HangUp};
 use support::tunnel::{connect, http2, peer_issuer, send2, tls, tls_config};
 use support::{origin, proxy};
@@ -205,6 +205,7 @@ async fn a_server_asking_for_an_optional_client_certificate_that_hangs_up_is_not
 async fn a_closed_port_is_still_not_learned() {
     let proxy = start(&ca("Origin CA")).await;
     let port = origin::closed_port().await;
-    assert_eq!(status_via(&proxy, port).await, StatusCode::BAD_GATEWAY);
+    let response = proxy_get_raw(proxy.addr, &format!("https://localhost:{port}/")).await;
+    assert_eq!(String::from_utf8_lossy(&response), "");
     assert!(learned(&proxy).is_empty());
 }
