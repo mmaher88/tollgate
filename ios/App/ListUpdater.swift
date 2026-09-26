@@ -18,9 +18,19 @@ final class ListUpdater: ObservableObject {
 
     @Published private(set) var state: State = .idle
     @Published private(set) var lastReport: CompileReport?
+    /// When every enabled list was last downloaded and compiled.
     @Published private(set) var lastUpdated: Date?
+    /// When the last full update (downloading every list) ran, whatever its outcome.
+    /// Staleness is based on this, so a list that keeps failing does not make every
+    /// foreground and every reconnect download everything again.
+    @Published private(set) var lastAttempt: Date?
+    /// The last full update could not download every list (or failed altogether).
+    @Published private(set) var lastAttemptPartial = false
     /// Lists that could not be downloaded in the last run (a cached copy may have been used).
-    @Published private(set) var warnings: [String] = []
+    /// Kept across launches, so the reason for a retry backoff stays visible.
+    @Published private(set) var warnings: [String] = [] {
+        didSet { UserDefaults.standard.set(warnings, forKey: Self.warningsKey) }
+    }
     /// Whether compiled lists exist, observable by the UI.
     @Published private(set) var compiled = FilterLists.compiled
     /// Settings changed since the last successful compile; applied at the next opportunity.
@@ -28,20 +38,43 @@ final class ListUpdater: ObservableObject {
 
     private let log = Logger(subsystem: "dev.tollgate.app", category: "lists")
     private static let lastUpdatedKey = "lists.lastUpdated"
+    private static let lastAttemptKey = "lists.lastAttempt"
+    private static let lastAttemptPartialKey = "lists.lastAttemptPartial"
+    private static let warningsKey = "lists.warnings"
     private static let pendingKey = "lists.pendingSettingsChange"
 
     /// Lists older than this are refreshed on launch, on returning to the foreground and by
     /// the background refresh task.
     nonisolated static let maxAge: TimeInterval = 24 * 60 * 60
+    /// Retry delay after a full update that could not download some lists.
+    static let partialRetry: TimeInterval = 60 * 60
+    /// Retry delay while no compiled lists exist (offline at first launch).
+    static let missingRetry: TimeInterval = 15 * 60
+    /// A last attempt this far in the future means the clock was set back (for example
+    /// after moving the date forward to test updates); the lists then count as stale.
+    static let clockTolerance: TimeInterval = 5 * 60
 
     init() {
-        lastUpdated = UserDefaults.standard.object(forKey: Self.lastUpdatedKey) as? Date
-        pendingSettingsChange = UserDefaults.standard.bool(forKey: Self.pendingKey)
+        let defaults = UserDefaults.standard
+        lastUpdated = defaults.object(forKey: Self.lastUpdatedKey) as? Date
+        // Installs from before attempts were recorded: their last success was an attempt.
+        lastAttempt = defaults.object(forKey: Self.lastAttemptKey) as? Date ?? lastUpdated
+        lastAttemptPartial = defaults.bool(forKey: Self.lastAttemptPartialKey)
+        warnings = defaults.stringArray(forKey: Self.warningsKey) ?? []
+        pendingSettingsChange = defaults.bool(forKey: Self.pendingKey)
     }
 
+    /// Whether an automatic full update is due. Based on the last attempt, not the last
+    /// success: after a partial or failed attempt it retries after an hour (15 minutes
+    /// while nothing is compiled), otherwise after a day. The Update buttons call
+    /// `update()` directly and are not held back.
     var isStale: Bool {
-        guard compiled, let lastUpdated else { return true }
-        return Date().timeIntervalSince(lastUpdated) > Self.maxAge
+        guard let lastAttempt else { return true }
+        let age = Date().timeIntervalSince(lastAttempt)
+        if age < -Self.clockTolerance { return true }
+        if !compiled { return age > Self.missingRetry }
+        if lastAttemptPartial { return age > Self.partialRetry }
+        return age > Self.maxAge
     }
 
     var needsWork: Bool { isStale || pendingSettingsChange }
@@ -134,6 +167,7 @@ final class ListUpdater: ObservableObject {
         }
         if !sources.isEmpty, inputs.isEmpty {
             warnings = problems
+            if refresh { recordAttempt(partial: true) }
             state = .failed(problems.first ?? "No list could be downloaded")
             return false
         }
@@ -160,10 +194,13 @@ final class ListUpdater: ObservableObject {
             lastReport = report
             compiled = true
             warnings = problems
-            if refresh && allDownloaded {
-                let now = Date()
-                lastUpdated = now
-                UserDefaults.standard.set(now, forKey: Self.lastUpdatedKey)
+            if refresh {
+                recordAttempt(partial: !allDownloaded)
+                if allDownloaded {
+                    let now = Date()
+                    lastUpdated = now
+                    UserDefaults.standard.set(now, forKey: Self.lastUpdatedKey)
+                }
             }
             if ListSettings.load() == settings {
                 pendingSettingsChange = false
@@ -174,9 +211,18 @@ final class ListUpdater: ObservableObject {
             return true
         } catch {
             log.error("list compile failed: \(String(describing: error), privacy: .public)")
+            if refresh { recordAttempt(partial: true) }
             state = .failed("Compile: \(error.localizedDescription)")
             return false
         }
+    }
+
+    private func recordAttempt(partial: Bool) {
+        let now = Date()
+        lastAttempt = now
+        lastAttemptPartial = partial
+        UserDefaults.standard.set(now, forKey: Self.lastAttemptKey)
+        UserDefaults.standard.set(partial, forKey: Self.lastAttemptPartialKey)
     }
 
     private static func isCancellation(_ error: Error) -> Bool {

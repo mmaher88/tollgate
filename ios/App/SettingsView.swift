@@ -142,10 +142,14 @@ struct FilterListsView: View {
         case let .failed(message): return "Update failed: \(message)"
         case .idle:
             if lists.pendingSettingsChange { return "Changes are not applied yet." }
-            if let date = lists.lastUpdated {
-                return "Updated \(date.formatted(date: .abbreviated, time: .shortened))"
+            let updated = lists.lastUpdated?.formatted(date: .abbreviated, time: .shortened)
+            if lists.lastAttemptPartial, let attempt = lists.lastAttempt {
+                var text = "Checked \(attempt.formatted(date: .abbreviated, time: .shortened)); some lists could not be downloaded and are retried hourly."
+                if let updated { text += " All lists were last updated \(updated)." }
+                return text
             }
-            return "Not downloaded yet"
+            if let updated { return "Updated \(updated)" }
+            return lists.compiled ? "Installed" : "Not downloaded yet"
         }
     }
 
