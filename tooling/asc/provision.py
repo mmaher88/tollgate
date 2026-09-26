@@ -16,7 +16,7 @@ Commands (all idempotent):
   bundle-ids   create the app and tunnel App IDs, enable Network Extensions and App Groups
   cert         create an Apple Development certificate and a macOS-compatible .p12
   profiles     (re)create development profiles and verify their entitlements
-  setup        device, bundle-ids, cert (if missing), profiles
+  setup        device (or --udid/--name), bundle-ids, cert (if missing), profiles
 """
 from __future__ import annotations
 
@@ -145,14 +145,37 @@ def cmd_check(c: Client, cfg: dict) -> None:
 
 
 def connected_udid() -> tuple[str, str]:
+    """The UDID and name of the one iPhone connected by USB: through libimobiledevice when
+    it is installed, otherwise through the pinned pymobiledevice3 (tooling/scripts/device.sh)."""
     try:
         out = subprocess.run(["idevice_id", "-l"], capture_output=True, text=True).stdout.split()
     except FileNotFoundError:
-        sys.exit("idevice_id not found (install libimobiledevice), or pass --udid and --name")
+        return connected_udid_pymobiledevice3()
     if len(out) != 1:
         sys.exit("connect exactly one iPhone by USB, or pass --udid and --name")
     name = subprocess.run(["ideviceinfo", "-u", out[0], "-k", "DeviceName"], capture_output=True, text=True).stdout.strip()
     return out[0], name or "iPhone"
+
+
+def connected_udid_pymobiledevice3() -> tuple[str, str]:
+    script = ROOT / "tooling" / "scripts" / "device.sh"
+    try:
+        run = subprocess.run([str(script), "usbmux", "list", "--usb"], capture_output=True, text=True)
+    except FileNotFoundError:
+        sys.exit("neither idevice_id nor uv found; install libimobiledevice or uv, or pass --udid and --name")
+    try:
+        devices = json.loads(run.stdout) if run.returncode == 0 else None
+    except json.JSONDecodeError:
+        devices = None
+    if devices is None:
+        sys.exit(f"could not list devices with pymobiledevice3 ({run.stderr.strip()}); pass --udid and --name")
+    if len(devices) != 1:
+        sys.exit("connect exactly one iPhone by USB, or pass --udid and --name")
+    device = devices[0]
+    udid = device.get("UniqueDeviceID") or device.get("Identifier")
+    if not udid:
+        sys.exit("pymobiledevice3 reported no UDID; pass --udid and --name")
+    return udid, device.get("DeviceName") or "iPhone"
 
 
 def cmd_device(c: Client, udid: str | None, name: str | None) -> None:
@@ -270,15 +293,17 @@ def cmd_profiles(c: Client, cfg: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
+    # The device options, shared by `device` and `setup` so they cannot drift apart.
+    device_options = argparse.ArgumentParser(add_help=False)
+    device_options.add_argument("--udid", help="UDID of the iPhone to register (default: the one connected by USB)")
+    device_options.add_argument("--name", help="name for the iPhone in the developer portal")
     sub.add_parser("check")
-    dev = sub.add_parser("device")
-    dev.add_argument("--udid")
-    dev.add_argument("--name")
+    sub.add_parser("device", parents=[device_options])
     sub.add_parser("bundle-ids")
     cert = sub.add_parser("cert")
     cert.add_argument("--force", action="store_true")
     sub.add_parser("profiles")
-    sub.add_parser("setup")
+    sub.add_parser("setup", parents=[device_options])
     args = parser.parse_args()
 
     cfg = load_config(ROOT / "tooling" / "config.env")
@@ -294,7 +319,7 @@ def main() -> None:
     elif args.command == "profiles":
         cmd_profiles(c, cfg)
     elif args.command == "setup":
-        cmd_device(c, None, None)
+        cmd_device(c, args.udid, args.name)
         cmd_bundle_ids(c, cfg)
         cmd_cert(c)
         cmd_profiles(c, cfg)

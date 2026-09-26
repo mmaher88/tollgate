@@ -54,6 +54,9 @@ sites, never-filtered hosts and learned certificate pins. The core is verified o
 
    This registers the phone, creates both App IDs with the Network Extensions and App Groups
    capabilities, creates an Apple Development certificate and the development profiles.
+   The phone's UDID and name are read with libimobiledevice, or with the pinned
+   pymobiledevice3 when it is not installed. If more than one device is connected, or
+   neither tool can read them, add `--udid <UDID> --name <name>`.
 4. In the portal, assign the App Group to both App IDs, then run
    `tooling/asc/provision.py profiles` again.
 5. `tooling/asc/push-secrets.sh` stores the certificate and profiles as repository secrets.
