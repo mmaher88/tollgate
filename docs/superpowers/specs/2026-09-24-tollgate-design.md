@@ -370,9 +370,11 @@ drops redundant children of blocked parents. The false positive rate is about 5e
   `bad_certificate`, `certificate_unknown`, `decrypt_error`) count, two within 10 minutes.
   Connections that finish the handshake and close without a request are counted as a
   statistic only, until E4 shows how iOS clients actually fail. An upstream certificate the
-  proxy cannot verify (webpki roots, no intermediate fetching) makes the SNI name a learned
-  pin at once, since it fails the same way every time; the request that failed gets `502`
-  and later connections are passed through for the client to verify.
+  proxy cannot verify (webpki roots, no intermediate fetching), a server the proxy's TLS
+  client shares no version or cipher suite with, or one that requires a client certificate
+  makes the SNI name a learned pin at once, since it fails the same way every time; the
+  request that failed gets `502`, its client connection is closed, and later connections
+  are passed through for the client to handle.
 
 **ffi.**
 - Foreign traits use `#[uniffi::export(foreign)]`: `CoreLogger` (not `Logger`, which would

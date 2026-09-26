@@ -221,10 +221,12 @@ impl Policy {
         }
     }
 
-    /// Makes `host` a learned pin at once because the proxy could not verify the upstream
-    /// server's certificate (for example a missing intermediate, or a root that only the
-    /// system trusts). Such a failure repeats on every connection, and the client, which
-    /// can fetch intermediates and trusts the system roots, is the better judge once the
+    /// Makes `host` a learned pin at once because the proxy's TLS client cannot talk to the
+    /// upstream server: its certificate could not be verified (for example a missing
+    /// intermediate, or a root that only the system trusts), it shares no protocol version
+    /// or cipher suite with the proxy, or it requires a client certificate. Such a failure
+    /// repeats on every connection, and the client, which can fetch intermediates, trusts
+    /// the system roots and may hold the certificate, is the better judge once the
     /// connection is passed through. Returns true when the host became a pin; false when it
     /// already was one or `host` is empty. The pin expires like any other.
     pub fn learn_upstream_untrusted(&self, host: &str, now: u64) -> bool {

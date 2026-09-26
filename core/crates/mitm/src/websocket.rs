@@ -4,8 +4,6 @@
 //! an upgraded connection can never go back to the pool. After both sides answer `101`,
 //! the two upgraded streams are copied into each other untouched.
 
-use std::sync::Arc;
-
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::client::conn::http1;
@@ -14,13 +12,12 @@ use hyper::{Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use tokio::sync::OwnedSemaphorePermit;
-use tokio_rustls::TlsConnector;
 
 use crate::body::{Body, DoneBody, empty, status};
 use crate::http::strip_hop_by_hop;
 use crate::limits::H1_MAX_BUF;
 use crate::proxy::State;
-use crate::upstream::{Target, UpstreamError, connect_tcp, learn_from_failure};
+use crate::upstream::{Target, UpstreamError, connect_tcp, connect_tls, learn_from_failure};
 
 pub(crate) fn is_upgrade<B>(request: &Request<B>) -> bool {
     request.version() == Version::HTTP_11
@@ -30,8 +27,8 @@ pub(crate) fn is_upgrade<B>(request: &Request<B>) -> bool {
             .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
 }
 
-/// The response, and whether the upstream certificate could not be verified (the host is
-/// then a learned pin, and the client connection should close).
+/// The response, and whether the upstream TLS failed in a way that makes the host a learned
+/// pin (the client connection should then close).
 pub(crate) async fn forward(
     state: &State,
     target: Target,
@@ -125,9 +122,7 @@ async fn dial(
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let name = ServerName::try_from(target.server_name.clone())
             .map_err(|_| UpstreamError::ServerName(target.server_name.clone()))?;
-        let tls = TlsConnector::from(Arc::new(config))
-            .connect(name, tcp)
-            .await?;
+        let (tls, _) = connect_tls(&config, name, tcp).await?;
         let (sender, conn) = http1::Builder::new()
             .max_buf_size(H1_MAX_BUF)
             .handshake(TokioIo::new(tls))

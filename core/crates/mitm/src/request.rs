@@ -55,8 +55,8 @@ async fn respond(
     (response, passed_through || untrusted)
 }
 
-/// Filters and forwards one request. The flag is true when the upstream certificate could
-/// not be verified, which makes the host a learned pin.
+/// Filters and forwards one request. The flag is true when the upstream TLS failed in a way
+/// that makes the host a learned pin (see `upstream::needs_passthrough`).
 async fn forward(
     state: &State,
     origin: &Origin,

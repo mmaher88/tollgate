@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -25,12 +25,15 @@ use hyper::header::{self, HeaderValue};
 use hyper::rt::{Read, Write};
 use hyper::{Method, Request, Response, Uri, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use rustls::ClientConfig;
+use rustls::client::ResolvesClientCert;
 use rustls::pki_types::ServerName;
+use rustls::sign::CertifiedKey;
+use rustls::{AlertDescription, ClientConfig, SignatureScheme};
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use tollgate_common::resolve::Resolve;
 
 use crate::ProxyContext;
@@ -74,35 +77,120 @@ impl Target {
     }
 }
 
-/// True when the upstream server's certificate could not be verified (unknown issuer,
-/// expired, wrong name, bad signature and so on). Timeouts, connection failures and HTTP
-/// errors are not.
-pub(crate) fn is_untrusted_certificate(error: &UpstreamError) -> bool {
-    let UpstreamError::Connect(io) = error else {
-        return false;
-    };
-    // tokio-rustls reports TLS errors as io::Error(InvalidData) wrapping the rustls error.
+/// True when the upstream TLS failure is one the client, talking to the server itself,
+/// probably would not have: the server's certificate could not be verified (unknown
+/// issuer, missing intermediate, a root only the system trusts), the server shares no
+/// protocol version or cipher suite with the proxy's TLS client (old TLS, CBC-only), or
+/// it requires a client certificate the proxy cannot present. Timeouts, connection
+/// failures, HTTP errors and other TLS alerts are not.
+pub(crate) fn needs_passthrough(error: &UpstreamError) -> bool {
+    if let UpstreamError::ClientCertificate(_) = error {
+        return true;
+    }
     matches!(
-        io.get_ref().and_then(|e| e.downcast_ref::<rustls::Error>()),
-        Some(rustls::Error::InvalidCertificate(_))
+        rustls_error(error),
+        Some(
+            rustls::Error::InvalidCertificate(_)
+                | rustls::Error::PeerIncompatible(_)
+                | rustls::Error::AlertReceived(
+                    AlertDescription::HandshakeFailure
+                        | AlertDescription::ProtocolVersion
+                        | AlertDescription::InsufficientSecurity
+                        | AlertDescription::CertificateRequired
+                )
+        )
     )
 }
 
-/// After a failed upstream request to the server named `name`: when its certificate could
-/// not be verified, the host is passed through from now on, so the client verifies it.
-/// Returns true in that case, also when the host already was a pin (another request may
-/// have learned it at the same time), so the caller closes the client connection.
+/// The rustls error behind `error`, if any. tokio-rustls reports TLS errors as an
+/// `io::Error` wrapping the rustls error, and hyper wraps that `io::Error` in turn.
+fn rustls_error(error: &UpstreamError) -> Option<&rustls::Error> {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = match error {
+        UpstreamError::Connect(io) => Some(io),
+        UpstreamError::Http(http) => Some(http),
+        _ => None,
+    };
+    while let Some(error) = next {
+        if let Some(tls) = error.downcast_ref::<rustls::Error>() {
+            return Some(tls);
+        }
+        if let Some(tls) = error
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::get_ref)
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        {
+            return Some(tls);
+        }
+        next = error.source();
+    }
+    None
+}
+
+/// After a failed upstream request to the server named `name`: when the failure is one
+/// the client would not have (see [`needs_passthrough`]), the host is passed through from
+/// now on, so the client talks to the server itself. Returns true in that case, also when
+/// the host already was a pin (another request may have learned it at the same time), so
+/// the caller closes the client connection.
 pub(crate) fn learn_from_failure(ctx: &ProxyContext, name: &str, error: &UpstreamError) -> bool {
-    if !is_untrusted_certificate(error) {
+    if !needs_passthrough(error) {
         return false;
     }
     if ctx
         .policy
         .learn_upstream_untrusted(name, tollgate_common::clock::unix_secs())
     {
-        log::info!("{name}: upstream certificate not verifiable; passing it through from now on");
+        log::info!("{name}: upstream TLS failed ({error}); passing it through from now on");
     }
     true
+}
+
+/// Records whether the server asked for a client certificate. The proxy has none to
+/// present, so it always answers with an empty one, as `with_no_client_auth` does.
+#[derive(Debug, Default)]
+struct ClientCertAsked(AtomicBool);
+
+impl ResolvesClientCert for ClientCertAsked {
+    fn resolve(&self, _: &[&[u8]], _: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+        self.0.store(true, Ordering::Relaxed);
+        None
+    }
+
+    fn has_certs(&self) -> bool {
+        false
+    }
+}
+
+/// A TLS connection to an upstream, and whether the server asked for a client certificate.
+/// A server that requires one and rejects the empty certificate during the handshake
+/// (TLS 1.2) fails here with [`UpstreamError::ClientCertificate`]; over TLS 1.3 the
+/// rejection only arrives with the first request, so the caller checks the flag then.
+pub(crate) async fn connect_tls(
+    config: &ClientConfig,
+    name: ServerName<'static>,
+    tcp: TcpStream,
+) -> Result<(TlsStream<TcpStream>, bool), UpstreamError> {
+    let asked = Arc::new(ClientCertAsked::default());
+    let mut config = config.clone();
+    config.client_auth_cert_resolver = asked.clone();
+    let result = TlsConnector::from(Arc::new(config))
+        .connect(name, tcp)
+        .await;
+    let asked = asked.0.load(Ordering::Relaxed);
+    match result {
+        Ok(tls) => Ok((tls, asked)),
+        Err(e) => Err(connect_failure(e, asked)),
+    }
+}
+
+/// A handshake failure; any alert after the server asked for a client certificate counts
+/// as the server requiring one (servers send bad_certificate, handshake_failure or
+/// certificate_required for it).
+fn connect_failure(error: io::Error, client_cert_asked: bool) -> UpstreamError {
+    let error = UpstreamError::Connect(error);
+    if client_cert_asked && let Some(rustls::Error::AlertReceived(_)) = rustls_error(&error) {
+        return UpstreamError::ClientCertificate(Box::new(error));
+    }
+    error
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -117,6 +205,10 @@ pub(crate) enum UpstreamError {
     Exhausted,
     #[error(transparent)]
     Http(#[from] hyper::Error),
+    /// The server asked for a client certificate and failed the connection or the first
+    /// request without one.
+    #[error("client certificate required: {0}")]
+    ClientCertificate(Box<UpstreamError>),
 }
 
 pub(crate) struct PoolOptions {
@@ -209,12 +301,24 @@ enum Sender {
     Http2(http2::SendRequest<Body>),
 }
 
+/// Where `checkout` got a connection from.
+#[derive(Clone, Copy, Debug)]
+enum Checkout {
+    Pooled,
+    /// Opened for this request. `client_cert_asked` when the server asked for a client
+    /// certificate during the handshake.
+    New {
+        client_cert_asked: bool,
+    },
+}
+
 pub(crate) struct Pool(Arc<Inner>);
 
 struct Inner {
     hosts: Mutex<HashMap<Target, Host>>,
     global: Arc<Semaphore>,
-    tls: TlsConnector,
+    /// Upstream TLS, with ALPN `h2` and `http/1.1`.
+    tls: ClientConfig,
     options: PoolOptions,
     shutdown: Shutdown,
     /// Where `reset_upstream_connections` is counted.
@@ -275,7 +379,7 @@ impl Pool {
         Pool(Arc::new(Inner {
             hosts: Mutex::new(HashMap::new()),
             global: Arc::new(Semaphore::new(options.max_connections)),
-            tls: TlsConnector::from(Arc::new(config)),
+            tls: config,
             options,
             shutdown,
             ctx,
@@ -296,7 +400,7 @@ impl Pool {
         let mut fresh_only = false;
         let mut replay = replayable(&request);
         loop {
-            let (sender, fresh) = self.checkout(target, fresh_only).await?;
+            let (sender, checkout) = self.checkout(target, fresh_only).await?;
             let mut error = match sender {
                 Sender::Http2(mut h2) => {
                     match h2.try_send_request(for_http2(request, target)).await {
@@ -311,7 +415,7 @@ impl Pool {
                     }
                 }
             };
-            if !fresh {
+            if let Checkout::Pooled = checkout {
                 if let Some(unsent) = error.take_message() {
                     request = unsent;
                     fresh_only = true;
@@ -329,7 +433,16 @@ impl Pool {
                     continue;
                 }
             }
-            return Err(error.into_error().into());
+            let error = UpstreamError::from(error.into_error());
+            if let Checkout::New {
+                client_cert_asked: true,
+            } = checkout
+            {
+                // Over TLS 1.3 a server that requires a client certificate rejects the
+                // empty one only after the handshake, so the first request fails.
+                return Err(UpstreamError::ClientCertificate(Box::new(error)));
+            }
+            return Err(error);
         }
     }
 
@@ -381,7 +494,7 @@ impl Pool {
         &self,
         target: &Target,
         fresh_only: bool,
-    ) -> Result<(Sender, bool), UpstreamError> {
+    ) -> Result<(Sender, Checkout), UpstreamError> {
         loop {
             let (protocol, slots, ready, dial) = {
                 let now = self.0.now();
@@ -400,7 +513,7 @@ impl Pool {
                 };
                 host.last_used = now;
                 if let Some(sender) = reused {
-                    return Ok((sender, false));
+                    return Ok((sender, Checkout::Pooled));
                 }
                 (
                     host.protocol,
@@ -413,7 +526,7 @@ impl Pool {
                 tokio::select! {
                     permit = slots.acquire_owned() => {
                         let permit = permit.expect("host slots are never closed");
-                        return Ok((self.connect(target, Some(permit)).await?, true));
+                        return self.connect(target, Some(permit)).await;
                     }
                     () = ready.notified(), if !fresh_only => continue,
                 }
@@ -429,7 +542,7 @@ impl Pool {
                     .or_insert_with(|| Host::new(target.tls, max_h1, now));
                 if !fresh_only && let Some(sender) = host.reuse(now, idle) {
                     host.last_used = now;
-                    return Ok((sender, false));
+                    return Ok((sender, Checkout::Pooled));
                 }
                 host.protocol
             };
@@ -437,7 +550,7 @@ impl Pool {
                 continue;
             }
             let permit = slots.try_acquire_owned().ok();
-            return Ok((self.connect(target, permit).await?, true));
+            return self.connect(target, permit).await;
         }
     }
 
@@ -445,7 +558,7 @@ impl Pool {
         &self,
         target: &Target,
         h1_permit: Option<OwnedSemaphorePermit>,
-    ) -> Result<Sender, UpstreamError> {
+    ) -> Result<(Sender, Checkout), UpstreamError> {
         let global = self.global_permit().await?;
         tokio::time::timeout(
             self.0.options.connect_timeout,
@@ -460,24 +573,28 @@ impl Pool {
         target: &Target,
         global: OwnedSemaphorePermit,
         h1_permit: Option<OwnedSemaphorePermit>,
-    ) -> Result<Sender, UpstreamError> {
+    ) -> Result<(Sender, Checkout), UpstreamError> {
         let resolver = self.0.options.resolver.as_deref();
         let tcp = connect_tcp(resolver, &target.host, target.port).await?;
         if !target.tls {
             let h1 = self
                 .start_http1(TokioIo::new(tcp), global, h1_permit)
                 .await?;
-            return Ok(Sender::Http1(h1));
+            let checkout = Checkout::New {
+                client_cert_asked: false,
+            };
+            return Ok((Sender::Http1(h1), checkout));
         }
         let name = ServerName::try_from(target.server_name.clone())
             .map_err(|_| UpstreamError::ServerName(target.server_name.clone()))?;
-        let tls = self.0.tls.connect(name, tcp).await?;
+        let (tls, client_cert_asked) = connect_tls(&self.0.tls, name, tcp).await?;
+        let checkout = Checkout::New { client_cert_asked };
         let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
         let io = TokioIo::new(tls);
         if !is_h2 {
             self.set_protocol(target, Protocol::Http1, None);
             let h1 = self.start_http1(io, global, h1_permit).await?;
-            return Ok(Sender::Http1(h1));
+            return Ok((Sender::Http1(h1), checkout));
         }
         drop(h1_permit);
         let (h2, conn) = http2::Builder::new(TokioExecutor::new())
@@ -500,7 +617,7 @@ impl Pool {
             }
         });
         self.set_protocol(target, Protocol::Http2, Some(h2.clone()));
-        Ok(Sender::Http2(h2))
+        Ok((Sender::Http2(h2), checkout))
     }
 
     async fn start_http1<T>(
@@ -691,4 +808,60 @@ fn for_http2(mut request: Request<Body>, target: &Target) -> Request<Body> {
         headers.insert(header::TE, HeaderValue::from_static("trailers"));
     }
     request
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tls_failure(error: rustls::Error) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, error)
+    }
+
+    fn alert(description: AlertDescription) -> io::Error {
+        tls_failure(rustls::Error::AlertReceived(description))
+    }
+
+    #[test]
+    fn bad_certificate_counts_only_after_a_client_certificate_request() {
+        let asked = connect_failure(alert(AlertDescription::BadCertificate), true);
+        assert!(matches!(asked, UpstreamError::ClientCertificate(_)));
+        assert!(needs_passthrough(&asked));
+        let unasked = connect_failure(alert(AlertDescription::BadCertificate), false);
+        assert!(!needs_passthrough(&unasked));
+        // A reset after the request is not an alert, so not a certificate requirement.
+        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
+        assert!(!needs_passthrough(&connect_failure(reset, true)));
+    }
+
+    #[test]
+    fn incompatible_servers_need_passthrough() {
+        let incompatible = tls_failure(rustls::Error::PeerIncompatible(
+            rustls::PeerIncompatible::NoCipherSuitesInCommon,
+        ));
+        assert!(needs_passthrough(&UpstreamError::Connect(incompatible)));
+        for description in [
+            AlertDescription::HandshakeFailure,
+            AlertDescription::ProtocolVersion,
+            AlertDescription::InsufficientSecurity,
+            AlertDescription::CertificateRequired,
+        ] {
+            assert!(needs_passthrough(&UpstreamError::Connect(alert(
+                description
+            ))));
+        }
+        for description in [
+            AlertDescription::InternalError,
+            AlertDescription::UnrecognisedName,
+            AlertDescription::DecodeError,
+        ] {
+            assert!(!needs_passthrough(&UpstreamError::Connect(alert(
+                description
+            ))));
+        }
+        assert!(!needs_passthrough(&UpstreamError::Timeout));
+        assert!(!needs_passthrough(&UpstreamError::Connect(
+            io::Error::from(io::ErrorKind::ConnectionRefused)
+        )));
+    }
 }
