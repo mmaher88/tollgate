@@ -9,8 +9,13 @@ final class TunnelController: ObservableObject {
     @Published private(set) var stats: TunnelStats?
     @Published private(set) var lastReply: String?
     @Published private(set) var lastError: String?
+    /// True while `start()` or `stop()` runs; the Turn on/off button is disabled meanwhile.
+    @Published private(set) var busy = false
 
     private var manager: NETunnelProviderManager?
+    /// The last `load` call. Loads run one after another, so two of them never both create
+    /// a configuration, or both remove duplicates and keep different ones.
+    private var loading: Task<Void, Never>?
     private var statusObserver: NSObjectProtocol?
     private var configurationObserver: NSObjectProtocol?
     private let log = Logger(subsystem: "dev.tollgate.app", category: "tunnel")
@@ -33,11 +38,31 @@ final class TunnelController: ObservableObject {
 
     /// Loads the existing configuration. With `createIfMissing`, creates and saves one,
     /// which shows the system "Add VPN Configurations" prompt; that only happens when the
-    /// user turns protection on.
+    /// user turns protection on. Waits for any earlier load to finish first.
     func load(createIfMissing: Bool = false) async {
+        let previous = loading
+        let task = Task { @MainActor in
+            await previous?.value
+            await self.loadNow(createIfMissing: createIfMissing)
+        }
+        loading = task
+        await task.value
+    }
+
+    private func loadNow(createIfMissing: Bool) async {
         do {
-            let managers = try await NETunnelProviderManager.loadAllFromPreferences()
-            if let existing = managers.first {
+            let managers = try await NETunnelProviderManager.loadAllFromPreferences().filter {
+                ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
+                    == tunnelBundleIdentifier
+            }
+            if let existing = Self.preferred(managers) {
+                // Duplicates (from an older build that could create two) are removed with
+                // their on-demand rules, so none can keep a tunnel running that the app
+                // does not track.
+                for duplicate in managers where duplicate !== existing {
+                    log.info("removing a duplicate VPN configuration")
+                    try? await duplicate.removeFromPreferences()
+                }
                 attach(existing)
                 return
             }
@@ -61,9 +86,21 @@ final class TunnelController: ObservableObject {
         }
     }
 
+    /// The configuration to keep: a running one, else an enabled one, else the first.
+    private static func preferred(_ managers: [NETunnelProviderManager]) -> NETunnelProviderManager? {
+        let running = managers.first {
+            $0.connection.status != .disconnected && $0.connection.status != .invalid
+        }
+        return running ?? managers.first { $0.isEnabled } ?? managers.first
+    }
+
     /// Turns protection on and keeps it on: the on-demand rule reconnects the tunnel after
-    /// network changes, reboots and crashes.
+    /// network changes, reboots and crashes. A call while `start()` or `stop()` runs does
+    /// nothing.
     func start() async {
+        guard !busy else { return }
+        busy = true
+        defer { busy = false }
         await load(createIfMissing: true)
         guard let manager else { return }
         do {
@@ -80,7 +117,11 @@ final class TunnelController: ObservableObject {
     }
 
     /// Turns protection off. On-demand is disabled first, otherwise iOS reconnects at once.
+    /// A call while `start()` or `stop()` runs does nothing.
     func stop() async {
+        guard !busy else { return }
+        busy = true
+        defer { busy = false }
         await load()
         guard let manager else { return }
         do {

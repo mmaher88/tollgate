@@ -64,6 +64,7 @@ struct ContentView: View {
                     if tunnel.isOn { await tunnel.stop() } else { await tunnel.start() }
                 }
             }
+            .disabled(tunnel.busy)
             if let error = tunnel.lastError {
                 Text(error).font(.footnote).foregroundStyle(.red)
             }
