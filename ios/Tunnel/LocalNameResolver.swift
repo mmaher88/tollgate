@@ -90,7 +90,7 @@ final class LocalNameResolver: LocalResolver, @unchecked Sendable {
 
     // MARK: - On the queue
 
-    private func pathChanged(_ path: NWPath) {
+    private func pathChanged(_ path: Network.NWPath) {
         let interface = path.status == .satisfied
             ? path.availableInterfaces.first(where: { $0.type != .other })
             : nil
