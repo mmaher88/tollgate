@@ -349,11 +349,16 @@ refusals in that time).
    its host the log shows `<host> hangs up on our certificate without an alert; passing
    it through from now on`, and the host appears under Learned certificate pins. Note
    each such app and host.
-5. Forget one of those hosts in Learned certificate pins and use its app again. Pass: it
-   fails briefly and the host is learned again. Within a minute of that, turn airplane
-   mode on and off. Pass: the log shows `network changed: dropped 1 certificate pins
-   learned from silent refusals in the last 60 s`, and the app gets its host learned again
-   when it next fails.
+5. Forget one of those hosts in Learned certificate pins and use its app again, on Wi-Fi
+   with cellular data on. Pass: it fails briefly and the host is learned again (a new
+   `learned certificate pin for <host>` line). Within about 30 s of that line, turn Wi-Fi
+   off in Control Center. Pass: within 60 s of that line the log shows `network path
+   changed` and then `network changed: dropped 1 certificate pins learned from silent
+   refusals in the last 60 s`, and the app gets its host learned again when it next
+   fails. A `network path changed` line more than 60 s after the learned line keeps the
+   pin by design, so repeat the step. Airplane mode is no substitute: it can stop the
+   tunnel, and a pin is saved when the tunnel stops and kept after it restarts. Turn Wi-Fi
+   back on afterwards.
 
 Result:
 
@@ -543,12 +548,16 @@ pins (Network.framework names hosts only by hash).
    learning a certificate pin` line and every `silent refusals on <n> hosts within 10 s
    have a common cause` line, with the time.
 3. Use the main app again. Pass: it works as before.
-4. Forget the host in Learned certificate pins and repeat step 2 (its `not learning` line
-   is left out if the last one came less than 5 minutes before). Within a minute of the
-   flood line, turn airplane mode on and off. Pass: the log shows `network changed:
-   dropped 1 certificate pins learned from silent refusals in the last 60 s`, and the
-   host is learned again (another `learned certificate pin for <host>` line) when the
-   app next keeps retrying.
+4. Forget the host in Learned certificate pins, and repeat step 2 on Wi-Fi with cellular
+   data on (its `not learning` line is left out if the last one came less than 5 minutes
+   before). Within about 30 s of the flood line, turn Wi-Fi off in Control Center. Pass:
+   within 60 s of the flood line the log shows `network path changed` and then `network
+   changed: dropped 1 certificate pins learned from silent refusals in the last 60 s`, and
+   the host is learned again (another `learned certificate pin for <host>` line) when the
+   app next keeps retrying. A `network path changed` line more than 60 s after the flood
+   line keeps the pin by design, so repeat the step. Airplane mode is no substitute: it
+   can stop the tunnel, and a pin is saved when the tunnel stops and kept after it
+   restarts. Turn Wi-Fi back on afterwards.
 5. Browse in Safari and Chrome for 10 minutes as in E28 step 2. Pass: no `learned
    certificate pin for <host> after a flood` line for a host of the sites visited, and
    none of their hosts appears under Learned certificate pins. Note each `not learning a

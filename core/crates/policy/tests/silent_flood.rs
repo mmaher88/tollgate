@@ -261,6 +261,21 @@ fn a_network_change_takes_back_a_fresh_flood_pin_and_forgets_a_flood() {
     assert_eq!(hosts(&p), [PINNED]);
 }
 
+/// The tunnel saves its pins when it stops (airplane mode can stop it), and the restarted
+/// tunnel's policy keeps a fresh flood pin through a network change, so only a path change
+/// while the tunnel runs takes one back.
+#[test]
+fn a_flood_pin_saved_when_the_tunnel_stops_is_kept_after_a_network_change() {
+    let p = policy();
+    p.record_intercepted_handshake(PINNED, T0 - 1);
+    refuse(&p, PINNED, T0..T0 + 9, 20);
+    assert!(p.record_silent_refusal(PINNED, T0 + 9));
+    let restored = Policy::new(&Config::default(), Some(&p.learned_pins_json())).unwrap();
+    restored.on_network_change(T0 + 10);
+    assert_eq!(hosts(&restored), [PINNED]);
+    assert!(pinned(&restored, PINNED, T0 + 10));
+}
+
 #[test]
 fn forgetting_a_host_forgets_its_flood() {
     let p = policy();
