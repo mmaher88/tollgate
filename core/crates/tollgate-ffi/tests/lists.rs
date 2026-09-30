@@ -1,6 +1,8 @@
 use std::fs;
 
-use tollgate_ffi::{ListFormat, ListInput, ListTarget, TollgateError, compile_lists};
+use tollgate_ffi::{
+    ListFormat, ListInput, ListTarget, TollgateError, compile_lists, detect_list_format,
+};
 use tollgate_filter::{DOMAINS_FILE, DomainSet, ENGINE_FILE, FilterEngine, Verdict};
 
 const URL_RULES: &str =
@@ -117,4 +119,22 @@ fn an_unwritable_directory_is_a_lists_error() {
         matches!(&result, Err(TollgateError::Lists { .. })),
         "{result:?}"
     );
+}
+
+#[test]
+fn detect_list_format_reports_the_majority_format() {
+    assert_eq!(
+        detect_list_format(HOSTS.to_string()),
+        Some(ListFormat::Hosts)
+    );
+    assert_eq!(
+        detect_list_format(URL_RULES.to_string()),
+        Some(ListFormat::Adblock)
+    );
+    assert_eq!(
+        detect_list_format(DNS_RULES.to_string()),
+        Some(ListFormat::Adblock)
+    );
+    assert_eq!(detect_list_format("# only a comment\n".to_string()), None);
+    assert_eq!(detect_list_format(String::new()), None);
 }

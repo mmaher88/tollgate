@@ -20,7 +20,8 @@ pub enum ListFormat {
 pub enum ListTarget {
     /// URL rules for the proxy (`engine.dat`): EasyList, EasyPrivacy, AdGuard Mobile Ads.
     Url,
-    /// Host names for the DNS blocklist (`domains.bin`): AdGuard DNS filter, hosts files.
+    /// Host names for the DNS blocklist (`domains.bin`): AdGuard DNS filter, StevenBlack
+    /// hosts and other hosts files.
     Dns,
 }
 
@@ -56,14 +57,29 @@ impl From<tollgate_filter::CompileReport> for CompileReport {
     }
 }
 
+impl From<ListFormat> for tollgate_filter::ListFormat {
+    fn from(format: ListFormat) -> tollgate_filter::ListFormat {
+        match format {
+            ListFormat::Adblock => tollgate_filter::ListFormat::Adblock,
+            ListFormat::Hosts => tollgate_filter::ListFormat::Hosts,
+        }
+    }
+}
+
+impl From<tollgate_filter::ListFormat> for ListFormat {
+    fn from(format: tollgate_filter::ListFormat) -> ListFormat {
+        match format {
+            tollgate_filter::ListFormat::Adblock => ListFormat::Adblock,
+            tollgate_filter::ListFormat::Hosts => ListFormat::Hosts,
+        }
+    }
+}
+
 fn source(input: &ListInput) -> ListSource<'_> {
     ListSource {
         name: &input.name,
         text: &input.text,
-        format: match input.format {
-            ListFormat::Adblock => tollgate_filter::ListFormat::Adblock,
-            ListFormat::Hosts => tollgate_filter::ListFormat::Hosts,
-        },
+        format: input.format.into(),
     }
 }
 
@@ -103,4 +119,17 @@ pub fn compile_lists(
     data_dir: String,
 ) -> Result<CompileReport, TollgateError> {
     catch_panic(|| compile_in(&sources, Path::new(&data_dir)))
+}
+
+/// How `text` is written, judged from its rule lines: `Hosts` when most of them are hosts
+/// lines (`0.0.0.0 name`, `::1 name` or a name on its own), `Adblock` when most are not.
+/// `None` when there is no verdict: no rule lines (an empty list, or only comments), as
+/// many lines of each kind, or a panic in the detector. See
+/// `tollgate_filter::detect_format` for the exact rule. The app uses it to correct the
+/// type of a list the user added: compiled with the wrong type, a list blocks little or
+/// nothing, or (a hosts file as request rules) fills the tunnel's engine with rules that
+/// belong in the DNS blocklist.
+#[uniffi::export]
+pub fn detect_list_format(text: String) -> Option<ListFormat> {
+    catch_panic(|| Ok(tollgate_filter::detect_format(&text).map(ListFormat::from))).unwrap_or(None)
 }
