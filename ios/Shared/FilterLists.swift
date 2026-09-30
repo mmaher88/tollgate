@@ -9,6 +9,10 @@ struct FilterList: Identifiable {
     /// `.url` lists go into the request engine (engine.dat), `.dns` lists into the DNS
     /// blocklist (domains.bin).
     let target: ListTarget
+    /// A `.dns` list whose blocks of hosts of sensitive services and banks the core leaves
+    /// out (`ListInput.exemptSensitiveHosts`), so that a list added for wider coverage
+    /// cannot break a bank or identity app by blocking its telemetry.
+    var exemptSensitiveHosts = false
 }
 
 enum FilterLists {
@@ -39,19 +43,36 @@ enum FilterLists {
             id: "stevenblack", name: "StevenBlack hosts",
             url: URL(string: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts")!,
             format: .hosts, target: .dns),
+        // Two lists built not to break anything, for ad, analytics and telemetry hosts the
+        // lists above do not have: together about 22,000 more names and 175 KB more in
+        // domains.bin. They also list telemetry hosts of banking apps, which could then
+        // break, so unlike the lists above their blocks of hosts of sensitive services and
+        // banks are left out.
+        FilterList(
+            id: "hagezi-light", name: "HaGeZi Multi LIGHT",
+            url: URL(string: "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/light.txt")!,
+            format: .adblock, target: .dns, exemptSensitiveHosts: true),
+        FilterList(
+            id: "oisd-small", name: "OISD small",
+            url: URL(string: "https://small.oisd.nl")!,
+            format: .adblock, target: .dns, exemptSensitiveHosts: true),
     ]
 
     /// Whether `address` names the same list as `url`: the same scheme and host in any
-    /// letter case, and the same port, path and query. The fragment is ignored, since it is
-    /// never sent to the server.
+    /// letter case, and the same port, path and query. An empty path counts as `/`, since
+    /// both request `/` (OISD small is `https://small.oisd.nl`, and a user may have added
+    /// it with the slash). The fragment is ignored, since it is never sent to the server.
     static func sameAddress(_ url: URL, _ address: String) -> Bool {
         guard let a = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let b = URLComponents(string: address.trimmingCharacters(in: .whitespaces))
         else { return false }
+        let path = { (components: URLComponents) -> String in
+            components.path.isEmpty ? "/" : components.path
+        }
         return a.scheme?.lowercased() == b.scheme?.lowercased()
             && a.host?.lowercased() == b.host?.lowercased()
             && a.port == b.port
-            && a.path == b.path
+            && path(a) == path(b)
             && a.query == b.query
     }
 

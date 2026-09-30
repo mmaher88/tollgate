@@ -56,12 +56,14 @@ pub fn compile_into(dir: &TempDir, url_rules: &str, dns_rules: &str) {
             text: url_rules.to_string(),
             format: ListFormat::Adblock,
             target: ListTarget::Url,
+            exempt_sensitive_hosts: false,
         },
         ListInput {
             name: "dns".to_string(),
             text: dns_rules.to_string(),
             format: ListFormat::Adblock,
             target: ListTarget::Dns,
+            exempt_sensitive_hosts: false,
         },
     ];
     compile_lists(lists, path(dir)).unwrap();

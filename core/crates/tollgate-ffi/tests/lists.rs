@@ -4,6 +4,7 @@ use tollgate_ffi::{
     ListFormat, ListInput, ListTarget, TollgateError, compile_lists, detect_list_format,
 };
 use tollgate_filter::{DOMAINS_FILE, DomainSet, ENGINE_FILE, FilterEngine, Verdict};
+use tollgate_policy::BundledGroup;
 
 const URL_RULES: &str =
     "! Title: test URL list\n||ads.example^\n||tracker.example^$third-party\n/banner/*$image\n";
@@ -16,7 +17,22 @@ fn input(name: &str, text: &str, format: ListFormat, target: ListTarget) -> List
         text: text.to_string(),
         format,
         target,
+        exempt_sensitive_hosts: false,
     }
+}
+
+/// A DNS list in adblock syntax that must not block sensitive or bank hosts.
+fn exempting(name: &str, text: &str) -> ListInput {
+    ListInput {
+        exempt_sensitive_hosts: true,
+        ..input(name, text, ListFormat::Adblock, ListTarget::Dns)
+    }
+}
+
+fn compile_blocklist(lists: Vec<ListInput>) -> DomainSet {
+    let tmp = tempfile::tempdir().unwrap();
+    compile_lists(lists, tmp.path().to_str().unwrap().to_string()).unwrap();
+    DomainSet::load(&tmp.path().join(DOMAINS_FILE)).unwrap()
 }
 
 #[test]
@@ -138,4 +154,104 @@ fn detect_list_format_reports_the_majority_format() {
     );
     assert_eq!(detect_list_format("# only a comment\n".to_string()), None);
     assert_eq!(detect_list_format(String::new()), None);
+}
+
+/// The names of the patterns of `groups`, without `*.`, each with whether it had one
+/// (the name and its subdomains) or not (that host only).
+fn group_names(groups: &[BundledGroup]) -> Vec<(&'static str, bool)> {
+    groups
+        .iter()
+        .flat_map(|group| group.patterns().iter())
+        .map(|pattern| match pattern.strip_prefix("*.") {
+            Some(name) => (name, true),
+            None => (*pattern, false),
+        })
+        .collect()
+}
+
+#[test]
+fn exempting_lists_leave_sensitive_and_bank_hosts_unblocked() {
+    let exempt = group_names(&[BundledGroup::Sensitive, BundledGroup::Banks]);
+    // Every sensitive and bank host blocked as a name and its subdomains and as one host
+    // and, under each domain, a telemetry host blocked as one host, by a wildcard pattern
+    // and in a hosts file.
+    let mut text = String::new();
+    let mut hosts = String::new();
+    for &(name, domain) in &exempt {
+        text += &format!("||{name}^\n|{name}^\n");
+        if domain {
+            text += &format!("|telemetry.{name}^\n||log*.{name}^\n");
+            hosts += &format!("0.0.0.0 metrics.{name}\n");
+        }
+    }
+    // The other bundled groups (Apple, and the apps that refuse our certificate) are not
+    // exempt: ad hosts under them stay blockable.
+    let others = group_names(&[BundledGroup::Apple, BundledGroup::SilentRefusers]);
+    for (name, _) in &others {
+        text += &format!("||ads.{name}^\n");
+    }
+    let bank = exempt[exempt.len() - 1].0;
+    let domains = compile_blocklist(vec![
+        // A list that exempts nothing still blocks a bank host.
+        input(
+            "plain",
+            &format!("||plain.{bank}^\n"),
+            ListFormat::Adblock,
+            ListTarget::Dns,
+        ),
+        exempting(
+            "exempting",
+            &format!("{text}||plain.{bank}^\n||tracker.example^\n"),
+        ),
+        ListInput {
+            exempt_sensitive_hosts: true,
+            ..input(
+                "exempting hosts",
+                &format!("{hosts}0.0.0.0 hosts-tracker.example\n"),
+                ListFormat::Hosts,
+                ListTarget::Dns,
+            )
+        },
+    ]);
+    for &(name, domain) in &exempt {
+        assert!(!domains.is_blocked(name), "{name}");
+        if domain {
+            for host in [
+                format!("telemetry.{name}"),
+                format!("logx.{name}"),
+                format!("metrics.{name}"),
+            ] {
+                assert!(!domains.is_blocked(&host), "{host}");
+            }
+        }
+    }
+    for (name, _) in &others {
+        let host = format!("ads.{name}");
+        assert!(domains.is_blocked(&host), "{host}");
+    }
+    for host in [
+        format!("plain.{bank}"),
+        "tracker.example".to_string(),
+        "hosts-tracker.example".to_string(),
+    ] {
+        assert!(domains.is_blocked(&host), "{host}");
+    }
+}
+
+#[test]
+fn a_url_list_cannot_exempt_sensitive_hosts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let list = ListInput {
+        exempt_sensitive_hosts: true,
+        ..input("easylist", URL_RULES, ListFormat::Adblock, ListTarget::Url)
+    };
+    let result = compile_lists(vec![list], tmp.path().to_str().unwrap().to_string());
+    assert_eq!(
+        result,
+        Err(TollgateError::Config {
+            message: "list \"easylist\" exempts sensitive hosts, which only a DNS list can do"
+                .to_string()
+        })
+    );
+    assert!(!tmp.path().join(ENGINE_FILE).exists());
 }

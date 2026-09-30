@@ -136,6 +136,25 @@ fn records_have_the_expected_swift_fields() {
         struct_fields(&swift, "LearnedPin"),
         ["host:String", "learnedAt:UInt64"]
     );
+    // ios/App/ListUpdater.swift builds ListInput by these labels, leaving out the last one
+    // for My rules, which needs its default.
+    assert_eq!(
+        struct_fields(&swift, "ListInput"),
+        [
+            "name:String",
+            "text:String",
+            "format:ListFormat",
+            "target:ListTarget",
+            "exemptSensitiveHosts:Bool",
+        ]
+    );
+    let defaulted = declarations(&swift, "exemptSensitiveHosts: Bool =");
+    assert!(
+        defaulted
+            .iter()
+            .any(|line| line.contains("exemptSensitiveHosts:Bool=false)")),
+        "{defaulted:?}"
+    );
     assert_eq!(
         struct_fields(&swift, "DnsRecord"),
         ["rtype:UInt16", "rclass:UInt16", "ttl:UInt32", "data:Data"]
