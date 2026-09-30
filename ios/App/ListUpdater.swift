@@ -39,7 +39,8 @@ final class ListUpdater: ObservableObject {
     /// Whether compiled lists exist, observable by the UI.
     @Published private(set) var compiled = FilterLists.compiled
     /// Settings changed since the last successful compile; applied at the next opportunity.
-    /// Also set when an app update adds or removes a built-in list (see
+    /// Also set at the first launch after an app update, whose compiled files another
+    /// build wrote (see `appBuildChanged`), perhaps from other built-in lists (see
     /// `builtInListsChanged`).
     @Published private(set) var pendingSettingsChange: Bool
     /// Counts the times this updater rewrote lists.json itself (to correct a custom list's
@@ -53,6 +54,7 @@ final class ListUpdater: ObservableObject {
     private static let warningsKey = "lists.warnings"
     private static let pendingKey = "lists.pendingSettingsChange"
     private static let knownDefaultsKey = "lists.knownDefaults"
+    private static let knownBuildKey = "lists.knownBuild"
 
     /// Lists older than this are refreshed on launch, on returning to the foreground and by
     /// the background refresh task.
@@ -70,7 +72,10 @@ final class ListUpdater: ObservableObject {
     init() {
         let defaults = UserDefaults.standard
         let updated = defaults.object(forKey: Self.lastUpdatedKey) as? Date
-        if Self.builtInListsChanged() { defaults.set(true, forKey: Self.pendingKey) }
+        // Both checks run, since each records what it compares with next time.
+        let buildChanged = Self.appBuildChanged()
+        let listsChanged = Self.builtInListsChanged()
+        if buildChanged || listsChanged { defaults.set(true, forKey: Self.pendingKey) }
         pendingSettingsChange = defaults.bool(forKey: Self.pendingKey)
         lastUpdated = updated
         // Installs from before attempts were recorded: their last success was an attempt.
@@ -114,6 +119,31 @@ final class ListUpdater: ObservableObject {
         case .downloading, .compiling: true
         case .idle, .failed: false
         }
+    }
+
+    /// Whether another build of the app ran before this one, and records this build either
+    /// way. The compiled files were then written by that build's core, whose compiler may
+    /// have read the lists differently (skipped rules this one reads, or left out a section
+    /// domains.bin now has), so they are compiled again like after a settings change: at
+    /// the next opportunity (launch, foreground or the background refresh), from the cached
+    /// copies. The tunnel uses the old files until then. Keyed on the build number
+    /// (CFBundleVersion, which CI sets to its run number), so a change to the compiler
+    /// needs no version bumped by hand to reach existing installs; the cost is one compile
+    /// from the cached copies after each update. Any other build counts, an older one
+    /// included, since an older core may not read what a newer one wrote. Local builds all
+    /// have build number 1, so for them only `builtInListsChanged` and the daily update
+    /// apply.
+    ///
+    /// Installs from before the build was recorded have none. If they have compiled lists,
+    /// an older build wrote them, so they count as changed. A fresh install has nothing
+    /// compiled, and its first update downloads every list anyway.
+    private static func appBuildChanged() -> Bool {
+        let defaults = UserDefaults.standard
+        let current = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
+        let known = defaults.string(forKey: knownBuildKey)
+        defaults.set(current, forKey: knownBuildKey)
+        guard let known else { return FilterLists.compiled }
+        return known != current
     }
 
     /// Whether this version of the app ships other built-in lists than the version that ran
