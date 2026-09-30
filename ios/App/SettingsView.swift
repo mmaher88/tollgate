@@ -69,7 +69,8 @@ struct SettingsView: View {
         allowCount = config.allowlist.count
         passthroughCount = config.passthrough.count
         let settings = ListSettings.load()
-        // A custom copy of an enabled built-in list is skipped, so it does not count.
+        // A custom copy of an enabled built-in list feeding the same file is skipped, so it
+        // does not count (see ListSettings.builtInDuplicate).
         enabledLists = FilterLists.defaults.filter(settings.isEnabled).count
             + settings.custom.filter { settings.builtInDuplicate(of: $0) == nil }.count
     }

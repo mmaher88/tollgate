@@ -143,11 +143,16 @@ struct ListSettings: Codable, Equatable {
         !disabledDefaults.contains(list.id)
     }
 
-    /// The enabled built-in list with the same address as `list`, if any. Such a custom
-    /// list is skipped, so the list is downloaded and compiled once, with the built-in
-    /// list's type, and Settings says so on its row so the user can delete it. With the
-    /// built-in list switched off, the custom one is used.
+    /// The enabled built-in list with the same address as `list` and feeding the same file
+    /// (engine.dat or domains.bin), if any. Such a custom list is skipped, so the list is
+    /// downloaded and compiled once, with the built-in list's type, and Settings says so on
+    /// its row so the user can delete it. A custom list at that address that feeds the other
+    /// file is used: a copy of EasyPrivacy typed Domain rules puts its hosts in the DNS
+    /// blocklist, which the built-in list does not. With the built-in list switched off,
+    /// the custom one is used too.
     func builtInDuplicate(of list: CustomList) -> FilterList? {
-        FilterLists.defaults.first { isEnabled($0) && FilterLists.sameAddress($0.url, list.url) }
+        FilterLists.defaults.first {
+            isEnabled($0) && $0.target == list.kind.target && FilterLists.sameAddress($0.url, list.url)
+        }
     }
 }

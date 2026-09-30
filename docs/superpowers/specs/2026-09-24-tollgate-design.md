@@ -927,8 +927,13 @@ sections, this section wins.
   host names the AdGuard DNS filter lacks: about 34,000 more hashes, about 270 KB of
   `domains.bin`. Built-in lists are on unless switched off, so it is on for existing
   installs, and the compile after the update picks it up. A custom list with the address
-  of an enabled built-in list (scheme and host in any case, port, path and query) is
-  skipped and its row says so; with the built-in list switched off, it is used.
+  of an enabled built-in list (scheme and host in any case, port, path and query) that
+  feeds the same file is skipped and its row says so; one that feeds the other file (a
+  copy of EasyPrivacy typed Domain rules, whose hosts the built-in list does not put in
+  `domains.bin`) is used, and so is any with the built-in list switched off. A built-in
+  list never downloaded starts from the cached copy of a custom list with its address, so
+  the compile after the update keeps the hosts of a StevenBlack list added by hand even
+  when the download fails, and needs no download when it compiles from the cached copies.
 - **Hosts files are recognized by their content.** A custom list added with the wrong
   type compiles into nothing useful: a hosts file added as Request rules became about
   75,000 request rules that blocked nothing and grew `engine.dat`, which the tunnel

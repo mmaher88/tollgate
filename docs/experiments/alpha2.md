@@ -186,16 +186,20 @@ Result:
    anything. Pass: one `lists compiled: <rules> rules, <domains> domains` line appears
    within that minute. `<domains>` is about 34,000 higher than before the update, unless
    the StevenBlack hosts list was already compiled as a hosts file under Added by you.
-   Settings shows Filter lists with one more list enabled than before; Filter lists shows
-   StevenBlack hosts as the fifth built-in list, switched on; the button below the lists
-   reads "Update now" and the status line under it does not say "Changes are not applied
-   yet."
-3. If Added by you has a list with the StevenBlack address: Pass: its row says "Not used:
-   the same list as the built-in StevenBlack hosts. You can delete it.", the log line of
-   step 2 comes after `<its name> skipped: same address as StevenBlack hosts`, and if it
-   was compiled as Request rules before, `<rules>` is about 75,000 lower than before. Delete
-   it and tap "Apply changes now". Pass: `lists compiled` with the same numbers as in
-   step 2.
+   Settings shows Filter lists with one more list enabled than before, or the same number
+   if Added by you has a list with the StevenBlack address (it is no longer counted, see
+   step 3); Filter lists shows StevenBlack hosts as the fifth built-in list, switched on;
+   the button below the lists reads "Update now" and the status line under it does not
+   say "Changes are not applied yet."
+3. If Added by you has a list with the StevenBlack address: Pass: the log line of step 2
+   comes after `StevenBlack hosts starts from the cached copy of <its name>`, and the
+   list's row says "Not used: the same list as the built-in StevenBlack hosts. You can
+   delete it.". If its type was Request rules, the Filter lists status says "<its name> is
+   a hosts file, so its type was changed from Request rules to Hosts file.", its row now
+   shows Hosts file, and `<rules>` is about 75,000 lower than before; otherwise the log
+   line of step 2 also comes after `<its name> skipped: same address as StevenBlack
+   hosts`. Delete it and tap "Apply changes now". Pass: `lists compiled` with the same
+   numbers as in step 2.
 4. Switch StevenBlack hosts off and tap "Apply changes now". Pass: `<domains>` drops by
    about 34,000 and `<rules>` stays the same. Switch it on again and apply.
 5. Close Tollgate from the app switcher and open it again. Pass: no `lists compiled` line

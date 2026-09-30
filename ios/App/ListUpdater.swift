@@ -8,9 +8,13 @@ import os
 /// falls back to its cached copy, so one broken list never stops the others, and settings
 /// changes (toggles, custom lists, My rules) can be applied without the network.
 ///
-/// A custom list with the same address as an enabled built-in list is skipped. A custom
-/// list whose content does not match its type (a hosts file added as Request rules, say)
-/// is compiled as the type its content has, and that type is saved in lists.json.
+/// A custom list with the same address as an enabled built-in list, feeding the same file,
+/// is skipped (see `ListSettings.builtInDuplicate`). A built-in list never downloaded
+/// starts from the cached copy of a custom list with its address, if one has any: after an
+/// update that makes a list the user had added built in, the first compile does not depend
+/// on downloading it, and keeps what the custom copy blocked. A custom list whose content
+/// does not match its type (a hosts file added as Request rules, say) is compiled as the
+/// type its content has, and that type is saved in lists.json.
 @MainActor
 final class ListUpdater: ObservableObject {
     enum State: Equatable {
@@ -235,6 +239,7 @@ final class ListUpdater: ObservableObject {
 
         let cache = directory.appendingPathComponent("list-cache", isDirectory: true)
         try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        seedBuiltInCaches(settings: settings, cache: cache)
         var inputs: [ListInput] = []
         var corrections: [KindCorrection] = []
         var allDownloaded = true
@@ -336,6 +341,32 @@ final class ListUpdater: ObservableObject {
             if refresh { recordAttempt(partial: true) }
             state = .failed("Compile: \(error.localizedDescription)")
             return false
+        }
+    }
+
+    /// Gives each enabled built-in list that has no cached copy the cached copy of a custom
+    /// list with the same address, of any type (the cached text is the list as downloaded),
+    /// when one has it. That custom list was added before the list was built in, and is now
+    /// skipped as a duplicate or compiled beside it; its copy lets `applySettings()` compile
+    /// the built-in list without downloading it, and `update()` fall back to it when the
+    /// download fails, instead of leaving the list out. The next successful download
+    /// replaces it.
+    private func seedBuiltInCaches(settings: ListSettings, cache: URL) {
+        let fileManager = FileManager.default
+        for builtIn in FilterLists.defaults where settings.isEnabled(builtIn) {
+            let own = cache.appendingPathComponent(builtIn.id + ".txt")
+            if fileManager.fileExists(atPath: own.path) { continue }
+            for list in settings.custom where FilterLists.sameAddress(builtIn.url, list.url) {
+                let copy = cache.appendingPathComponent("custom-" + list.id + ".txt")
+                guard fileManager.fileExists(atPath: copy.path) else { continue }
+                do {
+                    try fileManager.copyItem(at: copy, to: own)
+                    log.info("\(builtIn.name, privacy: .public) starts from the cached copy of \(list.name, privacy: .public)")
+                } catch {
+                    log.error("copying the cached copy of \(list.name, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+                }
+                break
+            }
         }
     }
 
