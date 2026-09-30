@@ -11,7 +11,10 @@
 //! longer. A matching name starts with the head, and the host ends with the tail, so a
 //! lookup finds the heads that start the host or one of its labels and the tails that end
 //! the host, and matches only the patterns filed under those in full. A pattern with a `*`
-//! at both ends has neither and is tried for every host; lists rarely have one.
+//! at both ends has neither and is tried for every host, so a compile keeps at most
+//! [`crate::MAX_UNKEYED_PATTERNS`] of them (the AdGuard DNS filter has one). The wildcard
+//! domains format, one `*.name` per line, would give only such patterns, and is read as
+//! names instead (see [`crate::DomainRules`]).
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -37,6 +40,13 @@ pub(crate) fn is_valid_pattern(pattern: &str) -> bool {
             .rsplit('.')
             .next()
             .is_some_and(|last| last.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether a pattern in the stored form has neither a literal head nor a literal tail to be
+/// filed under, because it starts and ends with `*`, so that [`PatternSet`] tries it on
+/// every lookup.
+pub(crate) fn is_unkeyed(pattern: &str) -> bool {
+    pattern.starts_with('*') && pattern.ends_with('*')
 }
 
 /// Whether `text` matches `glob`, where `*` matches any run of bytes (dots included) and

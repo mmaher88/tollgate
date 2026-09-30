@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 pub use compile::{CompileReport, DOMAINS_FILE, ENGINE_FILE, compile, compile_split};
 pub use detect::detect_format;
-pub use domain_rules::DomainRules;
+pub use domain_rules::{DomainRules, MAX_UNKEYED_PATTERNS, MAX_WILDCARD_PATTERNS};
 pub use domain_set::{DomainSet, DomainSetError};
 pub use engine::{
     FilterEngine, REGEX_CLEANUP_INTERVAL, REGEX_DISCARD_UNUSED, Verdict, network_rule_count,

@@ -833,7 +833,15 @@ sections, this section wins.
   tail, whichever is longer, in tries built at load, so a lookup fully matches only the
   patterns whose head starts one of the host's labels or whose tail ends the host; a
   lookup that no hash decides costs about 100 ns more (about 300 ns in all, release
-  build on the workstation).
+  build on the workstation). A pattern with a `*` at both ends has neither and is tried
+  on every lookup, so an unanchored `*.name` (with or without `^`, and no other `*`) is
+  read as `name` and its subdomains instead, hashed like `||name^`, which blocks `name`
+  too: DNS lists in the wildcard domains format write one per line with that meaning, and
+  as patterns (`*.name*`) a list of 75,000 would cost about 1 ms per lookup and 5 MiB of
+  the tunnel's heap. `*.zip`, whose name has no dot, is skipped like `||zip^`. A compile
+  keeps at most 4,096 patterns, 64 of them with a `*` at both ends (the AdGuard DNS
+  filter has 417 and 1): exceptions first, since leaving one out would block what a list
+  unblocks, then blocks, in list order; the rest count as skipped lines and are logged.
 - **`domains.bin` version 2.** The header grows from 32 to 40 bytes: bytes 32 to 36 hold
   the length of a wildcard block section that follows the wildcard exception section,
   and bytes 36 to 40 are zero, keeping the hashes 8-byte aligned; bytes 0 to 32, the

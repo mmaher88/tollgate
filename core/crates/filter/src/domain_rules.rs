@@ -2,8 +2,18 @@
 
 use std::collections::HashSet;
 
-use crate::wildcard::is_valid_pattern;
+use crate::wildcard::{is_unkeyed, is_valid_pattern};
 use crate::{ListFormat, ListSource};
+
+/// The most wildcard patterns, blocks and exceptions together, that one compile keeps.
+/// The tunnel parses every pattern into its heap when it loads `domains.bin`, up to about
+/// 170 bytes each with its place in the lookup index, and holds the old and the new set at
+/// once during a reload; the AdGuard DNS filter has about 420.
+pub const MAX_WILDCARD_PATTERNS: usize = 4096;
+/// The most patterns kept that start and end with `*`, out of [`MAX_WILDCARD_PATTERNS`].
+/// Such a pattern has no literal head or tail to be looked up by, so every lookup tries it
+/// in full (see `wildcard.rs`); the AdGuard DNS filter has one.
+pub const MAX_UNKEYED_PATTERNS: usize = 64;
 
 /// Host names taken from filter lists, lowercase, without a trailing dot, sorted, unique,
 /// and without names whose parent is in the same set (a lookup checks every parent, so
@@ -17,6 +27,18 @@ use crate::{ListFormat, ListSource};
 /// as `-ulog*.example^` may start anywhere in the host (`*-ulog*.example`, host only), and
 /// a rule without a caret may end anywhere in it (`||adx-*.example.` becomes
 /// `adx-*.example.*`). Patterns are sorted and unique.
+///
+/// One form is read otherwise: an unanchored `*.name`, with or without a caret, where
+/// `name` has no other `*`. DNS lists in the wildcard domains format write one per line
+/// for `name` and its subdomains. It becomes the name, as `||name^` would, so it blocks
+/// `name` itself too, as the adblock editions of the same lists do. As a pattern it would
+/// be `*.name*`, which also matches `a.name.other.example` and, with no literal head or
+/// tail, is tried on every lookup; a whole list of them would fill the tunnel's heap.
+///
+/// At most [`MAX_WILDCARD_PATTERNS`] patterns are kept, of which at most
+/// [`MAX_UNKEYED_PATTERNS`] start and end with `*`: exceptions first, since leaving one out
+/// would block what a list unblocks, then blocks, each in the order the lists give them.
+/// Each pattern left out counts as one skipped line.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DomainRules {
     /// `$important` blocks. They win over every exception.
@@ -44,7 +66,7 @@ pub struct DomainRules {
     pub exact_wildcard_block: Vec<String>,
     /// Lines that are neither comments nor host rules: rules with other options, paths,
     /// regexes, `$important` exact-host and wildcard blocks, and hosts lines without a
-    /// usable name.
+    /// usable name. Also one for each pattern over the limits.
     pub skipped: u64,
 }
 
@@ -59,6 +81,25 @@ enum Kind {
     ExactWildcardAllow,
     WildcardBlock,
     ExactWildcardBlock,
+}
+
+impl Kind {
+    fn is_pattern(self) -> bool {
+        matches!(
+            self,
+            Kind::WildcardAllow
+                | Kind::ExactWildcardAllow
+                | Kind::WildcardBlock
+                | Kind::ExactWildcardBlock
+        )
+    }
+
+    fn is_exception(self) -> bool {
+        matches!(
+            self,
+            Kind::Allow | Kind::ExactAllow | Kind::WildcardAllow | Kind::ExactWildcardAllow
+        )
+    }
 }
 
 enum Line {
@@ -83,21 +124,26 @@ struct Builder {
     wildcard_block: HashSet<String>,
     exact_wildcard_block: HashSet<String>,
     badfilter: HashSet<(Kind, String)>,
+    /// Each pattern the first time it was added, in the order the lists give them, for the
+    /// limits [`Builder::limit_patterns`] applies.
+    pattern_order: Vec<(Kind, String)>,
     skipped: u64,
 }
 
 impl DomainRules {
     /// Adblock lists contribute `||name^`, `||name^|`, `||name` (no caret, when the name
-    /// does not end in a dot), `.name^` and the unanchored `name^` and `name^|` (the name
-    /// must start with a letter or digit; all treated as the name and its subdomains), the
+    /// does not end in a dot), `.name^`, the unanchored `name^` and `name^|` (the name
+    /// must start with a letter or digit) and the wildcard domains format's `*.name`,
+    /// `*.name^` and `*.name^|` (all treated as the name and its subdomains), the
     /// exact-host forms `|name^|`, `|name^`, `://name^` and `://name^|` (the name only),
     /// their `@@` forms, `$important` (not on exact-host blocks) and `$badfilter`. A rule
-    /// of any of these forms whose name has a `*` is kept as a pattern (see
-    /// [`DomainRules`]), and so are unanchored and caretless rules with a `*`; `$important`
-    /// is not supported on those. Any other option, a path, a regex, a rule without a `*`
-    /// and without a caret such as `ads.example` or a `|` prefix rule such as `|ads.` is
-    /// skipped. Hosts lists contribute every name on `address name...` lines and bare
-    /// `name` lines.
+    /// of any other of these forms whose name has a `*` is kept as a pattern (see
+    /// [`DomainRules`]), and so are other unanchored and caretless rules with a `*`;
+    /// `$important` is not supported on those. Any other option, a path, a regex, a rule
+    /// without a `*` and without a caret such as `ads.example`, a `|` prefix rule such as
+    /// `|ads.`, `*.zip` (like `||zip^`, no name without a dot is stored) and the patterns
+    /// over the limits in [`DomainRules`] are skipped. Hosts lists contribute every name on
+    /// `address name...` lines and bare `name` lines.
     pub fn parse(lists: &[ListSource]) -> DomainRules {
         let mut builder = Builder::default();
         for list in lists {
@@ -128,6 +174,11 @@ impl Builder {
                 badfilter: true,
             } => {
                 self.badfilter.insert((kind, name));
+            }
+            Line::Rule { kind, name, .. } if kind.is_pattern() => {
+                if self.set(kind).insert(name.clone()) {
+                    self.pattern_order.push((kind, name));
+                }
             }
             Line::Rule { kind, name, .. } => {
                 self.set(kind).insert(name);
@@ -179,10 +230,48 @@ impl Builder {
         }
     }
 
+    /// Leaves out the patterns over [`MAX_WILDCARD_PATTERNS`] or [`MAX_UNKEYED_PATTERNS`],
+    /// keeping exceptions first, then blocks, each in the order they were added, and counts
+    /// each one left out as a skipped line. Patterns `$badfilter` cancelled must be gone
+    /// already, so they take no room.
+    fn limit_patterns(&mut self) {
+        let order = std::mem::take(&mut self.pattern_order);
+        let exceptions = order.iter().filter(|(kind, _)| kind.is_exception());
+        let blocks = order.iter().filter(|(kind, _)| !kind.is_exception());
+        let (mut kept, mut kept_unkeyed) = (0, 0);
+        let (mut left_out, mut left_out_unkeyed) = (0_u64, 0_u64);
+        for (kind, pattern) in exceptions.chain(blocks) {
+            let set = self.set(*kind);
+            if !set.contains(pattern) {
+                continue;
+            }
+            let unkeyed = is_unkeyed(pattern);
+            let room =
+                kept < MAX_WILDCARD_PATTERNS && (!unkeyed || kept_unkeyed < MAX_UNKEYED_PATTERNS);
+            if room {
+                kept += 1;
+                kept_unkeyed += usize::from(unkeyed);
+            } else {
+                set.remove(pattern);
+                left_out += 1;
+                left_out_unkeyed += u64::from(unkeyed);
+            }
+        }
+        if left_out > 0 {
+            log::warn!(
+                "left {left_out} wildcard patterns out of the DNS blocklist, \
+                 {left_out_unkeyed} of them without a literal head or tail: at most \
+                 {MAX_WILDCARD_PATTERNS} are kept, {MAX_UNKEYED_PATTERNS} of those without one"
+            );
+            self.skipped += left_out;
+        }
+    }
+
     fn finish(mut self) -> DomainRules {
         for (kind, name) in std::mem::take(&mut self.badfilter) {
             self.set(kind).remove(&name);
         }
+        self.limit_patterns();
         DomainRules {
             important: without_redundant_children(&self.important),
             allow: without_redundant_children(&self.allow),
@@ -219,6 +308,23 @@ fn parse_adblock_line(line: &str) -> Line {
             "badfilter" => badfilter = true,
             _ => return Line::Skip,
         }
+    }
+    if let Some(name) = wildcard_domain(pattern) {
+        // A list in the wildcard domains format (see `DomainRules`): the name and its
+        // subdomains, hashed like `||name^`, rather than a pattern tried on every lookup.
+        let Some(name) = normalize_name(name) else {
+            return Line::Skip;
+        };
+        let kind = match (exception, important) {
+            (true, _) => Kind::Allow,
+            (false, true) => Kind::Important,
+            (false, false) => Kind::Block,
+        };
+        return Line::Rule {
+            kind,
+            name,
+            badfilter,
+        };
     }
     if pattern.contains('*') {
         // Lists unblock hosts that break sites with wildcard exceptions such as
@@ -338,6 +444,18 @@ fn normalize_name(name: &str) -> Option<String> {
         return None;
     }
     Some(name.to_ascii_lowercase())
+}
+
+/// The name of an unanchored rule in the wildcard domains format, `*.name`, `*.name^` or
+/// `*.name^|` where `name` has no `*`: the name as written, not yet checked. `None` for
+/// any other rule.
+fn wildcard_domain(pattern: &str) -> Option<&str> {
+    let rest = pattern.strip_prefix("*.")?;
+    let name = rest
+        .strip_suffix("^|")
+        .or_else(|| rest.strip_suffix('^'))
+        .unwrap_or(rest);
+    (!name.contains('*')).then_some(name)
 }
 
 /// The pattern for the host part of a rule whose name has a `*`, and whether it also
