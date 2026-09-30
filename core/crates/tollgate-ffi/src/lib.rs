@@ -1,7 +1,35 @@
 //! Swift-facing facade of the Tollgate core. Everything the iOS app and tunnel call
 //! goes through this crate; the other crates stay free of FFI concerns.
+//!
+//! Every function on the tunnel path catches panics, so a Rust bug becomes a Swift error
+//! (or a logged error for the functions that return no `Result`) instead of killing the
+//! extension.
 
 uniffi::setup_scaffolding!();
+
+mod ca;
+mod controls;
+mod engine;
+mod error;
+mod fds;
+mod lists;
+mod logging;
+
+pub use ca::{
+    CA_CERT_FILE, CA_COMMON_NAME, CA_KEY_FILE, CaInfo, PROFILE_DISPLAY_NAME, PROFILE_IDENTIFIER,
+    ca_mobileconfig, ca_test_leaf, generate_ca, load_ca,
+};
+pub use controls::{
+    BlockEvent, EventKind, LearnedPin, forget_stored_pins, stored_learned_pins,
+    validate_host_pattern,
+};
+pub use engine::{
+    DnsRecord, Engine, EngineOptions, FORWARD_QUEUE, LEARNED_PINS_FILE, LOCAL_DEADLINE,
+    LOCAL_PENDING, LocalResolver, PINS_SAVE_INTERVAL, PacketSink, RUNTIME_THREAD, Stats,
+};
+pub use error::{TollgateError, catch_panic, panic_message};
+pub use lists::{CompileReport, ListFormat, ListInput, ListTarget, compile_lists};
+pub use logging::{CoreLogger, LogLevel, set_logger};
 
 /// Version of the Rust core, shown in the app and logged by the tunnel.
 #[uniffi::export]

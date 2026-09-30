@@ -1,0 +1,94 @@
+//! Timeouts and limits for one `serve` call.
+
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use rustls::ClientConfig;
+use tollgate_common::resolve::Resolve;
+
+use crate::limits::{MAX_BLOCKED, MAX_H1_PER_HOST, MAX_PASSTHROUGH, MAX_UPSTREAM_CONNECTIONS};
+
+/// Timeouts and limits for [`crate::serve_with_options`]. [`Default`] gives the production
+/// values.
+#[derive(Clone, Debug)]
+pub struct ServeOptions {
+    /// Roots for upstream TLS. ALPN is set by the proxy. Default: webpki roots through
+    /// `tollgate_common::tls::client_config`. Tests use it to trust a local origin.
+    pub upstream_tls: Arc<ClientConfig>,
+    /// Wait for the first bytes after `CONNECT`; a silent client gets a plain tunnel,
+    /// because some protocols wait for the server to speak first. Default 10 s.
+    pub first_bytes_timeout: Duration,
+    /// Limit for reading the ClientHello and for the TLS handshake with the client.
+    /// Default 10 s.
+    pub handshake_timeout: Duration,
+    /// Limit for reading HTTP/1.1 request headers. Default 30 s.
+    pub header_read_timeout: Duration,
+    /// Client connections without a request in flight for this long are closed; upstream
+    /// connections idle this long are closed too. Default 60 s.
+    pub idle_timeout: Duration,
+    /// Limit for opening an upstream connection, TCP and TLS together. Default 10 s.
+    pub connect_timeout: Duration,
+    /// HTTP/2 keep-alive ping interval on both sides. Default 30 s.
+    pub keep_alive_interval: Duration,
+    /// Upstream connections in total. Default 64.
+    pub max_upstream_connections: usize,
+    /// HTTP/1.1 upstream connections per origin. Default 6.
+    pub max_h1_per_host: usize,
+    /// `CONNECT` tunnels passed through at once, each holding two sockets. Above it a
+    /// passthrough host gets `503`, and a connection passed through after its first bytes
+    /// were read is closed. Default 128.
+    pub max_passthrough: usize,
+    /// A passthrough tunnel that moves no bytes either way for this long is closed.
+    /// Default 5 minutes.
+    pub tunnel_idle_timeout: Duration,
+    /// Blocked hosts' connections open at once. A host the DNS blocklist blocks gets `200`
+    /// and a connection that completes TLS and fails every request, because iOS retries a
+    /// refused connection over another network without the proxy. When this many are open,
+    /// the one idle longest is closed to make room; when none is idle, or none becomes idle
+    /// within a short wait, a blocked host gets `403`, and a blocked TLS server name behind
+    /// another `CONNECT` host is closed. Default 64.
+    pub max_blocked: usize,
+    /// A blocked host's connection with no request in flight for this long is closed; a
+    /// new one costs the client only a `CONNECT` and a TLS handshake with a cached leaf.
+    /// Default 10 s.
+    pub blocked_idle_timeout: Duration,
+    /// Seconds from a clock that keeps counting while the device sleeps, used to age pooled
+    /// upstream connections. tokio's clock, like `Instant` on iOS, stops during sleep, so a
+    /// connection pooled before hours of sleep would still look fresh. Default
+    /// `tollgate_common::clock::now_secs`; tests pass a clock they can move.
+    pub clock: fn() -> u64,
+    /// Looks up upstream host names, for example over DNS over HTTPS. When it finds
+    /// nothing, or none of its addresses answers, the system resolver is used. Default
+    /// `None`: the system resolver only.
+    pub resolver: Option<Arc<dyn Resolve>>,
+    /// Whether an address is still assigned to one of the device's interfaces. When the
+    /// upstream connections are reset (wake, network change), upstream connections still
+    /// carrying requests, passthrough tunnels and WebSockets whose upstream source address
+    /// is gone are closed. Default
+    /// `tollgate_common::net::is_local_address`; tests pass a predicate they control.
+    pub local_address_present: fn(IpAddr) -> bool,
+}
+
+impl Default for ServeOptions {
+    fn default() -> ServeOptions {
+        ServeOptions {
+            upstream_tls: tollgate_common::tls::client_config(&[b"h2", b"http/1.1"]),
+            first_bytes_timeout: Duration::from_secs(10),
+            handshake_timeout: Duration::from_secs(10),
+            header_read_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(60),
+            connect_timeout: Duration::from_secs(10),
+            keep_alive_interval: Duration::from_secs(30),
+            max_upstream_connections: MAX_UPSTREAM_CONNECTIONS,
+            max_h1_per_host: MAX_H1_PER_HOST,
+            max_passthrough: MAX_PASSTHROUGH,
+            tunnel_idle_timeout: Duration::from_secs(5 * 60),
+            max_blocked: MAX_BLOCKED,
+            blocked_idle_timeout: Duration::from_secs(10),
+            clock: tollgate_common::clock::now_secs,
+            resolver: None,
+            local_address_present: tollgate_common::net::is_local_address,
+        }
+    }
+}

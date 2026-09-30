@@ -1,0 +1,34 @@
+//! The DNS path of the tunnel. Queries arrive as raw IP packets addressed to the tunnel's DNS
+//! address. Blocked names, HTTPS and SVCB queries and cache hits are answered at once;
+//! names only the local network knows ([`is_local_name`]) go to the network's own resolver
+//! through [`DnsHandler::complete_local`]; everything else is forwarded over DNS over HTTPS
+//! and answered through [`DnsHandler::complete`].
+
+mod answer;
+mod cache;
+mod doh;
+mod handler;
+mod local;
+mod lookup;
+pub mod packet;
+mod wire;
+
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+pub use answer::{BLOCK_TTL, MAX_UDP_PAYLOAD};
+pub use cache::{CACHE_CAPACITY, MAX_CACHE_TTL, MIN_CACHE_TTL};
+pub use doh::{
+    COLD_DEADLINE, DOWN_FOR, DohError, DohResolver, MAX_IDLE, MAX_IN_FLIGHT, WARM_DEADLINE,
+};
+pub use handler::{
+    DnsHandler, ForwardJob, LOCAL_CACHE_CAPACITY, LocalRecord, MAX_LOCAL_TTL, Outcome,
+};
+pub use local::is_local_name;
+pub use lookup::{
+    HostResolver, LOOKUP_CACHE_CAPACITY, LOOKUP_PERMITS, LOOKUP_TIMEOUT, MAX_LOOKUP_TTL,
+};
+
+/// The tunnel's IPv4 DNS server address.
+pub const TUNNEL_DNS_V4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
+/// The tunnel's IPv6 DNS server address.
+pub const TUNNEL_DNS_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x7467, 0, 0, 0, 0, 0, 1);

@@ -22,6 +22,16 @@ jobs:
       - name: Load identifiers
         run: grep -E '^[A-Z_]+=' tooling/config.env | tr -d '"' >> "$GITHUB_ENV"
 
+      # Stamped into the app (CFBundleVersion and Diagnostics) so the installed build can be
+      # matched to its run and commit. A pull_request build names the branch head, not the
+      # merge commit.
+      - name: Build stamp
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          echo "BUILD_NUMBER=${{ github.run_number }}" >> "$GITHUB_ENV"
+          echo "BUILD_COMMIT=${SHA:0:7}" >> "$GITHUB_ENV"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
@@ -56,6 +66,7 @@ jobs:
         run: |
           xcodebuild -project ios/Tollgate.xcodeproj -scheme Tollgate -configuration Release \
             -destination 'generic/platform=iOS' -derivedDataPath build/DerivedData \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" TOLLGATE_BUILD_COMMIT="$BUILD_COMMIT" \
             CODE_SIGNING_ALLOWED=NO build
           tooling/ci/check-app-icon.sh build/DerivedData/Build/Products/Release-iphoneos/Tollgate.app
 
@@ -75,6 +86,7 @@ jobs:
         run: |
           xcodebuild -project ios/Tollgate.xcodeproj -scheme Tollgate -configuration Release \
             -destination 'generic/platform=iOS' -archivePath build/Tollgate.xcarchive \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" TOLLGATE_BUILD_COMMIT="$BUILD_COMMIT" \
             DEVELOPMENT_TEAM="$TEAM_ID" OTHER_CODE_SIGN_FLAGS="--keychain $SIGNING_KEYCHAIN" archive
           tooling/ci/check-app-icon.sh build/Tollgate.xcarchive/Products/Applications/Tollgate.app
 

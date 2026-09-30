@@ -1,7 +1,7 @@
 # Tollgate: design
 
 Date: 2026-09-24
-Status: approved, M0 in progress
+Status: approved; M0 merged; M1 revisions below (2026-09-25)
 
 Tollgate is a personal, sideloaded iOS ad blocker. It runs as a local packet tunnel (a
 Network Extension "VPN" that never leaves the device), blocks ad and tracker domains at the
@@ -107,8 +107,10 @@ tollgate/
   ECH hints.
 - Everything else: forward over DNS-over-HTTPS (RFC 8484, POST `application/dns-message`,
   HTTP/2) to upstreams reached by IP with the TLS name set explicitly, defaults Cloudflare
-  `1.1.1.1` (`cloudflare-dns.com`) and Quad9 `9.9.9.9` (`dns.quad9.net`). Sockets opened by
-  the extension bypass the tunnel, so upstream traffic cannot loop.
+  `1.1.1.1` (`cloudflare-dns.com`) and Quad9 `9.9.9.9` (`dns.quad9.net`), then the same two
+  over IPv6 (`2606:4700:4700::1111`, `2620:fe::fe`) for IPv6-only networks with NAT64 and no
+  CLAT, where a direct connect to an IPv4 literal fails. Sockets opened by the extension
+  bypass the tunnel, so upstream traffic cannot loop.
 - LRU cache of 2,000 answers keyed by (name, type, class), honoring the minimum TTL, clamped
   to 10 s to 1 h.
 - On upstream failure: try the next upstream, then answer SERVFAIL.
@@ -121,7 +123,10 @@ tollgate/
   (Built directly on hyper, tokio-rustls, rustls with the `ring` provider, and rcgen. We may
   use `hudsucker` if it fits the memory budget and gives us the hooks we need; the decision is
   made during M1 and recorded in the plan.)
-- Plain HTTP requests: filtered, then forwarded.
+- Plain HTTP requests: filtered, then forwarded. When the upstream cannot be reached, or
+  closes or resets the connection before any response, the client connection closes
+  without a response, so Safari shows its own error page as without the proxy, not an
+  empty `502`.
 - `CONNECT host:port`: `Policy::classify` on the host. Passthrough copies bytes both ways
   untouched. Intercept replies `200`, peeks the ClientHello for SNI, terminates TLS with a
   leaf for that name, and serves HTTP/1.1 or HTTP/2 depending on ALPN.
@@ -173,7 +178,13 @@ the CA, exercises the whole filtering path without a phone.
      only.
    - `NEDNSSettings(servers: ["198.18.0.1", "fd00:7467::1"])` with `matchDomains = [""]`.
    - `NEProxySettings`: HTTP and HTTPS proxy `127.0.0.1:<port>`, `matchDomains = [""]`,
-     `excludeSimpleHostnames = true`, exceptions for `*.local` and captive portal hosts.
+     `excludeSimpleHostnames = true`, exceptions for loopback, the private and link-local
+     IPv4 and IPv6 ranges, `*.local`, `*.lan`, `*.home.arpa`, `*.internal`,
+     `*.localdomain`, `fritz.box`, `*.fritz.box`, `*.intranet`, `*.corp`, `*.private` and
+     `captive.apple.com`, so local network pages never go through the extension. The
+     suffix entries cover every local suffix the core's DNS treats as local
+     (`LOCAL_SUFFIXES` in the dns crate) plus `*.local`; a test in the dns crate checks
+     that the two lists stay in sync.
    - MTU 1500.
 4. Loop `packetFlow.readPackets` into `engine.handlePackets` and write the results back.
 
@@ -221,7 +232,11 @@ intercepting new connections (passthrough only) until memory recovers.
 
 ## Failure handling
 
-- Engine creation fails: `startTunnel` completes with an error that the app shows.
+- Engine creation fails: `startTunnel` completes with an error that the app shows. The
+  tunnel also writes the reason to `core/last-start-error.txt` in the App Group (removed on
+  a successful start), since the provider's error may not reach the app intact; the app
+  shows "Protection could not start: ..." when the tunnel goes from connecting to off
+  without the app asking, from that file or else from `fetchLastDisconnectError`.
 - No compiled lists: the app compiles the bundled snapshots on first launch; the tunnel runs
   DNS-only if `engine.dat` is still missing.
 - DoH upstream unreachable: next upstream, then SERVFAIL; counted in stats.
@@ -259,3 +274,538 @@ intercepting new connections (passthrough only) until memory recovers.
 - M2: DNS blocking on the phone; E3.
 - M3: CA setup flow and MITM in Safari, passthrough and pin learning; E4, E5.
 - M4: lists and log UI, memory tuning, E7, decide on netstack phase 2.
+
+## Revisions after the M1 prototypes (2026-09-25)
+
+Throwaway prototypes were built for every M1 component against the pinned crate versions,
+measured on Linux, and re-run by an independent reviewer. Where this section disagrees with
+the sections above, this section wins.
+
+### Measured
+
+| Item | Result |
+|---|---|
+| adblock engine, EasyList + EasyPrivacy + AdGuard Mobile Ads (114k network rules), network rules only, no debug info | `engine.dat` 4.8 MiB; 5.8 to 8 MiB resident after load; build 53 ms in the app |
+| Same with debug info (keeps rule text) | 11 MiB file, 12 to 13 MiB resident: too big for the extension |
+| DNS blocklist, AdGuard DNS filter + StevenBlack hosts (253k names) | `HashSet` 13 to 17 MiB (rejected); sorted 64-bit hashes 2 MiB |
+| DoH: tokio runtime + one HTTP/2 connection | about 0.1 MiB heap; 10 to 25 ms per query on a warm connection |
+| HTTPS proxy, 20 concurrent intercepted downloads | 52 MB with hyper defaults, 11 to 12 MB with tuned flow control |
+| Leaf certificate minting (ECDSA P-256) | about 50 microseconds |
+
+### Decisions that change the design
+
+**Crates.** A new `tollgate-common` crate holds the continuous clock, the shared rustls
+client configuration, statistics counters and the logging facade, so `dns` and `mitm` do not
+depend on each other.
+
+**filter.**
+- `adblock = "=0.13.3"` with `default-features = false` and features
+  `embedded-domain-resolver`, `full-regex-handling`. The default `single-thread` feature makes
+  the engine `!Send`, which uniffi objects cannot hold. The version is pinned exactly because
+  the app writes `engine.dat` and the extension reads it.
+- Lists are compiled with network rules only and without debug info. `Verdict::Block` carries
+  `rule: Option<String>`, which is `None` in the extension. The app can find the matching rule
+  for its log view by re-checking the URL against a debug engine it builds on demand.
+- `engine.dat` is loaded through `mmap` (`memmap2`), avoiding a transient peak of twice the
+  file size.
+- The regex cache discard policy is set to 10 s cleanup and 30 s unused lifetime.
+- Request types come from an explicit `Sec-Fetch-Dest` table (`style` to `stylesheet`,
+  `iframe`/`frame` to `sub_frame`, `empty` to `xmlhttprequest`, and so on), then `Accept`,
+  then the path extension.
+- Source URL: top-level document requests use their own URL; otherwise `Referer`, then
+  `Origin`, then empty. An empty source counts as third party, which is adblock's behavior.
+
+**DNS blocklist (`DomainSet`).** Names are stored as a sorted array of FNV-1a 64-bit hashes of
+the lowercased name in a binary file: magic `TGDS`, format version, entry counts, the length
+of the pattern section, checksum, then block hashes, allow hashes and important hashes, then
+the pattern section. The extension mmaps it and binary-searches the host and each parent
+label. The parser accepts `||name^`, `||name`, `.name^`, the unanchored `name^` and
+`name^|` (the name must start with a letter or digit, so `-pia.example^`, a suffix of other
+names, is skipped; all of these block the name and its subdomains), `@@||name^`, the
+exact-host forms `|name^|`, `|name^`, `://name^` and `://name^|` and their `@@` forms,
+`$important` and `$badfilter` rules and hosts-format lines. The AdGuard DNS filter writes
+some blocks in the unanchored form (`dlsdk.appsflyer.com^`) and some with `://`
+(`://jhf.ru^`, that host only). Exceptions with a `*` in the name (the AdGuard DNS filter has about ten,
+such as `@@||clk*.tradedoubler.com^|` and `@@||bcicl.*.evergage.com^|`) are kept as text in
+the pattern section and parsed once at load; `*` matches any run of characters, dots
+included, and a `||` pattern may match the host or a parent, a `|` pattern the host only.
+Wildcard blocks, regex and prefix rules (such as `|ads.`) are skipped, and redundant children
+of blocked parents are dropped. A file without a pattern section (length 0, as written before
+it existed) still loads. An exact-host entry
+covers the host only and is stored in the block or allow array as the hash of `|` followed by
+the name, which no name produces, so the AdGuard DNS filter's `@@|cdn.example^|` unblocks that
+host under a blocked `||example^` without unblocking the rest. Order of evaluation: important
+block (host and parents), exact allow, allow (host and parents), exact block, block (host and
+parents); a block is then lifted when a wildcard exception matches. The false positive rate is
+about 5e-14 per lookup.
+
+**dns.**
+- Only UDP port 53 addressed to `198.18.0.1` or `fd00:7467::1` is handled. Everything else is
+  dropped and counted; undecodable queries of at least 12 bytes get FORMERR.
+- The cache stores upstream wire bytes plus the offsets of each TTL (about 0.5 MiB for 2,000
+  entries) and patches id, question case and TTLs on a hit.
+- The cache clock is a continuous clock that keeps counting while the device sleeps
+  (`CLOCK_MONOTONIC` on Apple platforms, `CLOCK_BOOTTIME` on Linux). `Instant` stops during
+  sleep on iOS.
+- DoH: one shared HTTP/2 connection per upstream; each query runs in its own task on that
+  connection. An attempt has a 2 s deadline on a cold connection and 1.5 s on a warm one. A
+  closed connection is retried once, then the next upstream is tried, then the answer is
+  SERVFAIL. An upstream whose attempt timed out or failed to connect is marked down for 30 s
+  and tried only after the others (all in order when every upstream is down); when the time
+  is up, one query goes to it in the background, and its answer brings it back. A network
+  path change clears the marks; attempts still running on the old path stop, try once more
+  on a new connection and never mark an upstream down. At most 128 queries are in flight: 96 for the DNS forwarder
+  (further forwarded queries wait in its 256-job queue) and 32 for the proxy's name
+  lookups (16 names at once, A and AAAA together; further names wait for a turn, and
+  callers asking for a name already being looked up share that lookup).
+- Responses are normalized to the requester: OPT is echoed only if the query had one, and
+  answers larger than the requester's UDP size are trimmed: authority and additional records
+  go first, then answer records from the end, keeping the CNAME chain and as many whole
+  records of the final RRset as fit, without TC (RFC 2181 section 9). Nothing answers DNS
+  over TCP on the tunnel address, so a TC reply could not be retried; it is sent only when
+  not one record of the queried type fits. The cache key includes the requester's DO bit, so
+  answers with DNSSEC records never reach requesters that did not ask for them.
+
+**mitm.**
+- Built directly on hyper, hyper-util, tokio-rustls, rustls (ring provider only) and rcgen, not
+  `hudsucker`. hudsucker always compiles aws-lc-sys, hides client TLS failures, and would need
+  its certificate authority replaced anyway.
+- After `CONNECT`, the first bytes are peeked through a rewindable reader. Non-TLS traffic is
+  tunneled with the peeked bytes replayed. For TLS, the host is classified from the `CONNECT`
+  target and again from the SNI; either one saying passthrough tunnels the connection with
+  the ClientHello replayed.
+- Flow control limits are mandatory: HTTP/2 stream window 128 KiB, connection window 256 KiB,
+  server send buffer 128 KiB, HTTP/1 read buffer 128 KiB.
+- At most 32 intercepted client connections (about 0.35 MiB each) instead of 64. When all 32
+  are taken, a new connection closes the one that has had nothing in flight the longest (at
+  least 3 s) and waits up to 100 ms for its slot; without one, or when less than 8 MiB of
+  memory is available, new connections pass through. Upstream
+  connections are pooled per host and shared across client connections: at most 6 HTTP/1.1
+  connections per host and 64 upstream connections in total. An HTTP/2 origin shares one
+  connection, except that one whose stalled streams (responses whose clients stopped reading
+  for 1 s) could hold half its 256 KiB window gets no new requests: the next request opens
+  another connection, and the stalled one closes when its streams end. The 64-connection
+  limit still bounds the windows at 16 MiB.
+- At most 128 passthrough tunnels at once (two sockets and about 20 KiB each). Over the cap
+  a passthrough `CONNECT` host gets `503`, and a connection passed through after its first
+  bytes were read is closed. A tunnel that moves no bytes for 5 minutes is closed. The
+  engine raises the soft open file limit from iOS's 256 to 2048 before opening any socket.
+- Timeouts: 10 s for the first bytes and for the TLS handshake, 30 s to read request headers,
+  HTTP/2 keep-alive pings, and idle connections are closed after 60 s without requests.
+  Pooled upstream connections are aged with the continuous clock (tokio's clock stops during
+  sleep), checked again when taken from the pool, pinged while idle (HTTP/2), and dropped all
+  at once when the provider wakes or the default network path changes. A GET, HEAD or
+  OPTIONS without a body that fails on a reused connection before its response starts is
+  sent once more on a new connection.
+- An intercepted connection is answered (`CONNECT` 200 and TLS with our leaf) before the
+  upstream is dialed. When the dial for a request then fails (the name does not resolve,
+  the connection is refused, reset or times out), or the server closes or resets the
+  connection before any response (or resets the HTTP/2 stream or sends GOAWAY), without a
+  TLS error, the request gets no response: HTTP/1.1 closes the connection and HTTP/2
+  resets the stream, so the browser shows its own error page or falls back from
+  `https://` to `http://`, as without the proxy. An HTTPS origin that may speak HTTP/2 is
+  dialed by one request at a time; when that dial times out or cannot connect, the requests
+  that waited for it fail with it, so a page with many requests to a dead host fails them
+  together after one connect timeout rather than one timeout apart. Plain absolute-form
+  requests (`http://` through the system proxy) whose upstream cannot be reached, or closes
+  or resets the connection before any response, get no response either: the client
+  connection closes. An unreachable host is logged at info level, at most once a minute.
+  No free upstream connection gets `503`; an upstream TLS failure that teaches a pin gets
+  no response (see pin learning); other TLS failures and anything else get `502`.
+- WebSockets over intercepted HTTPS are forwarded over a dedicated HTTP/1.1 upstream
+  connection.
+- Passthrough tunnels and WebSocket relays outlive a wake or a path change unless their
+  network is gone: on each reset (`ProxyContext::path_resets`) and 2 s later, a relay whose
+  upstream socket's source address is no longer assigned to an interface (`getifaddrs`)
+  closes both sockets, so the client reconnects through a new `CONNECT` on the new path.
+  Pooled upstream connections that still carry requests (a server-sent events feed, a long
+  poll, a download) get the same check: their socket is wrapped so it can be cut, which
+  fails every request on it (HTTP/1.1 and HTTP/2 alike) instead of leaving the response
+  stalled on the dead path.
+- Clients using the proxy send it host names instead of looking them up, so the proxy checks
+  the DNS blocklist itself (`ProxyContext::domains`, the same `DomainSet` the DNS responder
+  uses, swapped together on reload): the `CONNECT` host before classification (passthrough
+  hosts included), a TLS server name that differs from it, and absolute-form hosts. A block
+  answers `403` (or closes the tunnel for a server name), never dials, counts in
+  `dns_blocked` and is recorded as a DNS block. The allowlist applies.
+- Upstream host names are looked up through `ServeOptions::resolver` (the
+  `tollgate_common::resolve::Resolve` trait; the tunnel passes `tollgate_dns::HostResolver`,
+  A and AAAA over the shared DoH connections with a 256-name cache), so proxied lookups are
+  encrypted like the tunnel's. The first two addresses are tried for 2 s each; when the
+  lookup fails, finds nothing or no address answers, `getaddrinfo` is the fallback.
+- HTTP/2 requests whose authority does not match the connection's SNI get `421 Misdirected
+  Request`.
+- The CA certificate and key are stored as PEM; leaves are issued from the stored certificate
+  (rcgen `x509-parser` feature), never from regenerated parameters.
+- Pin learning: only client TLS alerts that reject our certificate (`unknown_ca`,
+  `bad_certificate`, `certificate_unknown`, `decrypt_error`) count, two within 10 minutes.
+  Connections that finish the handshake and close without a request are counted as a
+  statistic only, until E4 shows how iOS clients actually fail. An upstream certificate the
+  proxy cannot verify (unknown issuer or missing intermediate: webpki roots, no
+  intermediate fetching), a server the proxy's TLS client shares no version or cipher suite
+  with, or one that requires a client certificate (it asked for one and then failed the
+  TLS 1.2 handshake, or sent a fatal TLS 1.3 alert in place of the first response; any
+  other failure after an optional request, such as a reset, teaches nothing), or an HTTP/2
+  server that resets a request's stream with HTTP_1_1_REQUIRED (IIS with Windows
+  authentication or client certificate renegotiation: the shared pool cannot carry that
+  connection-bound state, and there is no HTTP/1.1 fallback inside it) makes the SNI
+  name a learned pin at once;
+  the request that failed gets no response (HTTP/1.1 closes the connection; HTTP/2 resets
+  the stream with REFUSED_STREAM, since the upstream never processed it, or with
+  HTTP_1_1_REQUIRED when that was the server's answer, and sends GOAWAY),
+  so the browser retries on a new connection or shows its own error page (and may fall back
+  from `https://` to `http://`) instead of an empty `502`, and later connections are passed
+  through for the client to handle. When such a failure is not learned (the burst guard
+  below), the request gets a `502` with a short plain-text body that says the server's
+  certificate could not be verified (or no secure connection could be made) and names a
+  captive portal or a network filter as a likely cause. A certificate for another name,
+  expired, not yet valid, revoked or for another purpose only gets `502`: the client would
+  reject it too. The client accepted the proxy's leaf, so it cannot show its own
+  certificate warning; the `502` carries a short plain-text body (`Cache-Control:
+  no-store`) that names the problem, for example "Tollgate: the server's certificate has
+  expired", instead. Such failures can come from the network rather than the server (a captive
+  portal before login, a filter that intercepts HTTPS), which makes every host fail. So
+  when a third different host would be learned this way within 60 s, it is not, the
+  upstream pins from that minute are taken back, and upstream failures teach nothing for
+  10 minutes. On a wake or a network path change, upstream pins learned in the last
+  5 minutes are dropped as well. Pins from client rejections are never taken back.
+
+**ffi.**
+- Foreign traits use `#[uniffi::export(foreign)]`: `CoreLogger` (not `Logger`, which would
+  shadow `os.Logger` in Swift) and `PacketSink`.
+- `Engine.start(sink: PacketSink) -> UInt16`. `handle_packets` stays synchronous: it returns
+  answers it can produce immediately (blocked names, cache hits, type 65 and 64, SERVFAIL when
+  stopped) and queues the rest; forwarded answers arrive through `PacketSink.writePackets`.
+- Every exported function on the tunnel path returns `Result` and catches panics, so a Rust
+  bug becomes a Swift error instead of killing the extension. Poisoned locks are recovered.
+- Swift derives each packet's protocol family from the IP version nibble when writing packets.
+- `stopTunnel` always calls `engine.stop()`. The Swift `PacketSink` captures only the
+  `NEPacketTunnelFlow`, never the provider, so there is no reference cycle.
+- uniffi default features are off in the runtime crate; `cargo-metadata` is enabled only in
+  the bindgen tool.
+
+**CI.** A job checks the workspace with Rust 1.94, the declared minimum version.
+
+### Revised memory budget (extension)
+
+| Component | Budget |
+|---|---|
+| adblock engine | 8 MiB |
+| DNS blocklist (mmapped, clean pages) | 2 MiB |
+| DNS cache and DoH | 1 MiB |
+| intercepted connections (32 x 0.35 MiB) | 11 MiB |
+| passthrough tunnels (128 x about 20 KiB) | 2.5 MiB |
+| runtime, TLS configuration, leaf cache, misc | 3 MiB |
+| total for Rust | about 28 MiB, leaving room for the Swift runtime and system frameworks |
+
+## M1 crate contracts
+
+These signatures are the interface between the M1 plans. A plan may add private items and
+extra public helpers, but must not change these.
+
+```rust
+// ---------- tollgate-common ----------
+pub mod clock {
+    /// Seconds from a clock that keeps counting while the device sleeps.
+    pub fn now_secs() -> u64;
+}
+pub mod tls {
+    /// rustls client configuration with the ring provider and webpki roots.
+    pub fn client_config(alpn: &[&[u8]]) -> std::sync::Arc<rustls::ClientConfig>;
+}
+pub mod stats {
+    /// Lock-free counters shared by dns, mitm and ffi.
+    #[derive(Default, Debug)]
+    pub struct Stats {
+        pub dns_queries: AtomicU64, pub dns_blocked: AtomicU64, pub dns_cache_hits: AtomicU64,
+        pub dns_forwarded: AtomicU64, pub dns_failed: AtomicU64, pub packets_dropped: AtomicU64,
+        pub http_requests: AtomicU64, pub http_blocked: AtomicU64,
+        pub connections_intercepted: AtomicU64, pub connections_passthrough: AtomicU64,
+        pub tls_client_rejections: AtomicU64, pub tls_abandoned_after_handshake: AtomicU64,
+    }
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct StatsSnapshot { /* same fields as u64 */ }
+    impl Stats { pub fn snapshot(&self) -> StatsSnapshot; }
+}
+// Logging goes through the `log` crate facade; ffi installs a `log::Log` that forwards to
+// the Swift CoreLogger, devproxy installs env_logger.
+
+// ---------- tollgate-policy ----------
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DohUpstream { pub ip: std::net::IpAddr, pub port: u16, pub tls_name: String, pub path: String }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub doh_upstreams: Vec<DohUpstream>,     // default: Cloudflare 1.1.1.1, Quad9 9.9.9.9,
+                                             // then 2606:4700:4700::1111, 2620:fe::fe
+    pub passthrough: Vec<String>,            // user host patterns
+    pub mitm_enabled: bool,                  // default true
+    pub max_intercepted_connections: u32,    // default 32
+}
+impl Default for Config;
+impl Config { pub fn from_json(s: &str) -> Result<Config, PolicyError>; pub fn to_json(&self) -> String; }
+pub struct HostPattern; // "example.com" (exact) or "*.example.com" (the domain and all subdomains)
+impl HostPattern { pub fn parse(s: &str) -> Result<HostPattern, PolicyError>; pub fn matches(&self, host: &str) -> bool; }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision { Intercept, Passthrough(PassthroughReason) }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassthroughReason { MitmDisabled, User, Bundled, LearnedPin, NotTls, Capacity, LowMemory }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectionKind { UnknownCa, BadCertificate, CertificateUnknown, DecryptError }
+pub struct Policy; // Send + Sync, interior mutability
+impl Policy {
+    pub fn new(config: &Config, learned_pins_json: Option<&str>) -> Result<Policy, PolicyError>;
+    pub fn classify(&self, host: &str, now: u64) -> Decision;
+    /// Returns true when this rejection made the host a learned pin.
+    pub fn record_client_rejection(&self, host: &str, kind: RejectionKind, now: u64) -> bool;
+    pub fn learned_pins_json(&self) -> String;
+}
+pub fn bundled_passthrough() -> &'static [&'static str]; // compiled-in patterns
+
+// ---------- tollgate-filter ----------
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListFormat { Adblock, Hosts }
+pub struct ListSource<'a> { pub name: &'a str, pub text: &'a str, pub format: ListFormat }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict { Allow, Block { rule: Option<String> } }
+pub struct FilterEngine; // Send + Sync
+impl FilterEngine {
+    pub fn from_lists(lists: &[ListSource], debug: bool) -> FilterEngine;
+    pub fn serialize(&self) -> Vec<u8>;
+    pub fn load(path: &std::path::Path) -> Result<FilterEngine, FilterError>; // mmap
+    pub fn check(&self, url: &str, source_url: &str, request_type: &str) -> Verdict;
+}
+/// Maps Sec-Fetch-Dest, then Accept, then path extension to an adblock request type string.
+pub fn request_type(sec_fetch_dest: Option<&str>, accept: Option<&str>, path: &str) -> &'static str;
+pub struct DomainSet; // Send + Sync, mmapped
+impl DomainSet {
+    pub fn build(lists: &[ListSource]) -> Vec<u8>;                 // file bytes
+    pub fn load(path: &std::path::Path) -> Result<DomainSet, FilterError>;
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<DomainSet, FilterError>; // tests, devproxy
+    pub fn is_blocked(&self, host: &str) -> bool;
+    pub fn len(&self) -> usize;
+}
+pub const ENGINE_FILE: &str = "engine.dat";
+pub const DOMAINS_FILE: &str = "domains.bin";
+#[derive(Clone, Debug)]
+pub struct CompileReport { pub network_rules: u64, pub domain_entries: u64, pub engine_bytes: u64, pub domains_bytes: u64 }
+/// Writes ENGINE_FILE and DOMAINS_FILE atomically into dir.
+pub fn compile(lists: &[ListSource], dir: &std::path::Path) -> Result<CompileReport, FilterError>;
+
+// ---------- tollgate-dns ----------
+pub const TUNNEL_DNS_V4: std::net::Ipv4Addr; // 198.18.0.1
+pub const TUNNEL_DNS_V6: std::net::Ipv6Addr; // fd00:7467::1
+pub struct DnsHandler; // Send + Sync
+pub enum Outcome { Reply(Vec<u8>), Forward(ForwardJob), Drop }
+pub struct ForwardJob; // opaque: query wire bytes plus what is needed to build the reply packet
+impl DnsHandler {
+    pub fn new(blocklist: Option<std::sync::Arc<tollgate_filter::DomainSet>>, stats: std::sync::Arc<tollgate_common::stats::Stats>) -> DnsHandler;
+    pub fn set_blocklist(&self, blocklist: Option<std::sync::Arc<tollgate_filter::DomainSet>>);
+    /// Never blocks or awaits.
+    pub fn handle_packet(&self, packet: &[u8], now: u64) -> Outcome;
+    /// Builds the reply packet for a forwarded query; caches successful answers.
+    pub fn complete(&self, job: ForwardJob, answer: Result<Vec<u8>, DohError>, now: u64) -> Vec<u8>;
+}
+pub struct DohResolver; // Clone, used on one tokio runtime
+impl DohResolver {
+    pub fn new(upstreams: Vec<tollgate_policy::DohUpstream>) -> DohResolver;
+    pub async fn resolve(&self, query: &[u8]) -> Result<Vec<u8>, DohError>;
+}
+impl ForwardJob { pub fn query(&self) -> &[u8]; }
+
+// ---------- tollgate-mitm ----------
+pub struct CertAuthority; // Send + Sync
+impl CertAuthority {
+    pub fn generate(common_name: &str) -> Result<CertAuthority, MitmError>;
+    pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<CertAuthority, MitmError>;
+    pub fn cert_pem(&self) -> String;
+    pub fn key_pem(&self) -> String;
+    pub fn cert_der(&self) -> Vec<u8>;
+    /// iOS configuration profile containing only the root certificate.
+    pub fn mobileconfig(&self, display_name: &str, identifier: &str) -> Vec<u8>;
+}
+pub struct ProxyContext {
+    pub policy: std::sync::Arc<tollgate_policy::Policy>,
+    pub filter: arc_swap::ArcSwapOption<tollgate_filter::FilterEngine>,
+    pub ca: std::sync::Arc<CertAuthority>,
+    pub stats: std::sync::Arc<tollgate_common::stats::Stats>,
+    pub max_intercepted: usize,
+    /// Returns available memory in bytes; `None` where unknown (Linux dev runs).
+    pub available_memory: fn() -> Option<u64>,
+}
+/// Serves until `shutdown` resolves. Must be spawned on a current-thread tokio runtime.
+pub async fn serve(listener: tokio::net::TcpListener, ctx: std::sync::Arc<ProxyContext>,
+                   shutdown: impl std::future::Future<Output = ()>);
+
+// ---------- tollgate-ffi (Swift-facing) ----------
+// #[uniffi::export(foreign)] trait CoreLogger: Send + Sync { fn log(&self, level: LogLevel, target: String, message: String); }
+// #[uniffi::export(foreign)] trait PacketSink: Send + Sync { fn write_packets(&self, packets: Vec<Vec<u8>>); }
+// #[derive(uniffi::Object)] struct Engine;
+//   #[uniffi::constructor] fn new(config_json: String, data_dir: String) -> Result<Arc<Engine>, TollgateError>
+//   fn start(&self, sink: Arc<dyn PacketSink>) -> Result<u16, TollgateError>
+//   fn stop(&self)
+//   fn handle_packets(&self, packets: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, TollgateError>
+//   fn reload_lists(&self) -> Result<(), TollgateError>
+//   fn stats(&self) -> Stats            (uniffi::Record mirroring StatsSnapshot)
+//   fn learned_pins_json(&self) -> String
+// free functions: set_logger(Arc<dyn CoreLogger>, LogLevel), generate_ca(data_dir) -> Result<CaInfo>,
+//   ca_mobileconfig(data_dir) -> Result<Vec<u8>>, compile_lists(sources: Vec<ListInput>, data_dir) -> Result<CompileReport>
+```
+
+## M3: user controls (2026-09-25)
+
+Adds the blocked log, the allowlist, the passthrough editor, learned pin management, custom
+lists and rules, and automatic list updates. Where this section disagrees with earlier
+sections, this section wins.
+
+### Behavior
+
+- **Blocked log.** The tunnel keeps the last 500 block events in memory: DNS blocks (the
+  queried name) and request blocks (host, URL truncated to 512 bytes, and the page's host).
+  The app polls them while the Activity screen is visible. Nothing is written to disk.
+- **Allowlist.** Host patterns (same syntax as passthrough) where Tollgate blocks nothing:
+  DNS names matching a pattern are resolved normally, and a request is allowed when either
+  its own host or its page's host matches. From the log, "Allow" adds `*.host`.
+- **Passthrough editor.** The user edits `Config.passthrough`; entries are validated with the
+  core's own pattern parser before they are saved.
+- **Learned pins.** The app lists learned pins and can forget them. While the tunnel runs it
+  asks the tunnel (the engine owns the pins and saves them periodically); while it is off
+  the app edits `learned-pins.json` through the core.
+- **Custom lists and rules.** The default lists can be switched off individually; the user
+  can add list URLs of three kinds (request rules, DNS rules in adblock syntax, hosts files)
+  and type their own rules, which go into both the request engine and the DNS blocklist.
+  Settings live in the App Group as `lists.json`, owned by the app.
+- **Automatic updates.** A background app refresh task (`dev.tollgate.lists-refresh`) runs
+  about daily; the app also updates on launch and on returning to the foreground when the
+  lists are more than 24 hours old. After an attempt that could not download every list it
+  retries after an hour, and after 15 minutes while nothing is compiled; the background
+  task is asked for at that time too (iOS decides when it actually runs), so a failed
+  refresh is retried while the app stays closed. After an update the tunnel reloads the
+  lists.
+- Config changes (allowlist, passthrough) are saved to `config.json` and applied by
+  restarting the tunnel.
+- **Local network names.** The tunnel is the resolver for every name, and the DoH upstreams
+  know nothing about the owner's LAN, so names only the network's own resolver knows are
+  never sent there (`tollgate_dns::is_local_name`): single-label names, names under `lan`,
+  `home.arpa`, `internal`, `localdomain`, `fritz.box`, `intranet`, `corp` and `private`, and
+  the reverse zones of 10/8, 172.16/12, 192.168/16, 169.254/16, fc00::/7 and fe80::/10.
+  They are never blocked. The handler returns `Outcome::Local`; the engine hands the
+  question to the Swift `LocalResolver` (one lookup per question, at most 64 waiting, 5 s
+  deadline), which runs `DNSServiceQueryRecord` scoped to the current physical interface
+  from `NWPathMonitor(prohibitedInterfaceTypes: [.other])`, so the network's DHCP resolver
+  answers, never the tunnel's. The records come back through `Engine::complete_local`;
+  a failure or 2 s without an answer is SERVFAIL. Answers with records are cached for at
+  most 60 s, and the cache is emptied when the interface or its gateways change
+  (`Engine::set_network`). The proxy's `HostResolver` leaves these names to
+  `getaddrinfo`. Names under other router domains still go to DoH and fail, and a bare
+  name is sent to the router as typed, without the network's search domain.
+
+### Contracts
+
+```rust
+// ---------- tollgate-common::events ----------
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventKind { Dns, Request }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockEvent { pub unix_secs: u64, pub kind: EventKind, pub host: String,
+                        pub url: Option<String>, pub source_host: Option<String> }
+pub struct EventLog; // Send + Sync, bounded ring buffer
+impl EventLog {
+    pub const CAPACITY: usize = 500;
+    pub const MAX_URL_BYTES: usize = 512;
+    pub fn new() -> EventLog;
+    pub fn record(&self, event: BlockEvent);           // truncates url, drops oldest
+    pub fn recent(&self, limit: usize) -> Vec<BlockEvent>; // newest first
+    pub fn clear(&self);
+}
+
+// ---------- tollgate-policy ----------
+// Config gains `pub allowlist: Vec<String>` (serde default: empty).
+impl Policy {
+    pub fn is_allowlisted(&self, host: &str) -> bool;
+    /// Forgets learned pins (and pending rejections) for these hosts; returns how many pins.
+    pub fn forget_pins(&self, hosts: &[String]) -> usize;
+    /// (host, learned_at unix seconds), sorted by host.
+    pub fn learned_pins(&self) -> Vec<(String, u64)>;
+}
+
+// ---------- tollgate-dns ----------
+impl DnsHandler {
+    pub fn set_allowlist(&self, patterns: Vec<tollgate_policy::HostPattern>);
+    pub fn set_events(&self, events: Option<std::sync::Arc<tollgate_common::events::EventLog>>);
+}
+
+// ---------- tollgate-mitm ----------
+// ProxyContext gains `pub events: Option<Arc<EventLog>>`. Requests are allowed when
+// ctx.policy.is_allowlisted(request host) or is_allowlisted(page host); blocks are recorded.
+
+// ---------- tollgate-ffi (Swift-facing) ----------
+// #[derive(uniffi::Enum)] enum EventKind { Dns, Request }
+// #[derive(uniffi::Record)] struct BlockEvent { unix_secs: u64, kind: EventKind, host: String,
+//                                               url: Option<String>, source_host: Option<String> }
+// #[derive(uniffi::Record)] struct LearnedPin { host: String, learned_at: u64 }
+// impl Engine {
+//   fn recent_events(&self, limit: u32) -> Vec<BlockEvent>
+//   fn clear_events(&self)
+//   fn learned_pins(&self) -> Vec<LearnedPin>
+//   fn forget_pins(&self, hosts: Vec<String>) -> u32
+// }
+// free: validate_host_pattern(pattern: String) -> Result<(), TollgateError>
+//       stored_learned_pins(data_dir: String) -> Result<Vec<LearnedPin>, TollgateError>
+//       forget_stored_pins(data_dir: String, hosts: Vec<String>) -> Result<u32, TollgateError>
+```
+
+## Alpha 2: blocks under iOS 27 Connectivity Assist (2026-09-29)
+
+Changes how the proxy blocks a host and adds a notice to the app. Where this section
+disagrees with earlier sections, this section wins.
+
+- **The race.** With Connectivity Assist on (Settings, Wi-Fi: a main switch and one on each
+  network's page) and cellular data available, iOS 27 races each connection: it starts the
+  attempt over Wi-Fi, which goes through the proxy, and when that attempt fails, or is not
+  ready after about 350 ms, starts a second attempt over cellular that uses the carrier's
+  DNS and no proxy. An attempt through the proxy is ready only after the `CONNECT` answer
+  and the TLS handshake, the client's certificate trust check included. A device log
+  (iOS 27.0.1) showed a blocked host's `CONNECT` answered `403`, the Wi-Fi attempt marked
+  failed, the cellular attempt started in the same millisecond and the host loaded over
+  cellular: every refusal was a bypass. An attempt through the proxy that succeeded won
+  every time, so speed is not the problem.
+- **Blocks complete the connection.** A `CONNECT` to a host the DNS blocklist blocks is
+  answered `200`, and the TLS handshake completes with a leaf minted for the host, as for
+  an intercepted connection. The upstream is never dialed, and every request on the
+  connection fails without a response: HTTP/2 resets the stream and keeps the connection,
+  HTTP/1.1 closes the connection. To the page each blocked request is a network error, as
+  the refused `CONNECT` was, so pages that treat a failed request as blocked (ad-block test
+  pages among them) see no difference; to iOS the attempt is ready, so it has no reason to
+  try cellular. A TLS server name the blocklist blocks, behind a `CONNECT` host it does
+  not block, is served the same way instead of being closed. A client that rejects the
+  leaf on such a connection (an app that pins its certificates) teaches no pin. A client
+  whose ClientHello offers ALPN protocols but no HTTP one gets no ALPN, so its handshake
+  completes, and is closed right after the handshake. When the DNS lists are reloaded
+  (a My rules save, a list turned on or off, the daily update), the next request on an
+  open blocked connection is refused with `REFUSED_STREAM` and the connection closes, so
+  the client retries on a new `CONNECT`, which is classified with the new lists.
+- **Blocked connections are capped and reclaimed.** At most 64 are open at once. When all
+  are taken, the one idle longest is closed to make room, however briefly it has been
+  idle: its client's attempt was ready already, and its next request opens a new
+  `CONNECT`. A new blocked host waits up to 150 ms for a slot, looking again every 10 ms
+  for one to close while none is idle (in a burst the others are still in their
+  handshakes). A blocked connection with nothing in flight for 10 s is closed.
+- **Cases that keep the `403`.** A blocked host that the policy passes through (the user's
+  never filtered list, the bundled list, a learned pin) still gets `403`: intercepting it
+  is against the policy or known to fail in the client. So does a blocked host while the
+  proxy is low on memory, or while the cap on open blocked connections is full of blocked
+  connections none of which becomes idle within the wait (a blocked server name is then
+  closed). These refusals can still be retried over cellular. The low-memory and full-cap
+  refusals are logged at info level, at most once a minute for each, as
+  `blocked <host>: refused with 403, ...` (or `refused by closing the connection` for a
+  server name); the passthrough refusal is logged at debug level only.
+- **Connectivity Assist notice.** Blocks made by DNS alone (HTTPS filtering off, or an app
+  that does not use the proxy) answer `0.0.0.0` or `::`, the connection fails, and iOS can
+  retry it over cellular with the carrier's DNS. The app can neither read nor change the
+  setting. On iOS 27 and later, Home shows a notice after the protection section asking
+  the owner to turn Connectivity Assist off (the main switch and the one on each network's
+  page); "I turned it off" hides it (`notice.connectivityAssistDismissed` in the app's
+  `UserDefaults`), and a Connectivity Assist section in Settings keeps the same advice and
+  can show the notice again. The text never claims to know whether the setting is on.
+- On-device checks: `docs/experiments/alpha2.md` (E18 to E22).

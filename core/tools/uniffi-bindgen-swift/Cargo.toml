@@ -6,4 +6,6 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-uniffi = { workspace = true, features = ["cli"] }
+# The workspace turns uniffi's default features off; the bindings generator needs
+# cargo-metadata to find each crate's uniffi configuration.
+uniffi = { workspace = true, features = ["cli", "cargo-metadata"] }

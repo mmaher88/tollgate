@@ -9,7 +9,13 @@ web views and third-party apps.
 It is not distributed through the App Store. It is built and signed by GitHub Actions with
 the owner's Apple Developer account and installed from a Linux workstation.
 
-Status: M0, build pipeline and a first-light tunnel. See the
+Status: M3. The tunnel runs the Rust core (DNS blocking with DNS over HTTPS, and HTTPS
+filtering through a local proxy once the certificate is trusted). The app downloads,
+caches and compiles the filter lists (daily, in the background), installs the certificate,
+and has an Activity tab with recent blocks and Settings for lists, your own rules, allowed
+sites, never-filtered hosts and learned certificate pins. The core is verified on Linux with
+`devproxy`; the on-device checks are in [docs/experiments/m2.md](docs/experiments/m2.md) and
+[docs/experiments/m3.md](docs/experiments/m3.md). See the
 [design](docs/superpowers/specs/2026-09-24-tollgate-design.md) and the
 [feasibility research](docs/research/2026-09-23-feasibility-brief.md).
 
@@ -17,6 +23,8 @@ Status: M0, build pipeline and a first-light tunnel. See the
 
 - `core/`: Rust workspace. Filtering, DNS and the HTTPS proxy live here and are developed and
   tested on Linux with `cargo test`. `tollgate-ffi` exposes them to Swift through uniffi.
+- `core/tools/devproxy`: runs the same DNS responder and proxy on the workstation for
+  Firefox; `devproxy --help` and [the checklist](docs/experiments/m1-devproxy.md).
 - `ios/`: a thin SwiftUI app and a `NEPacketTunnelProvider` extension. The Xcode project is
   generated from `ios/project.yml` with XcodeGen; nobody edits a `.xcodeproj`.
 - `.github/workflows/ios.yml`: on an Apple silicon runner, cross-compiles the Rust core for
@@ -46,6 +54,9 @@ Status: M0, build pipeline and a first-light tunnel. See the
 
    This registers the phone, creates both App IDs with the Network Extensions and App Groups
    capabilities, creates an Apple Development certificate and the development profiles.
+   The phone's UDID and name are read with libimobiledevice, or with the pinned
+   pymobiledevice3 when it is not installed. If more than one device is connected, or
+   neither tool can read them, add `--udid <UDID> --name <name>`.
 4. In the portal, assign the App Group to both App IDs, then run
    `tooling/asc/provision.py profiles` again.
 5. `tooling/asc/push-secrets.sh` stores the certificate and profiles as repository secrets.
@@ -55,13 +66,26 @@ Everything written by the provisioning tool goes to `tooling/asc/out/`, which is
 ## Install and debug
 
 ```bash
-tooling/scripts/fetch-ipa.sh      # latest successful CI build of main (or pass a branch)
+gh workflow run ios.yml --repo mmaher88/tollgate --ref <branch>   # build the branch tip first
+tooling/scripts/fetch-ipa.sh <branch>   # the CI build of the branch tip (default main)
 tooling/scripts/install.sh        # install on the USB-connected iPhone
 tooling/scripts/logs.sh tunnel    # stream the extension's logs
 ```
 
+`fetch-ipa.sh` refuses a build older than the branch tip unless given `--allow-stale`, and
+prints the run number (`#N`), run id and URL, and the commit (kept in `build/ipa/BUILD_INFO`).
+The app shows "N (short commit)" under Diagnostics, Build, which matches the run number and
+the short commit.
+
 The first install of a development-signed app asks for Developer Mode on the phone
 (Settings, Privacy & Security, Developer Mode), followed by a reboot.
+
+In the app: tap Turn on (allow the VPN configuration), let the filter lists download, then
+follow the Setup steps to install and trust the certificate before switching on HTTPS
+filtering. `tooling/scripts/logs.sh` streams the app, the tunnel and the Rust core together.
+
+To try the core on Linux without a phone, run `devproxy` (see
+[docs/experiments/m1-devproxy.md](docs/experiments/m1-devproxy.md)).
 
 ## License
 

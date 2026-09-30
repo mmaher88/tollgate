@@ -32,3 +32,25 @@ jobs:
         run: cargo test --workspace
       - name: Swift bindings generate
         run: tooling/scripts/build-core-ios.sh --host
+      - name: Swift bindings keep the M0 calls and declare the foreign traits
+        run: |
+          swift=build/bindings-host/Swift/tollgate_ffi.swift
+          grep -q '^public func coreVersion() -> String' "$swift"
+          grep -q '^public func ping(message: String) -> String' "$swift"
+          grep -q '^public func sha256Hex(data: Data) -> String' "$swift"
+          grep -q '^public protocol CoreLogger: AnyObject, Sendable {' "$swift"
+          grep -q '^public protocol PacketSink: AnyObject, Sendable {' "$swift"
+
+  msrv:
+    name: check with Rust 1.94
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+          key: msrv
+      - name: check
+        working-directory: core
+        run: cargo check --workspace --locked

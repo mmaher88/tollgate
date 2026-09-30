@@ -9,6 +9,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CORE="$ROOT/core"
 MODE="${1:-ios}"
+# Honor CARGO_TARGET_DIR so the script finds the library wherever cargo put it.
+TARGET_DIR="${CARGO_TARGET_DIR:-$CORE/target}"
 
 bindgen() {
     local lib="$1" out="$2"
@@ -29,14 +31,14 @@ bindgen() {
 case "$MODE" in
     --host)
         (cd "$CORE" && cargo build --release -p tollgate-ffi)
-        bindgen "$CORE/target/release/libtollgate_ffi.a" "$ROOT/build/bindings-host"
+        bindgen "$TARGET_DIR/release/libtollgate_ffi.a" "$ROOT/build/bindings-host"
         ls -R "$ROOT/build/bindings-host"
         ;;
     ios)
         export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-17.0}"
         TARGET=aarch64-apple-ios
         (cd "$CORE" && cargo build --release -p tollgate-ffi --target "$TARGET")
-        LIB="$CORE/target/$TARGET/release/libtollgate_ffi.a"
+        LIB="$TARGET_DIR/$TARGET/release/libtollgate_ffi.a"
         OUT="$ROOT/ios/Generated"
         bindgen "$LIB" "$OUT"
         mkdir -p "$OUT/lib"

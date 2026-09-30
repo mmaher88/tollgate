@@ -11,5 +11,26 @@ name = "tollgate_ffi"
 crate-type = ["lib", "staticlib"]
 
 [dependencies]
-uniffi = { workspace = true }
+arc-swap = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
 ring = { workspace = true }
+rustls = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tollgate-common = { workspace = true }
+tollgate-dns = { workspace = true }
+tollgate-filter = { workspace = true }
+tollgate-mitm = { workspace = true }
+tollgate-policy = { workspace = true }
+uniffi = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+hickory-proto = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+rcgen = { workspace = true }
+tempfile = { workspace = true }
+tokio-rustls = { workspace = true }
