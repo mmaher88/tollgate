@@ -1,4 +1,5 @@
-//! Hosts that are never intercepted, compiled in.
+//! Hosts that are never intercepted, compiled in, in one group per source (see
+//! [`BundledGroup`]).
 //!
 //! Sources, fetched 2026-09-25:
 //! - Apple: every host in support.apple.com/101555, collapsed to `*.domain` where the
@@ -19,13 +20,59 @@
 //!
 //! Each group is sorted; a host listed in an earlier group is not repeated.
 
-/// The compiled-in passthrough patterns, in [`crate::HostPattern`] syntax.
+use std::sync::LazyLock;
+
+/// One group of the bundled passthrough list, named by its source. The proxy passes every
+/// group through alike; the groups exist for uses that need only some of them, such as
+/// the DNS lists that must leave the hosts of sensitive services and banks unblocked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BundledGroup {
+    /// Apple services, from Apple's article on enterprise networks.
+    Apple,
+    /// AdGuard's `sensitive.txt`: identity, password managers, health, government and
+    /// other services with sensitive personal information.
+    Sensitive,
+    /// AdGuard's `banks.txt`, its second-level `.com`, `.org` and `.net` domains: banks,
+    /// card issuers, payment processors, brokers and exchanges.
+    Banks,
+    /// Apps that refuse Tollgate's certificate without a TLS alert.
+    SilentRefusers,
+}
+
+impl BundledGroup {
+    /// Every group, in the order [`bundled_passthrough`] lists them.
+    pub const ALL: [BundledGroup; 4] = [
+        BundledGroup::Apple,
+        BundledGroup::Sensitive,
+        BundledGroup::Banks,
+        BundledGroup::SilentRefusers,
+    ];
+
+    /// The group's patterns, in [`crate::HostPattern`] syntax, sorted.
+    pub fn patterns(self) -> &'static [&'static str] {
+        match self {
+            BundledGroup::Apple => APPLE,
+            BundledGroup::Sensitive => SENSITIVE,
+            BundledGroup::Banks => BANKS,
+            BundledGroup::SilentRefusers => SILENT_REFUSERS,
+        }
+    }
+}
+
+/// The compiled-in passthrough patterns of every group, in [`crate::HostPattern`] syntax,
+/// group after group in the order of [`BundledGroup::ALL`].
 pub fn bundled_passthrough() -> &'static [&'static str] {
-    BUNDLED
+    static JOINED: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+        BundledGroup::ALL
+            .iter()
+            .flat_map(|group| group.patterns().iter().copied())
+            .collect()
+    });
+    JOINED.as_slice()
 }
 
 #[rustfmt::skip]
-static BUNDLED: &[&str] = &[
+static APPLE: &[&str] = &[
     // Apple, support article 101555 "Use Apple products on enterprise networks"
     // (published 2026-08-07): Apple services fail when HTTPS is intercepted.
     "*.apple", "*.apple-cloudkit.com", "*.apple-dns.net", "*.apple-livephotoskit.com",
@@ -35,7 +82,10 @@ static BUNDLED: &[&str] = &[
     "appldnld.apple.com.edgesuite.net", "apple-relay.cloudflare.com",
     "apple-relay.fastly-edge.com", "cp4.cloudflare.com", "crl3.digicert.com", "crl4.digicert.com",
     "ocsp.digicert.cn", "ocsp.digicert.com",
+];
 
+#[rustfmt::skip]
+static SENSITIVE: &[&str] = &[
     // AdGuard HttpsExclusions exclusions/sensitive.txt: identity, password managers,
     // health, government and other services with sensitive personal information.
     "*.1177.se", "*.1password.ca", "*.1password.com", "*.1password.eu", "*.4user.yeskey.or.kr",
@@ -80,7 +130,10 @@ static BUNDLED: &[&str] = &[
     "*.trueidentity.com", "*.trustedid.com", "*.turkiye.gov.tr", "*.tutanota.com",
     "*.uwzorgonline.nl", "*.vd.l.qq.com", "*.web.whatsapp.com", "*.websign.ro",
     "*.workflow.idocs.kz", "*.xero.com", "*.zakupki.gov.ru",
+];
 
+#[rustfmt::skip]
+static BANKS: &[&str] = &[
     // AdGuard HttpsExclusions exclusions/banks.txt: second-level .com, .org and .net
     // domains (banks, card issuers, payment processors, brokers, exchanges).
     "*.1stnorcalcu.org", "*.2checkout.com", "*.53.com", "*.abanca.com", "*.abchina.com",
@@ -177,7 +230,10 @@ static BUNDLED: &[&str] = &[
     "*.westconsincu.org", "*.wideup.net", "*.wise.com", "*.wlp-acs.com", "*.wmtransfer.com",
     "*.wooppay.com", "*.wooribank.com", "*.xtb.com", "*.yesrewardz.com", "*.youneedabudget.com",
     "*.zaim.com",
+];
 
+#[rustfmt::skip]
+static SILENT_REFUSERS: &[&str] = &[
     // X (formerly Twitter), iOS app com.atebits.Tweetie2 12.29 on iOS 27.0.1, device log of
     // 2026-09-30: every intercepted API connection was cancelled in the app's certificate
     // check ("Cancelled during verify block", task error -999), without a TLS alert.

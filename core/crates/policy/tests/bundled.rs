@@ -1,11 +1,58 @@
 use std::collections::HashSet;
 
-use tollgate_policy::{HostPattern, bundled_passthrough};
+use tollgate_policy::{BundledGroup, HostPattern, bundled_passthrough};
 
 fn bundled_matches(host: &str) -> bool {
     bundled_passthrough()
         .iter()
         .any(|p| HostPattern::parse(p).unwrap().matches(host))
+}
+
+fn group_matches(group: BundledGroup, host: &str) -> bool {
+    group
+        .patterns()
+        .iter()
+        .any(|p| HostPattern::parse(p).unwrap().matches(host))
+}
+
+#[test]
+fn the_groups_make_up_the_bundled_list_in_order() {
+    let joined: Vec<&str> = BundledGroup::ALL
+        .iter()
+        .flat_map(|group| group.patterns().iter().copied())
+        .collect();
+    assert_eq!(joined, bundled_passthrough());
+    let sizes = BundledGroup::ALL.map(|group| group.patterns().len());
+    assert_eq!(sizes, [24, 183, 420, 3]);
+}
+
+#[test]
+fn each_group_is_sorted() {
+    for group in BundledGroup::ALL {
+        let patterns = group.patterns();
+        assert!(patterns.is_sorted(), "{group:?}");
+    }
+}
+
+#[test]
+fn each_host_falls_in_the_group_of_its_source() {
+    for (group, host) in [
+        (BundledGroup::Apple, "gateway.icloud.com"),
+        (BundledGroup::Sensitive, "accounts.google.com"),
+        (BundledGroup::Sensitive, "vault.bitwarden.com"),
+        (BundledGroup::Sensitive, "www.army.mil"),
+        (BundledGroup::Banks, "secure.chase.com"),
+        (BundledGroup::Banks, "api.stripe.com"),
+        (BundledGroup::SilentRefusers, "api.x.com"),
+    ] {
+        for other in BundledGroup::ALL {
+            assert_eq!(
+                group_matches(other, host),
+                other == group,
+                "{host} in {other:?}"
+            );
+        }
+    }
 }
 
 #[test]
