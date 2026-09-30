@@ -20,7 +20,7 @@ fn every_entry_is_a_canonical_pattern() {
 fn entries_are_unique_and_the_snapshot_is_complete() {
     let unique: HashSet<&str> = bundled_passthrough().iter().copied().collect();
     assert_eq!(unique.len(), bundled_passthrough().len());
-    assert_eq!(bundled_passthrough().len(), 627);
+    assert_eq!(bundled_passthrough().len(), 630);
 }
 
 #[test]
@@ -59,6 +59,19 @@ fn covers_banking_and_sensitive_services() {
 }
 
 #[test]
+fn covers_apps_that_refuse_our_certificate_silently() {
+    for host in [
+        "api.x.com",
+        "x.com",
+        "api.twitter.com",
+        "pbs.twimg.com",
+        "video.twimg.com",
+    ] {
+        assert!(bundled_matches(host), "{host}");
+    }
+}
+
+#[test]
 fn leaves_ordinary_hosts_alone() {
     for host in [
         "www.google.com",
@@ -66,6 +79,8 @@ fn leaves_ordinary_hosts_alone() {
         "securepubads.g.doubleclick.net",
         "apple.com.evil.example",
         "cloudflare.com",
+        "fox.com",
+        "notx.com",
     ] {
         assert!(!bundled_matches(host), "{host}");
     }

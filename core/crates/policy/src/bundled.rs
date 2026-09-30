@@ -10,6 +10,9 @@
 //!   banks, 1,439 of them German) is left to pin learning and the user list. AdGuard excludes
 //!   each listed domain with its subdomains, so every entry becomes `*.domain`. Entries
 //!   limited to a desktop app (`$app=`) are left out.
+//! - Apps that refuse Tollgate's certificate without a TLS alert, confirmed in a device log.
+//!   Such an app gives up in its own certificate check and closes the connection silently,
+//!   which pin learning cannot see, so it would fail on every attempt.
 //!
 //! Each group is sorted; a host listed in an earlier group is not repeated.
 
@@ -171,4 +174,9 @@ static BUNDLED: &[&str] = &[
     "*.westconsincu.org", "*.wideup.net", "*.wise.com", "*.wlp-acs.com", "*.wmtransfer.com",
     "*.wooppay.com", "*.wooribank.com", "*.xtb.com", "*.yesrewardz.com", "*.youneedabudget.com",
     "*.zaim.com",
+
+    // X (formerly Twitter), iOS app com.atebits.Tweetie2 12.29 on iOS 27.0.1, device log of
+    // 2026-09-30: every intercepted API connection was cancelled in the app's certificate
+    // check ("Cancelled during verify block", task error -999), without a TLS alert.
+    "*.twimg.com", "*.twitter.com", "*.x.com",
 ];
