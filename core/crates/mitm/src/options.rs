@@ -7,7 +7,7 @@ use std::time::Duration;
 use rustls::ClientConfig;
 use tollgate_common::resolve::Resolve;
 
-use crate::limits::{MAX_H1_PER_HOST, MAX_PASSTHROUGH, MAX_UPSTREAM_CONNECTIONS};
+use crate::limits::{MAX_BLOCKED, MAX_H1_PER_HOST, MAX_PASSTHROUGH, MAX_UPSTREAM_CONNECTIONS};
 
 /// Timeouts and limits for [`crate::serve_with_options`]. [`Default`] gives the production
 /// values.
@@ -42,6 +42,17 @@ pub struct ServeOptions {
     /// A passthrough tunnel that moves no bytes either way for this long is closed.
     /// Default 5 minutes.
     pub tunnel_idle_timeout: Duration,
+    /// Blocked hosts' connections open at once. A host the DNS blocklist blocks gets `200`
+    /// and a connection that completes TLS and fails every request, because iOS retries a
+    /// refused connection over another network without the proxy. When this many are open,
+    /// the one idle longest is closed to make room; when none is idle, or none becomes idle
+    /// within a short wait, a blocked host gets `403`, and a blocked TLS server name behind
+    /// another `CONNECT` host is closed. Default 64.
+    pub max_blocked: usize,
+    /// A blocked host's connection with no request in flight for this long is closed; a
+    /// new one costs the client only a `CONNECT` and a TLS handshake with a cached leaf.
+    /// Default 10 s.
+    pub blocked_idle_timeout: Duration,
     /// Seconds from a clock that keeps counting while the device sleeps, used to age pooled
     /// upstream connections. tokio's clock, like `Instant` on iOS, stops during sleep, so a
     /// connection pooled before hours of sleep would still look fresh. Default
@@ -73,6 +84,8 @@ impl Default for ServeOptions {
             max_h1_per_host: MAX_H1_PER_HOST,
             max_passthrough: MAX_PASSTHROUGH,
             tunnel_idle_timeout: Duration::from_secs(5 * 60),
+            max_blocked: MAX_BLOCKED,
+            blocked_idle_timeout: Duration::from_secs(10),
             clock: tollgate_common::clock::now_secs,
             resolver: None,
             local_address_present: tollgate_common::net::is_local_address,

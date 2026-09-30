@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
@@ -38,13 +38,18 @@ use crate::{CertAuthority, ServeOptions, connect, forward};
 const TLS_SESSION_CACHE: usize = 256;
 /// An unreachable upstream host is logged at most once in this interval.
 const UNREACHABLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// Each cause of refusing a blocked host a blocked connection is logged at info level at most
+/// once in this interval.
+const REFUSED_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Everything the proxy needs from the engine that owns it.
 pub struct ProxyContext {
     pub policy: Arc<Policy>,
     pub filter: ArcSwapOption<FilterEngine>,
     /// The DNS blocklist, the same one the tunnel's DNS responder uses. Clients using the
-    /// proxy do not look names up themselves, so the proxy refuses blocked hosts itself.
+    /// proxy do not look names up themselves, so the proxy blocks those hosts itself: a
+    /// `CONNECT` gets a connection whose requests all fail (see `ServeOptions::max_blocked`
+    /// for when it gets `403` instead), and a request in absolute form gets `403`.
     pub domains: ArcSwapOption<DomainSet>,
     pub ca: Arc<CertAuthority>,
     pub stats: Arc<Stats>,
@@ -86,27 +91,28 @@ pub(crate) struct State {
     /// One per passthrough tunnel, held from before dialing until the tunnel ends, so
     /// overflow cannot take the file descriptors that DNS and the pool need.
     pub(crate) passthrough_slots: Arc<Semaphore>,
+    /// One per blocked host's connection (see `crate::sink`), held from the `200` answering
+    /// its `CONNECT` (or from reading a blocked server name) until the connection ends.
+    pub(crate) blocked_slots: Arc<Semaphore>,
     /// The intercepted connections past their TLS handshake, for reclaiming the slot of an
     /// idle one when the table is full.
     pub(crate) intercepted: Mutex<Vec<Weak<Activity>>>,
+    /// The blocked connections past their TLS handshake, for reclaiming the slot of an idle
+    /// one when `blocked_slots` is full.
+    pub(crate) blocked: Mutex<Vec<Weak<Activity>>>,
     pub(crate) provider: Arc<CryptoProvider>,
     pub(crate) sessions: Arc<dyn StoresServerSessions>,
-    /// Serves intercepted connections: HTTP/1.1 or HTTP/2, with the mandatory limits.
+    /// Serves intercepted and blocked connections: HTTP/1.1 or HTTP/2, with the mandatory
+    /// limits.
     pub(crate) server: auto::Builder<TokioExecutor>,
     /// Keeps unreachable upstream hosts to one log line per host a minute.
     pub(crate) unreachable_log: LogThrottle,
+    /// Keeps blocked hosts refused a blocked connection (see `crate::connect`) to one info
+    /// line a minute for each cause.
+    pub(crate) refused_log: LogThrottle,
 }
 
 impl State {
-    fn intercepted(&self) -> std::sync::MutexGuard<'_, Vec<Weak<Activity>>> {
-        let mut list = self
-            .intercepted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        list.retain(|activity| activity.strong_count() > 0);
-        list
-    }
-
     /// Logs a failed upstream request to `authority`. An unreachable host is logged at info
     /// level, which the tunnel's log shows, at most once a minute per host; anything else at
     /// debug level.
@@ -122,28 +128,56 @@ impl State {
 
     /// Records an intercepted connection that completed its TLS handshake.
     pub(crate) fn add_intercepted(&self, activity: &Arc<Activity>) {
-        self.intercepted().push(Arc::downgrade(activity));
+        live(&self.intercepted).push(Arc::downgrade(activity));
+    }
+
+    /// Records a blocked connection that completed its TLS handshake.
+    pub(crate) fn add_blocked(&self, activity: &Arc<Activity>) {
+        live(&self.blocked).push(Arc::downgrade(activity));
     }
 
     /// Asks the intercepted connection that has had nothing in flight the longest, and for
     /// at least [`MIN_IDLE_TO_RECLAIM`], to close. False when there is none.
     pub(crate) fn close_longest_idle(&self) -> bool {
-        let now = tokio::time::Instant::now();
-        let oldest = self
-            .intercepted()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter_map(|activity| Some((activity.idle_since()?, activity)))
-            .filter(|(since, _)| now.saturating_duration_since(*since) >= MIN_IDLE_TO_RECLAIM)
-            .min_by_key(|(since, _)| *since);
-        match oldest {
-            Some((_, activity)) => {
-                activity.request_reclaim();
-                true
-            }
-            None => false,
-        }
+        reclaim_longest_idle(&self.intercepted, MIN_IDLE_TO_RECLAIM).is_some()
     }
+
+    /// Asks the blocked connection that has had nothing in flight the longest, however
+    /// briefly, to close, and returns it; `None` when there is none. No minimum: closing a
+    /// blocked connection past its handshake costs its client nothing, since the client's
+    /// attempt was ready already, so iOS does not retry it over cellular, and the client's
+    /// next request to the host opens a new `CONNECT` and gets another. And a burst of
+    /// blocked hosts (an ad-block test page) needs the slots of connections idle for only
+    /// milliseconds.
+    pub(crate) fn close_longest_idle_blocked(&self) -> Option<Weak<Activity>> {
+        reclaim_longest_idle(&self.blocked, Duration::ZERO)
+    }
+}
+
+/// The connections in `list`, locked, without those that have ended.
+fn live(list: &Mutex<Vec<Weak<Activity>>>) -> MutexGuard<'_, Vec<Weak<Activity>>> {
+    let mut list = list.lock().unwrap_or_else(PoisonError::into_inner);
+    list.retain(|activity| activity.strong_count() > 0);
+    list
+}
+
+/// Asks the connection in `list` that has had nothing in flight the longest, and for at
+/// least `min_idle`, to close (see [`Activity::request_reclaim`]), and returns it; `None`
+/// when there is none. A connection already asked to close is not idle (see
+/// [`Activity::idle_since`]), so it is never picked twice.
+fn reclaim_longest_idle(
+    list: &Mutex<Vec<Weak<Activity>>>,
+    min_idle: Duration,
+) -> Option<Weak<Activity>> {
+    let now = tokio::time::Instant::now();
+    let (_, activity) = live(list)
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter_map(|activity| Some((activity.idle_since()?, activity)))
+        .filter(|(since, _)| now.saturating_duration_since(*since) >= min_idle)
+        .min_by_key(|(since, _)| *since)?;
+    activity.request_reclaim();
+    Some(Arc::downgrade(&activity))
 }
 
 /// Delay after the given number of consecutive `accept` errors: 10 ms, doubling, at most
@@ -212,7 +246,9 @@ pub async fn serve_with_options(
     let state = Arc::new(State {
         intercept_slots: Arc::new(Semaphore::new(ctx.max_intercepted)),
         passthrough_slots: Arc::new(Semaphore::new(options.max_passthrough)),
+        blocked_slots: Arc::new(Semaphore::new(options.max_blocked)),
         intercepted: Mutex::new(Vec::new()),
+        blocked: Mutex::new(Vec::new()),
         ctx,
         pool,
         shutdown: tasks.clone(),
@@ -220,6 +256,7 @@ pub async fn serve_with_options(
         sessions: ServerSessionMemoryCache::new(TLS_SESSION_CACHE),
         server,
         unreachable_log: LogThrottle::new(UNREACHABLE_LOG_INTERVAL),
+        refused_log: LogThrottle::new(REFUSED_LOG_INTERVAL),
         options,
     });
 
