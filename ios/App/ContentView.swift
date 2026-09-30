@@ -8,11 +8,15 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var httpsFiltering = CoreConfig.load().mitmEnabled
     @State private var heartbeat: TunnelHeartbeat?
+    @AppStorage(ConnectivityAssist.noticeDismissedKey) private var connectivityAssistNoticeDismissed = false
 
     var body: some View {
         NavigationStack {
             List {
                 protectionSection
+                if ConnectivityAssist.isAvailable && !connectivityAssistNoticeDismissed {
+                    connectivityAssistSection
+                }
                 setupSection
                 if tunnel.status == .connected {
                     activitySection
@@ -126,6 +130,27 @@ struct ContentView: View {
                 httpsFiltering = false
                 tunnel.showError("HTTPS filtering was turned off: iOS does not trust the Tollgate certificate for websites yet. Turn on full trust in Settings, General, About, Certificate Trust Settings.")
             }
+        }
+    }
+
+    // MARK: - Connectivity Assist
+
+    /// Asks the owner to turn off Connectivity Assist, which can retry a blocked connection
+    /// over cellular data (see `ConnectivityAssist`). Shown on iOS 27 and later until the
+    /// owner dismisses it; Settings can show it again.
+    private var connectivityAssistSection: some View {
+        Section {
+            HStack(alignment: .top, spacing: 14) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(ConnectivityAssist.title).font(.headline)
+                    Text(ConnectivityAssist.advice).font(.subheadline).foregroundStyle(.secondary)
+                }
+            }
+            .padding(.vertical, 6)
+            Button("I turned it off") { connectivityAssistNoticeDismissed = true }
         }
     }
 

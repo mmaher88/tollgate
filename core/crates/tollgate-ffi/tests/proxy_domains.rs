@@ -1,5 +1,7 @@
-//! The proxy refuses hosts the DNS blocklist blocks, with the same set as the DNS path,
-//! also after the lists are reloaded.
+//! The proxy blocks hosts the DNS blocklist blocks, with the same set as the DNS path,
+//! also after the lists are reloaded. These engines have no CA, so HTTPS filtering is off
+//! and a blocked host's `CONNECT` gets `403`; with filtering on it gets a connection whose
+//! requests fail instead (see the mitm crate's `domains` tests).
 
 mod support;
 

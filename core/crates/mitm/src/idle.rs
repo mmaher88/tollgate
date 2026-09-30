@@ -2,10 +2,12 @@
 //!
 //! A connection is busy from the moment a request arrives until its response body has been
 //! sent or dropped. Once nothing is in flight for the idle timeout, the connection is shut
-//! down gracefully, so idle browsers cannot hold interception slots forever. A request can
-//! also ask for the connection to be shut down, for example once its host is passed
-//! through, so the client's next request opens a new `CONNECT`, and so can a new
-//! connection that needs the interception slot of one that has been idle for a while.
+//! down gracefully, so idle browsers cannot hold interception slots (or blocked-connection
+//! slots) forever. A request can also ask for the connection to be shut down, for example
+//! once its host is passed through, so the client's next request opens a new `CONNECT`,
+//! and so can a new connection that needs the slot of an idle one: the interception slot
+//! of one that has been idle for a while, or the blocked-connection slot of one that has
+//! been idle for any time at all.
 //!
 //! A graceful HTTP/2 shutdown waits for the client to answer a ping. A client that never
 //! answers, such as an app iOS has suspended in the background, would keep its connection

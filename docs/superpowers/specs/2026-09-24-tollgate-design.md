@@ -754,3 +754,58 @@ impl DnsHandler {
 //       stored_learned_pins(data_dir: String) -> Result<Vec<LearnedPin>, TollgateError>
 //       forget_stored_pins(data_dir: String, hosts: Vec<String>) -> Result<u32, TollgateError>
 ```
+
+## Alpha 2: blocks under iOS 27 Connectivity Assist (2026-09-29)
+
+Changes how the proxy blocks a host and adds a notice to the app. Where this section
+disagrees with earlier sections, this section wins.
+
+- **The race.** With Connectivity Assist on (Settings, Wi-Fi: a main switch and one on each
+  network's page) and cellular data available, iOS 27 races each connection: it starts the
+  attempt over Wi-Fi, which goes through the proxy, and when that attempt fails, or is not
+  ready after about 350 ms, starts a second attempt over cellular that uses the carrier's
+  DNS and no proxy. An attempt through the proxy is ready only after the `CONNECT` answer
+  and the TLS handshake, the client's certificate trust check included. A device log
+  (iOS 27.0.1) showed a blocked host's `CONNECT` answered `403`, the Wi-Fi attempt marked
+  failed, the cellular attempt started in the same millisecond and the host loaded over
+  cellular: every refusal was a bypass. An attempt through the proxy that succeeded won
+  every time, so speed is not the problem.
+- **Blocks complete the connection.** A `CONNECT` to a host the DNS blocklist blocks is
+  answered `200`, and the TLS handshake completes with a leaf minted for the host, as for
+  an intercepted connection. The upstream is never dialed, and every request on the
+  connection fails without a response: HTTP/2 resets the stream and keeps the connection,
+  HTTP/1.1 closes the connection. To the page each blocked request is a network error, as
+  the refused `CONNECT` was, so pages that treat a failed request as blocked (ad-block test
+  pages among them) see no difference; to iOS the attempt is ready, so it has no reason to
+  try cellular. A TLS server name the blocklist blocks, behind a `CONNECT` host it does
+  not block, is served the same way instead of being closed. A client that rejects the
+  leaf on such a connection (an app that pins its certificates) teaches no pin. A client
+  whose ClientHello offers ALPN protocols but no HTTP one gets no ALPN, so its handshake
+  completes, and is closed right after the handshake. When the DNS lists are reloaded
+  (a My rules save, a list turned on or off, the daily update), the next request on an
+  open blocked connection is refused with `REFUSED_STREAM` and the connection closes, so
+  the client retries on a new `CONNECT`, which is classified with the new lists.
+- **Blocked connections are capped and reclaimed.** At most 64 are open at once. When all
+  are taken, the one idle longest is closed to make room, however briefly it has been
+  idle: its client's attempt was ready already, and its next request opens a new
+  `CONNECT`. A new blocked host waits up to 150 ms for a slot, looking again every 10 ms
+  for one to close while none is idle (in a burst the others are still in their
+  handshakes). A blocked connection with nothing in flight for 10 s is closed.
+- **Cases that keep the `403`.** A blocked host that the policy passes through (the user's
+  never filtered list, the bundled list, a learned pin) still gets `403`: intercepting it
+  is against the policy or known to fail in the client. So does a blocked host while the
+  proxy is low on memory, or while the cap on open blocked connections is full of blocked
+  connections none of which becomes idle within the wait (a blocked server name is then
+  closed). These refusals can still be retried over cellular. The low-memory and full-cap
+  refusals are logged at info level, at most once a minute for each, as
+  `blocked <host>: refused with 403, ...` (or `refused by closing the connection` for a
+  server name); the passthrough refusal is logged at debug level only.
+- **Connectivity Assist notice.** Blocks made by DNS alone (HTTPS filtering off, or an app
+  that does not use the proxy) answer `0.0.0.0` or `::`, the connection fails, and iOS can
+  retry it over cellular with the carrier's DNS. The app can neither read nor change the
+  setting. On iOS 27 and later, Home shows a notice after the protection section asking
+  the owner to turn Connectivity Assist off (the main switch and the one on each network's
+  page); "I turned it off" hides it (`notice.connectivityAssistDismissed` in the app's
+  `UserDefaults`), and a Connectivity Assist section in Settings keeps the same advice and
+  can show the notice again. The text never claims to know whether the setting is on.
+- On-device checks: `docs/experiments/alpha2.md` (E18 to E22).

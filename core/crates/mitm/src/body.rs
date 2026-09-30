@@ -43,7 +43,8 @@ pub(crate) fn text(code: StatusCode, message: String) -> Response<Body> {
 }
 
 /// The answer to a blocked request: an empty `403` that any origin may read, so pages do
-/// not stall on a CORS error.
+/// not stall on a CORS error. Also the answer to a `CONNECT` for a blocked host that gets
+/// no blocked connection (see `crate::connect`).
 pub(crate) fn blocked() -> Response<Body> {
     let mut response = status(StatusCode::FORBIDDEN);
     response

@@ -2,12 +2,13 @@
 //! the DNS blocklist.
 
 use std::net::IpAddr;
+use std::sync::{Arc, Weak};
 
 use hyper::HeaderMap;
 use tollgate_common::clock::unix_secs;
 use tollgate_common::events::{BlockEvent, EventKind};
 use tollgate_common::stats::Stats;
-use tollgate_filter::{Verdict, request_type, source_url};
+use tollgate_filter::{DomainSet, Verdict, request_type, source_url};
 
 use crate::ProxyContext;
 
@@ -65,26 +66,49 @@ pub(crate) fn is_blocked(
     }
 }
 
-/// True when the DNS blocklist blocks `host` and the allowlist does not cover it: the same
-/// decision the tunnel's DNS responder makes for a lookup of the name. Clients that use the
-/// proxy send it the name instead of looking it up, so without this check names that only
-/// the DNS lists block would load. A block counts in `dns_blocked` and is recorded as a DNS
-/// block. IP addresses are never blocked.
+/// Which DNS blocklist blocked a host: the one `ProxyContext::domains` held at the time. A
+/// blocked host's connection keeps it to notice that the lists were reloaded since (see
+/// `crate::sink`). It holds the list weakly, so such a connection does not keep a replaced
+/// list in memory.
+pub(crate) struct BlockedBy(Weak<DomainSet>);
+
+impl BlockedBy {
+    /// True when `ctx` holds another DNS blocklist than the one that blocked the host, or
+    /// none.
+    pub(crate) fn lists_changed(&self, ctx: &ProxyContext) -> bool {
+        let domains = ctx.domains.load();
+        // The Weak keeps the old list's allocation, so no new list can take its address.
+        domains
+            .as_ref()
+            .is_none_or(|domains| !std::ptr::eq(Arc::as_ptr(domains), self.0.as_ptr()))
+    }
+}
+
+/// True when [`domain_blocked_by`] finds `host` blocked.
 pub(crate) fn is_domain_blocked(ctx: &ProxyContext, host: &str) -> bool {
+    domain_blocked_by(ctx, host).is_some()
+}
+
+/// The DNS blocklist that blocks `host`, or `None` when it does not or the allowlist covers
+/// the host: the same decision the tunnel's DNS responder makes for a lookup of the name.
+/// Clients that use the proxy send it the name instead of looking it up, so without this
+/// check names that only the DNS lists block would load. A block counts in `dns_blocked`
+/// and is recorded as a DNS block. IP addresses are never blocked. The caller blocks the
+/// host: `CONNECT` with a connection whose requests all fail (see `crate::sink`), or `403`
+/// where that cannot be used, and a request in absolute form with `403`.
+pub(crate) fn domain_blocked_by(ctx: &ProxyContext, host: &str) -> Option<BlockedBy> {
     let host = host.strip_suffix('.').unwrap_or(host);
     let bare = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     if bare.is_empty() || bare.parse::<IpAddr>().is_ok() {
-        return false;
+        return None;
     }
     let domains = ctx.domains.load();
-    let Some(domains) = domains.as_ref() else {
-        return false;
-    };
+    let domains = domains.as_ref()?;
     if !domains.is_blocked(bare) || ctx.policy.is_allowlisted(bare) {
-        return false;
+        return None;
     }
     Stats::inc(&ctx.stats.dns_blocked);
     log::debug!("blocked host {bare} by the DNS blocklist");
@@ -97,7 +121,7 @@ pub(crate) fn is_domain_blocked(ctx: &ProxyContext, host: &str) -> bool {
             source_host: None,
         });
     }
-    true
+    Some(BlockedBy(Arc::downgrade(domains)))
 }
 
 /// The host of an absolute URL, without userinfo, port, IPv6 brackets or a trailing dot.

@@ -62,15 +62,25 @@ impl ResolvesServerCert for FixedCert {
     }
 }
 
-/// The leaf is issued before the handshake, so a certificate problem can never look like a
+/// The ALPN protocols of a client connection the proxy serves HTTP on.
+pub(crate) const HTTP_ALPN: &[&[u8]] = &[b"h2", b"http/1.1"];
+
+/// The TLS configuration for a client connection the proxy terminates, intercepted or
+/// blocked (see `crate::sink`): `leaf`, the ALPN protocols `alpn` ([`HTTP_ALPN`], or none,
+/// which ignores the client's ALPN and negotiates none), and the shared session cache. The
+/// leaf is issued before the handshake, so a certificate problem can never look like a
 /// client rejecting us.
-fn server_config(state: &State, leaf: Arc<CertifiedKey>) -> Arc<ServerConfig> {
+pub(crate) fn server_config(
+    state: &State,
+    leaf: Arc<CertifiedKey>,
+    alpn: &[&[u8]],
+) -> Arc<ServerConfig> {
     let mut config = ServerConfig::builder_with_provider(state.provider.clone())
         .with_safe_default_protocol_versions()
         .expect("the ring provider supports TLS 1.2 and 1.3")
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(FixedCert(leaf)));
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
     config.session_storage = state.sessions.clone();
     Arc::new(config)
 }
@@ -87,7 +97,7 @@ pub(crate) async fn intercept<C>(
 {
     let _permit = permit;
     Stats::inc(&state.ctx.stats.connections_intercepted);
-    let acceptor = TlsAcceptor::from(server_config(&state, leaf));
+    let acceptor = TlsAcceptor::from(server_config(&state, leaf, HTTP_ALPN));
     let handshake =
         tokio::time::timeout(state.options.handshake_timeout, acceptor.accept(client)).await;
     let tls = match handshake {

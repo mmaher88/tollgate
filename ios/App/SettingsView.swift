@@ -6,6 +6,7 @@ struct SettingsView: View {
     @State private var allowCount = 0
     @State private var passthroughCount = 0
     @State private var enabledLists = 0
+    @AppStorage(ConnectivityAssist.noticeDismissedKey) private var connectivityAssistNoticeDismissed = false
 
     var body: some View {
         NavigationStack {
@@ -43,6 +44,18 @@ struct SettingsView: View {
                     NavigationLink("Learned certificate pins") { PinsView() }
                 } header: {
                     Text("Exceptions")
+                }
+
+                // The Home notice's advice stays here after it is dismissed.
+                if ConnectivityAssist.isAvailable {
+                    Section {
+                        Button("Show the notice on Home") { connectivityAssistNoticeDismissed = false }
+                            .disabled(!connectivityAssistNoticeDismissed)
+                    } header: {
+                        Text("Connectivity Assist")
+                    } footer: {
+                        Text(ConnectivityAssist.advice)
+                    }
                 }
             }
             .navigationTitle("Settings")

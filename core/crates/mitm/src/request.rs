@@ -21,7 +21,8 @@ use crate::upstream::{
 use crate::websocket;
 
 /// Ends a request without a response. hyper closes an HTTP/1.1 connection and resets an
-/// HTTP/2 stream, so the client sees a connection failure, as it would without the proxy.
+/// HTTP/2 stream, so the client sees a network error: for an upstream failure, the one it
+/// would see without the proxy.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum NoResponse {
     /// The upstream could not be reached, or closed or reset the connection before any
@@ -35,6 +36,20 @@ pub(crate) enum NoResponse {
     /// connection, whose `CONNECT` is now passed through.
     #[error("no response: the host is passed through from now on")]
     PassedThrough(#[source] h2::Error),
+    /// Every request on a blocked host's connection (see `crate::sink`). It does not close
+    /// the connection by itself: the HTTP/2 stream is reset with the reason carried here
+    /// and the connection stays open for the client's next request, while HTTP/1.1 closes
+    /// the connection, as after any error. Built by [`NoResponse::blocked`], whose reason is
+    /// chosen there.
+    #[error("no response: the host is blocked")]
+    Blocked(#[source] h2::Error),
+    /// A request on a blocked host's connection after the DNS blocklist was reloaded, which
+    /// may no longer block the host. The client connection closes too (HTTP/2 GOAWAY), and
+    /// the HTTP/2 stream is reset with the reason carried here: REFUSED_STREAM, which tells
+    /// the client that the request was not processed and may be retried on a new
+    /// connection, whose `CONNECT` is classified again with the new lists.
+    #[error("no response: the DNS blocklist changed")]
+    ListsChanged(#[source] h2::Error),
 }
 
 impl NoResponse {
@@ -44,9 +59,31 @@ impl NoResponse {
         NoResponse::PassedThrough(reason.into())
     }
 
+    /// For a request to a blocked host. The HTTP/2 stream is reset with INTERNAL_ERROR,
+    /// which says only that the request failed, as [`NoResponse::Closed`] says for an
+    /// unreachable upstream, so a blocked request fails like any other network error.
+    /// The other reasons say more than that: REFUSED_STREAM tells the client that the
+    /// request was never processed and may be retried, on a new connection if need be (RFC
+    /// 9113, section 8.7), and HTTP_1_1_REQUIRED asks for a retry over HTTP/1.1 on a new
+    /// connection, and a blocked request must invite no retry; CANCEL is for a stream the
+    /// sender no longer needs and NO_ERROR for one that ended normally, neither of which is
+    /// true here.
+    pub(crate) fn blocked() -> NoResponse {
+        NoResponse::Blocked(h2::Reason::INTERNAL_ERROR.into())
+    }
+
+    /// For a request on a blocked host's connection after the DNS blocklist was reloaded;
+    /// the HTTP/2 stream is reset with REFUSED_STREAM (see [`NoResponse::ListsChanged`]).
+    pub(crate) fn lists_changed() -> NoResponse {
+        NoResponse::ListsChanged(h2::Reason::REFUSED_STREAM.into())
+    }
+
     /// True when the client connection should close as well.
-    fn closes_connection(&self) -> bool {
-        matches!(self, NoResponse::PassedThrough(_))
+    pub(crate) fn closes_connection(&self) -> bool {
+        matches!(
+            self,
+            NoResponse::PassedThrough(_) | NoResponse::ListsChanged(_)
+        )
     }
 }
 
