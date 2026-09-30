@@ -16,6 +16,7 @@ use tollgate_common::clock::unix_secs;
 use tollgate_common::stats::Stats;
 use tollgate_policy::RejectionKind;
 
+use crate::flight::FlightWatch;
 use crate::http::{authority, bare_host};
 use crate::idle::{self, Activity};
 use crate::proxy::State;
@@ -98,13 +99,17 @@ pub(crate) async fn intercept<C>(
     let _permit = permit;
     Stats::inc(&state.ctx.stats.connections_intercepted);
     let acceptor = TlsAcceptor::from(server_config(&state, leaf, HTTP_ALPN));
-    let handshake =
-        tokio::time::timeout(state.options.handshake_timeout, acceptor.accept(client)).await;
+    let accept = acceptor.accept(FlightWatch::new(client)).into_fallible();
+    let handshake = tokio::time::timeout(state.options.handshake_timeout, accept).await;
     let tls = match handshake {
         Err(_) => return log::debug!("TLS handshake for {} timed out", origin.name),
-        Ok(Err(e)) => return report_handshake_failure(&state, &origin.name, &e),
+        Ok(Err((e, client))) => return report_handshake_failure(&state, &origin.name, &e, &client),
         Ok(Ok(tls)) => tls,
     };
+    state
+        .ctx
+        .policy
+        .record_intercepted_handshake(&origin.name, unix_secs());
 
     let activity = Activity::new();
     state.add_intercepted(&activity);
@@ -146,10 +151,21 @@ pub(crate) async fn intercept<C>(
     }
 }
 
-/// Only alerts that reject our certificate feed pin learning. Anything else (no shared
-/// cipher suite, a reset, garbage) is our problem or noise, and is only logged.
-fn report_handshake_failure(state: &State, name: &str, error: &io::Error) {
+/// Two kinds of handshake failure feed pin learning: an alert that rejects our certificate,
+/// and a client that hangs up without one after our certificate reached it (a silent
+/// refusal, see `crate::flight`), which the policy learns from under a stricter rule.
+/// Anything else (no shared cipher suite, a client that hangs up before our certificate
+/// reached it, garbage) is our problem or noise, and is only logged.
+fn report_handshake_failure<C>(
+    state: &State,
+    name: &str,
+    error: &io::Error,
+    client: &FlightWatch<C>,
+) {
     let Some(kind) = rejection_kind(error) else {
+        if hung_up(error) && client.certificate_delivered() {
+            return report_silent_refusal(state, name, error);
+        }
         return log::debug!("TLS handshake for {name} failed: {error}");
     };
     Stats::inc(&state.ctx.stats.tls_client_rejections);
@@ -177,5 +193,39 @@ fn rejection_kind(error: &io::Error) -> Option<RejectionKind> {
             Some(RejectionKind::DecryptError)
         }
         _ => None,
+    }
+}
+
+/// A client hung up during the handshake for `name` after our certificate reached it,
+/// with `error`: counted, and taught to the policy, which decides whether it is a pin.
+fn report_silent_refusal(state: &State, name: &str, error: &io::Error) {
+    Stats::inc(&state.ctx.stats.tls_silent_refusals);
+    if state.ctx.policy.record_silent_refusal(name, unix_secs()) {
+        log::info!(
+            "{name} hangs up on our certificate without an alert; passing it through from now \
+             on"
+        );
+    } else {
+        log::debug!("{name} hung up during the handshake after our certificate: {error}");
+    }
+}
+
+/// Whether a failed handshake is the client hanging up without saying why: the connection
+/// ended (end of stream or a reset), or the client sent close_notify, which rustls reports
+/// as a received alert during a TLS 1.3 handshake (TLS 1.2 ignores it and then sees the end
+/// of stream), or user_canceled at the fatal level (at the warning level it is ignored).
+fn hung_up(error: &io::Error) -> bool {
+    match error.kind() {
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted => true,
+        _ => matches!(
+            error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<rustls::Error>()),
+            Some(rustls::Error::AlertReceived(
+                AlertDescription::CloseNotify | AlertDescription::UserCanceled
+            ))
+        ),
     }
 }

@@ -11,7 +11,9 @@ pub use config::{Config, DohUpstream};
 pub use pattern::HostPattern;
 pub use policy::{
     Decision, PIN_LIFETIME_SECS, PassthroughReason, Policy, REJECTION_WINDOW_SECS, RejectionKind,
-    UPSTREAM_BURST_HOSTS, UPSTREAM_BURST_SECS, UPSTREAM_RECENT_SECS, UPSTREAM_SUPPRESS_SECS,
+    SILENT_BURST_HOSTS, SILENT_BURST_SECS, SILENT_REFUSALS, SILENT_SUPPRESS_SECS,
+    SILENT_WINDOW_SECS, UPSTREAM_BURST_HOSTS, UPSTREAM_BURST_SECS, UPSTREAM_RECENT_SECS,
+    UPSTREAM_SUPPRESS_SECS,
 };
 
 /// Errors from parsing configuration and host patterns.

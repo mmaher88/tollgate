@@ -138,6 +138,7 @@ pub struct Stats {
     pub connections_passthrough: u64,
     pub tls_client_rejections: u64,
     pub tls_abandoned_after_handshake: u64,
+    pub tls_silent_refusals: u64,
 }
 
 impl From<StatsSnapshot> for Stats {
@@ -155,6 +156,7 @@ impl From<StatsSnapshot> for Stats {
             connections_passthrough: s.connections_passthrough,
             tls_client_rejections: s.tls_client_rejections,
             tls_abandoned_after_handshake: s.tls_abandoned_after_handshake,
+            tls_silent_refusals: s.tls_silent_refusals,
         }
     }
 }
@@ -326,8 +328,8 @@ impl Engine {
         catch_panic(|| Ok(learned_pins(&self.proxy.policy))).unwrap_or_default()
     }
 
-    /// Forgets the learned pins (and pending rejections) for these hosts, then saves
-    /// `learned-pins.json` at once. Returns how many pins were removed.
+    /// Forgets the learned pins (and pending rejections and silent refusals) for these
+    /// hosts, then saves `learned-pins.json` at once. Returns how many pins were removed.
     pub fn forget_pins(&self, hosts: Vec<String>) -> u32 {
         catch_panic(|| {
             let removed = self.proxy.policy.forget_pins(&hosts);
@@ -342,7 +344,9 @@ impl Engine {
     /// connect again. Call it when the device wakes and when the network path changes:
     /// connections from before usually still look open while their path is gone. Also
     /// drops the certificate pins learned from upstream TLS failures in the last few
-    /// minutes, which a captive portal or a filtering network may have caused.
+    /// minutes, which a captive portal or a filtering network may have caused, and those
+    /// learned from clients hanging up silently in the last minute, which the change
+    /// itself may have caused (see `Policy::on_network_change`).
     pub fn reset_connections(&self) {
         let _ = catch_panic(|| {
             self.proxy.policy.on_network_change(clock::unix_secs());
