@@ -1334,7 +1334,9 @@ mod tests {
 
     #[test]
     fn certificates_the_client_would_reject_too_are_not_learned() {
-        use rustls::CertificateError;
+        use rustls::pki_types::UnixTime;
+        use rustls::{CertificateError, ExtendedKeyPurpose};
+        let at = |secs| UnixTime::since_unix_epoch(std::time::Duration::from_secs(secs));
         for error in [
             CertificateError::NotValidForName,
             CertificateError::Expired,
@@ -1342,6 +1344,25 @@ mod tests {
             CertificateError::Revoked,
             CertificateError::UnknownRevocationStatus,
             CertificateError::InvalidPurpose,
+            // The variants with context, which rustls reports.
+            CertificateError::NotValidForNameContext {
+                expected: ServerName::try_from("api.tollgate.test")
+                    .unwrap()
+                    .to_owned(),
+                presented: vec![r#"DnsName("*.cdn.tollgate.test")"#.to_string()],
+            },
+            CertificateError::ExpiredContext {
+                time: at(1_790_000_000),
+                not_after: at(1_789_000_000),
+            },
+            CertificateError::NotValidYetContext {
+                time: at(1_790_000_000),
+                not_before: at(1_791_000_000),
+            },
+            CertificateError::InvalidPurposeContext {
+                required: ExtendedKeyPurpose::ServerAuth,
+                presented: vec![ExtendedKeyPurpose::ClientAuth],
+            },
         ] {
             let failure = tls_failure(rustls::Error::InvalidCertificate(error.clone()));
             assert!(

@@ -964,8 +964,9 @@ sections, this section wins.
 
 Learns pins from apps that refuse our certificate for a host other clients trust, fails
 browser requests to servers with bad certificates, blocks more hosts by DNS without
-blocking those of banks, and answers apps' requests to blocked hosts. Where this section
-disagrees with earlier sections, this section wins.
+blocking those of banks, answers apps' requests to blocked hosts and names servers with
+bad certificates in the log. Where this section disagrees with earlier sections, this
+section wins.
 
 - **Pins from a flood of silent refusals.** A device log showed Messenger cancel 286
   connections to one host in its certificate check, in 39 different seconds within a
@@ -1083,4 +1084,17 @@ disagrees with earlier sections, this section wins.
   `CONNECT`, and the attempt is ready for Connectivity Assist once TLS completes, as
   before. A blocked host that is passed through still gets a `CONNECT` answered `403`,
   which an app sees as a network error.
-- On-device checks: `docs/experiments/alpha2.md` (E31 to E37).
+- **Certificates a browser would refuse are logged.** Three device logs showed SwiftKey
+  get the 85-byte text `502` ("is for another name") 21 times from one of its hosts,
+  whose server presents a certificate for another name (with Tollgate off iOS refuses it
+  too: `Trust evaluate failure: [leaf SSLHostname]`, then `-1200`), and no line named the
+  host: `State::log_upstream_failure` logged only unreachable hosts at info level, and
+  the tunnel passes nothing below info to the device's log. A failure with a
+  `certificate_problem` is now logged at info too, as `upstream <host>: certificate
+  rejected (<error>)`, with the throttle of unreachable hosts (one line per host a minute,
+  `upstream_log`, was `unreachable_log`); the `unreachable` line keeps its wording. Such a
+  failure is never learned, so the line never repeats `learn_from_failure`'s. The host is
+  not passed through: iOS refuses its certificate either way, and learning a certificate
+  for another name would undo the rule that keeps captive portals and wrong device clocks
+  from making pins.
+- On-device checks: `docs/experiments/alpha2.md` (E31 to E38).

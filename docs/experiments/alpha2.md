@@ -36,8 +36,9 @@ hosts of banks and sensitive services alone, two hosts Tollgate blocks on its ow
 requests that fail when a server's certificate is bad, and pins learned from an app that
 keeps refusing Tollgate's certificate for a host that other apps trust it for. Run E31
 right after installing the build, for the same reason as E23. E36 checks the apps behind
-the hosts added to the built-in passthrough list, and E37 that apps get an answer from a
-blocked host instead of a failure they retry.
+the hosts added to the built-in passthrough list, E37 that apps get an answer from a
+blocked host instead of a failure they retry, and E38 the log line that names a server
+whose certificate a browser would refuse.
 
 ## Logs
 
@@ -495,8 +496,9 @@ intercepts HTTPS), used to get a short text `502` from Tollgate, which a page se
 loaded. Now a browser's request that is not a top-level page gets no response, so the
 page sees a network error, as without Tollgate, where the browser refuses the
 certificate itself. A top-level page still gets the text, and requests from apps, which
-do not say what they are for, still get the `502`. Tollgate logs these failures at debug
-level only, so the checks are what the browsers show.
+do not say what they are for, still get the `502`. Tollgate logs the failures of a
+certificate a browser would refuse at info level (see E38) and the others at debug level
+only, so the checks are what the browsers show.
 
 1. HTTPS filtering on, Connectivity Assist off. In Safari, open the ad-block test page
    used in E18, then do the same in Chrome. Pass: the score is at least E25's. For each
@@ -637,5 +639,28 @@ page included.
 4. In Safari, repeat E18 step 4. Pass: Safari's own error page, as before, not
    Tollgate's "Tollgate blocked this page." Open the ad-block test page of E18. Pass: the
    score is at least E25's.
+
+Result:
+
+## E38: the host of a certificate a browser would refuse
+
+When a server's certificate is one a browser would refuse (for another name, expired,
+not yet valid, revoked), Tollgate answers an app's request with a short text `502` (E34).
+In three device logs SwiftKey got 21 such `502`s from one of its hosts, whose server
+presents a certificate for another name (iOS refuses it too with Tollgate off), and
+nothing named the host: Tollgate logged the failure at debug level only, and
+Network.framework names hosts only by hash. Now the tunnel logs `upstream <host>:
+certificate rejected (<the error>)` at info level, at most once a minute for each host,
+as it logs `upstream <host>: unreachable (...)`.
+
+1. HTTPS filtering on. Start the log command above. Open SwiftKey, then bring up the
+   SwiftKey keyboard in any app a few times within a minute. Pass: typing works as
+   before, and within a few seconds Tollgate logs one `upstream <host>: certificate
+   rejected (connecting: invalid peer certificate: certificate not valid for name
+   "<host>"; ...)` line for a SwiftKey host, and no second one for the same host within
+   the minute. If no such line appears, the server may have been fixed: note it and go on.
+2. Open the host of E34 step 2 in Safari. Pass: the text page of E34, and one
+   `upstream <that host>: certificate rejected (...)` line. Reload it three times within
+   a minute. Pass: no second line. Reload it again after a minute. Pass: a second line.
 
 Result:

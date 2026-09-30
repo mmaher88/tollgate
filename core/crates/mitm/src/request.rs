@@ -462,6 +462,22 @@ mod tests {
             assert!(body.starts_with("Tollgate: "), "{error:?}: {body}");
             assert!(body.contains(says), "{error:?}: {body}");
         }
+
+        // What rustls reports for a server whose certificate is for another name, with the
+        // 85 bytes of every 502 an app got from such a server in three device logs.
+        let error = CertificateError::NotValidForNameContext {
+            expected: rustls::pki_types::ServerName::try_from("api.tollgate.test")
+                .unwrap()
+                .to_owned(),
+            presented: vec![r#"DnsName("*.cdn.tollgate.test")"#.to_string()],
+        };
+        let body = text(bad_gateway(&certificate(error))).await;
+        assert_eq!(
+            body,
+            "Tollgate: the server's certificate is for another name, so this site was not \
+             loaded.\n"
+        );
+        assert_eq!(body.len(), 85);
     }
 
     /// Reads fail with `error`, or end the connection when it is `None`; writes succeed.
