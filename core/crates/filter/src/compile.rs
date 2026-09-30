@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::domain_set::hash_count;
-use crate::{DomainRules, FilterEngine, FilterError, ListFormat, ListSource, network_rule_count};
+use crate::{
+    DnsList, DomainRules, FilterEngine, FilterError, ListFormat, ListSource, network_rule_count,
+};
 
 pub const ENGINE_FILE: &str = "engine.dat";
 pub const DOMAINS_FILE: &str = "domains.bin";
@@ -19,6 +21,9 @@ pub struct CompileReport {
     pub domain_entries: u64,
     /// Wildcard patterns in the DNS blocklist: blocks and exceptions.
     pub domain_patterns: u64,
+    /// Block rules left out of the DNS blocklist because they cover a host their list
+    /// exempts (see [`DnsList::exempt`]).
+    pub domain_exempted: u64,
     pub engine_bytes: u64,
     pub domains_bytes: u64,
 }
@@ -42,14 +47,27 @@ pub fn compile(lists: &[ListSource], dir: &Path) -> Result<CompileReport, Filter
 }
 
 /// Builds ENGINE_FILE from `engine_lists` and DOMAINS_FILE from `dns_lists` and writes
-/// both into `dir`, which is created if missing.
+/// both into `dir`, which is created if missing, like [`compile_split_exempting`] with no
+/// exempt hosts.
+pub fn compile_split(
+    engine_lists: &[ListSource],
+    dns_lists: &[ListSource],
+    dir: &Path,
+) -> Result<CompileReport, FilterError> {
+    let dns_lists: Vec<DnsList> = dns_lists.iter().copied().map(DnsList::from).collect();
+    compile_split_exempting(engine_lists, &dns_lists, dir)
+}
+
+/// Builds ENGINE_FILE from `engine_lists` and DOMAINS_FILE from `dns_lists`, leaving out
+/// the blocks of each DNS list that cover a host it exempts, and writes both into `dir`,
+/// which is created if missing.
 ///
 /// The engine is built without debug information. Each file is written to a temporary
 /// file in `dir`, flushed to disk and renamed over the old one, so a reader sees the old
 /// file or the new one, never a partial file.
-pub fn compile_split(
+pub fn compile_split_exempting(
     engine_lists: &[ListSource],
-    dns_lists: &[ListSource],
+    dns_lists: &[DnsList],
     dir: &Path,
 ) -> Result<CompileReport, FilterError> {
     fs::create_dir_all(dir).map_err(|source| FilterError::Io {
@@ -58,7 +76,7 @@ pub fn compile_split(
     })?;
     let network_rules = network_rule_count(engine_lists);
     let engine = FilterEngine::from_lists(engine_lists, false).serialize();
-    let rules = DomainRules::parse(dns_lists);
+    let rules = DomainRules::parse_exempting(dns_lists);
     let domains = rules.encode();
     write_atomically(&dir.join(ENGINE_FILE), &engine)?;
     write_atomically(&dir.join(DOMAINS_FILE), &domains)?;
@@ -75,6 +93,7 @@ pub fn compile_split(
         network_rules,
         domain_entries: hash_count(&domains),
         domain_patterns,
+        domain_exempted: rules.exempted,
         engine_bytes: engine.len() as u64,
         domains_bytes: domains.len() as u64,
     };
