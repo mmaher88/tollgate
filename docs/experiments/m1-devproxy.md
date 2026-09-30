@@ -40,11 +40,18 @@ Result: pass. doubleclick.net A 0.0.0.0, AAAA ::, stats.g.doubleclick.net 0.0.0.
    `200 HTTP/2`.
 3. Blocking, in two parts.
    a. A host on the DNS blocklist (doubleclick.net is on both default DNS lists): the proxy
-      refuses its `CONNECT` itself, so curl gets no HTTP response and exits with code 7.
+      answers its `CONNECT` with `200` without dialing anything, completes TLS with a
+      Tollgate leaf for the host, then resets the request's HTTP/2 stream without a
+      response, so curl gets no HTTP status.
       `curl -sS -x http://127.0.0.1:8080 --cacert /tmp/tollgate-dev/ca.pem -o /dev/null -w '%{http_connect}\n' https://securepubads.g.doubleclick.net/tag/js/gpt.js`.
-      Pass: curl prints `curl: (7) CONNECT tunnel failed, response 403` and then `403`.
-      With `RUST_LOG=debug` the devproxy log shows
-      `blocked host securepubads.g.doubleclick.net by the DNS blocklist`.
+      Pass: curl exits with code 92 and prints an HTTP/2 stream reset, for example
+      `curl: (92) HTTP/2 stream 1 reset by server (error 0x2 INTERNAL_ERROR)` (the wording
+      varies with the curl version), and then `200`. With `RUST_LOG=debug` the devproxy log
+      shows `blocked host securepubads.g.doubleclick.net by the DNS blocklist`. With
+      `--http1.1` added, the connection is closed without a response instead (curl exits
+      with code 56, an unexpected end of file). A blocked host that is passed through (the
+      bundled list, the user's passthrough list, a learned pin) still gets
+      `curl: (7) CONNECT tunnel failed, response 403`.
    b. A URL rule on a host that is not on the DNS blocklist: the `CONNECT` is intercepted
       and the request inside the tunnel gets `403`. This needs a second devproxy with a
       one-rule list, in another terminal:
@@ -58,7 +65,7 @@ Result: pass. doubleclick.net A 0.0.0.0, AAAA ::, stats.g.doubleclick.net 0.0.0.
    16,000 on the workstation after three intercepted HTTPS pages; the phone's budget for the
    engine and the blocklist alone is about 10 MiB.
 
-Result: pass. http://example.com 200; https://example.com intercepted (issuer CN=Tollgate Root CA; O=Tollgate) 200 over HTTP/2; gpt.js and adsbygoogle.js 403 (this run predates the DNS blocklist check on `CONNECT` in 7b569f0, when DNS-listed hosts were still intercepted and answered `403` inside the tunnel; step 3.3 now expects the `CONNECT` refusal); www.apple.com passed through with Apple's own certificate. Memory, measured as RssAnon because RSS includes the 26 MB unstripped binary: 5.6 MB after loading the compiled lists, 7.0 MB after intercepting eight real sites over HTTP/2 (including a 6.4 MB page); peak VmHWM 17 MB. A run that also downloads and compiles the lists peaks higher (compile happens in the app on iOS, not in the tunnel).
+Result: pass. http://example.com 200; https://example.com intercepted (issuer CN=Tollgate Root CA; O=Tollgate) 200 over HTTP/2; gpt.js and adsbygoogle.js 403 (this run predates the DNS blocklist check on `CONNECT` in 7b569f0, when DNS-listed hosts were still intercepted and answered `403` inside the tunnel; step 3.3a was later changed to expect the `CONNECT` refusal, and now, since blocked hosts get `200` and a connection whose requests fail, expects the reset stream); www.apple.com passed through with Apple's own certificate. Memory, measured as RssAnon because RSS includes the 26 MB unstripped binary: 5.6 MB after loading the compiled lists, 7.0 MB after intercepting eight real sites over HTTP/2 (including a 6.4 MB page); peak VmHWM 17 MB. A run that also downloads and compiles the lists peaks higher (compile happens in the app on iOS, not in the tunnel).
 
 ## 4. Pin learning
 
@@ -86,11 +93,12 @@ Result: pass. Runs 1 and 2: Verify return code 20; the log shows "learned certif
    the issuer `Tollgate Root CA`.
 3. Open a news site with ads, for example `https://www.theguardian.com/international`. Pass:
    the page loads and works. In the network panel (F12), requests to ad and tracker hosts
-   on the DNS blocklist fail at `CONNECT`: Firefox shows them as failed or blocked, with no
-   HTTP status. Only requests that a URL rule blocks on an otherwise allowed host come back
-   as `403` responses. Restart devproxy with `RUST_LOG=debug` to see the reasons:
-   `blocked host ... by the DNS blocklist` for refused `CONNECT`s and `blocked <type> <url>`
-   for URL rules.
+   on the DNS blocklist fail with no HTTP status (the `CONNECT` and the TLS handshake
+   succeed, then the stream is reset, or the connection closed over HTTP/1.1): Firefox
+   shows them as failed or blocked. Only requests that a URL rule blocks on an otherwise
+   allowed host come back as `403` responses. Restart devproxy with `RUST_LOG=debug` to see
+   the reasons: `blocked host ... by the DNS blocklist` for hosts the DNS blocklist blocks
+   and `blocked <type> <url>` for URL rules.
 4. Open `https://www.icloud.com`. Pass: it loads with an Apple certificate (passthrough).
 5. Log in to one site you use and click through a few pages. Pass: nothing breaks; if
    something does, note the URL and the blocked requests from the debug log.
