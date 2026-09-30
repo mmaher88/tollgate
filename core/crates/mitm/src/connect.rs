@@ -12,7 +12,10 @@
 //! the host get `403`. A blocked server name refused in any of these cases is closed.
 //!
 //! The host is classified from the `CONNECT` target first; a passthrough host is tunneled
-//! without reading anything. Otherwise the first bytes are read and kept for replay.
+//! without reading anything. It gets `200` at once and is dialed while the client starts
+//! its TLS handshake, so the DNS lookup and the TCP connection do not delay the answer; a
+//! host that cannot be reached gets its client connection closed, so the client sees its
+//! handshake fail. Otherwise the first bytes are read and kept for replay.
 //! Non-TLS traffic, and a client that waits for the server to speak first, is tunneled
 //! with those bytes replayed. For TLS the SNI is classified as well; passthrough, TLS
 //! without an HTTP protocol, low memory and a full interception table also tunnel, with
@@ -96,25 +99,11 @@ pub(crate) async fn connect(state: &Arc<State>, request: Request<Incoming>) -> R
             log::debug!("CONNECT {host}:{port}: too many passthrough tunnels");
             return status(StatusCode::SERVICE_UNAVAILABLE);
         };
-        // Dial before answering, so an unreachable host gets 502 instead of a dead tunnel.
-        let upstream = match dial(state, &host, port).await {
-            Ok(upstream) => upstream,
-            Err(e) => {
-                log::debug!("CONNECT {host}:{port}: {e}");
-                return status(StatusCode::BAD_GATEWAY);
-            }
-        };
-        Stats::inc(&state.ctx.stats.connections_passthrough);
-        log::debug!("passthrough {host}:{port} ({reason:?})");
         let task_state = state.clone();
         state.shutdown.spawn(async move {
             let _slot = slot;
-            match hyper::upgrade::on(request).await {
-                Ok(client) => {
-                    tunnel(&task_state, TokioIo::new(client), upstream, &host, port).await;
-                }
-                Err(e) => log::debug!("CONNECT upgrade: {e}"),
-            }
+            let why = format!("{reason:?}");
+            passthrough_at_once(&task_state, request, &host, port, &why).await;
         });
         return status(StatusCode::OK);
     }
@@ -367,6 +356,41 @@ async fn intercept_slot(state: &State) -> Option<OwnedSemaphorePermit> {
 /// A passthrough tunnel slot, if one is free.
 fn passthrough_slot(state: &State) -> Option<OwnedSemaphorePermit> {
     state.passthrough_slots.clone().try_acquire_owned().ok()
+}
+
+/// Tunnels the passthrough host `host` of a `CONNECT` answered `200` without waiting for
+/// the dial: dials while hyper hands over the client connection, then tunnels. The dial
+/// (a DNS lookup, over DNS over HTTPS in the tunnel, and a TCP connection) no longer delays
+/// the answer, and the client sends its ClientHello meanwhile, which waits in the socket
+/// until the tunnel starts. When the dial fails the client connection is closed: the
+/// client sees its TLS handshake fail, as it would for a host that cannot be reached
+/// without the proxy, and as a connection passed through after its first bytes were read
+/// does ([`passthrough`]). The caller holds the passthrough slot until this returns.
+async fn passthrough_at_once(
+    state: &State,
+    request: Request<Incoming>,
+    host: &str,
+    port: u16,
+    why: &str,
+) {
+    /// Why the tunnel could not start.
+    enum Failed {
+        Dial(UpstreamError),
+        Upgrade(hyper::Error),
+    }
+    // try_join stops at the first failure: a failed dial drops the pending upgrade, and
+    // hyper then closes the client connection once it has written the `200`.
+    let dial = async { dial(state, host, port).await.map_err(Failed::Dial) };
+    let upgrade = async { hyper::upgrade::on(request).await.map_err(Failed::Upgrade) };
+    match tokio::try_join!(dial, upgrade) {
+        Ok((upstream, client)) => {
+            Stats::inc(&state.ctx.stats.connections_passthrough);
+            log::debug!("passthrough {host}:{port} ({why})");
+            tunnel(state, TokioIo::new(client), upstream, host, port).await;
+        }
+        Err(Failed::Dial(e)) => log::debug!("passthrough {host}:{port} ({why}): {e}, closing"),
+        Err(Failed::Upgrade(e)) => log::debug!("CONNECT upgrade: {e}"),
+    }
 }
 
 /// Tunnels `client`, whose replay buffer (if any) goes upstream first. Over the cap the
