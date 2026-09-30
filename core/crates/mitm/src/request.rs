@@ -37,12 +37,12 @@ pub(crate) enum NoResponse {
     /// connection, whose `CONNECT` is now passed through.
     #[error("no response: the host is passed through from now on")]
     PassedThrough(#[source] h2::Error),
-    /// Every request on a blocked host's connection (see `crate::sink`), and a blocked
-    /// request from a browser that is not a top-level navigation (see [`answer_blocked`]).
-    /// It does not close the connection by itself: the HTTP/2 stream is reset with the
-    /// reason carried here and the connection stays open for the client's next request,
-    /// while HTTP/1.1 closes the connection, as after any error. Built by
-    /// [`NoResponse::blocked`], whose reason is chosen there.
+    /// A browser's request on a blocked host's connection (see
+    /// [`answer_on_blocked_connection`]), and a blocked request from a browser that is not
+    /// a top-level navigation (see [`answer_blocked`]). It does not close the connection by
+    /// itself: the HTTP/2 stream is reset with the reason carried here and the connection
+    /// stays open for the client's next request, while HTTP/1.1 closes the connection, as
+    /// after any error. Built by [`NoResponse::blocked`], whose reason is chosen there.
     #[error("no response: blocked")]
     Blocked(#[source] h2::Error),
     /// A request on a blocked host's connection after the DNS blocklist was reloaded, which
@@ -61,10 +61,11 @@ impl NoResponse {
         NoResponse::PassedThrough(reason.into())
     }
 
-    /// For a request to a blocked host, and for a blocked request from a browser (see
-    /// [`answer_blocked`]). The HTTP/2 stream is reset with INTERNAL_ERROR, which says
-    /// only that the request failed, as [`NoResponse::Closed`] says for an unreachable
-    /// upstream, so a blocked request fails like any other network error.
+    /// For a browser's request to a blocked host (see [`answer_on_blocked_connection`]),
+    /// and for a blocked request from a browser (see [`answer_blocked`]). The HTTP/2 stream
+    /// is reset with INTERNAL_ERROR, which says only that the request failed, as
+    /// [`NoResponse::Closed`] says for an unreachable upstream, so a blocked request fails
+    /// like any other network error.
     /// The other reasons say more than that: REFUSED_STREAM tells the client that the
     /// request was never processed and may be retried, on a new connection if need be (RFC
     /// 9113, section 8.7), and HTTP_1_1_REQUIRED asks for a retry over HTTP/1.1 on a new
@@ -162,6 +163,24 @@ pub(crate) fn answer_blocked(headers: &HeaderMap) -> Result<Response<Body>, NoRe
         Destination::App => Ok(blocked()),
         Destination::Document => Ok(blocked_page()),
         Destination::Subresource => Err(NoResponse::blocked()),
+    }
+}
+
+/// The answer to a request on a blocked host's connection (see `crate::sink`), chosen from
+/// its `Sec-Fetch-Dest` header as in [`answer_blocked`], except for a navigation:
+///
+/// - No header, an app, gets [`blocked`]'s empty `403`, for the reason given there: on a
+///   device, an app's telemetry SDKs sent the batches that failed here again and again,
+///   239 requests in 5 minutes.
+/// - Any value, `document` included, gets no response ([`NoResponse::blocked`]), so a
+///   navigation to the host shows the browser's own error page, as when the host is
+///   blocked by DNS alone (HTTPS filtering off).
+pub(crate) fn answer_on_blocked_connection(
+    headers: &HeaderMap,
+) -> Result<Response<Body>, NoResponse> {
+    match Destination::of(headers) {
+        Destination::App => Ok(blocked()),
+        Destination::Document | Destination::Subresource => Err(NoResponse::blocked()),
     }
 }
 
@@ -400,6 +419,26 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], "*");
         assert_eq!(text(response).await, "");
+    }
+
+    #[tokio::test]
+    async fn on_a_blocked_connection_only_an_apps_request_gets_a_response() {
+        let response = answer_on_blocked_connection(&fetch_dest(None)).unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(text(response).await, "");
+
+        // A navigation included: the browser shows its own error page.
+        for dest in [
+            "document", "Document", "empty", "script", "image", "iframe", "",
+        ] {
+            let answer = answer_on_blocked_connection(&fetch_dest(Some(dest)));
+            let Err(no_response) = answer else {
+                panic!("{dest:?}: {answer:?}");
+            };
+            assert!(matches!(no_response, NoResponse::Blocked(_)), "{dest:?}");
+            assert!(!no_response.closes_connection(), "{dest:?}");
+        }
     }
 
     #[tokio::test]

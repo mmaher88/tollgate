@@ -11,9 +11,10 @@ that uses the carrier's DNS and no proxy. An attempt through the proxy is ready 
 `CONNECT` answer and the TLS handshake (including the browser's certificate check) are
 done. Tollgate used to answer a `CONNECT` to a blocked host with `403`; iOS then started
 the cellular attempt at once and the blocked host loaded over cellular. Now it answers
-`200`, completes TLS with its own certificate for that host and fails every request on the
-connection without a response, so the attempt through the proxy is ready and wins, and
-the page sees a network error for each blocked request, as before. At most 64 blocked
+`200`, completes TLS with its own certificate for that host and answers every request on
+the connection itself, so the attempt through the proxy is ready and wins. A browser's
+request fails without a response, so the page sees a network error for each blocked
+request, as before; an app's request gets an empty `403` (E37). At most 64 blocked
 connections are open at once; when all are taken, the one idle longest is closed to make
 room. Blocked hosts that are passed through (Never filtered, the built-in list, Learned
 certificate pins) still get `403`, and so do blocked hosts while the tunnel is low on
@@ -35,7 +36,8 @@ hosts of banks and sensitive services alone, two hosts Tollgate blocks on its ow
 requests that fail when a server's certificate is bad, and pins learned from an app that
 keeps refusing Tollgate's certificate for a host that other apps trust it for. Run E31
 right after installing the build, for the same reason as E23. E36 checks the apps behind
-the hosts added to the built-in passthrough list.
+the hosts added to the built-in passthrough list, and E37 that apps get an answer from a
+blocked host instead of a failure they retry.
 
 ## Logs
 
@@ -593,5 +595,47 @@ under them. Tollgate logs no line for a built-in passthrough.
 3. Settings, Learned certificate pins. Pass: none of the hosts of step 2 is added, and
    `meta-ohttp-relay-prod.fastly-edge.com` is not added again once forgotten and the
    Facebook app is used.
+4. Repeat step 2 for 5 minutes with the log command above running. A host that a DNS
+   list blocks under one of the new patterns (WhatsApp's statistics host is one: the
+   AdGuard DNS filter and OISD small block it) is passed through, so its `CONNECT` gets
+   `403`, which the app sees as a network error, not the `403` inside a blocked
+   connection of E37. Pass: Activity, Domains lists such hosts as domain blocks, and no
+   app of step 2 logs more than a few `http connect Proxy received status: HTTP/1.1 403
+   Forbidden` lines a minute. Note any app that does, with its process and count: it
+   retries a blocked host as Claude did before E37's change.
+
+Result:
+
+## E37: apps' requests to blocked hosts
+
+With HTTPS filtering on, a host the DNS lists block gets a working connection from
+Tollgate (E18), and every request on it used to fail without a response. Some apps send
+such a request again and again: in a device log, Claude's telemetry sent 239 requests to
+two blocked hosts in 5 minutes, each reset by Tollgate within milliseconds, until the app
+went to the background. Now a request without a `Sec-Fetch-Dest` header, which is how
+apps send them, gets an empty `403`, as a request the filter lists block does (E25). A
+browser's request carries the header and still fails without a response, a top-level
+page included.
+
+1. HTTPS filtering on, Connectivity Assist off. In a second terminal, stream the app's
+   network lines:
+
+       tooling/scripts/device.sh syslog live --label -pn Claude -e 'received response, status 403' -e 'RST_STREAM with error code' -e 'error code: -1005' -e 'consecutive failures' -e 'reject limit'
+
+2. Open Claude, send a message and wait for the whole reply, attach a PDF to a message,
+   and keep using it for 5 minutes, then send it to the background. Pass: everything
+   works as before (the reply streams in, the upload finishes); the log shows
+   `received response, status 403` lines, few or no `received H2 RST_STREAM with error
+   code: 2` and `error code: -1005` lines, and no `consecutive failures` line. Count the
+   `403` lines: at most a few a minute (the previous build's log had 239 failures in the
+   same time). Note each `Drop a batch due to reject limit reached` line.
+3. Repeat steps 1 and 2 with the Google app (`-pn Google`), X (`-pn Twitter`) and the
+   SwiftKey keyboard (`-pn SwiftKey`), whose requests to blocked hosts were reset in the
+   same log. Pass: each works as before and shows no error it did not show with the
+   previous build (an app that took the `403` for a sign-in problem would ask to sign in
+   again, for example); note any that does, with the time.
+4. In Safari, repeat E18 step 4. Pass: Safari's own error page, as before, not
+   Tollgate's "Tollgate blocked this page." Open the ad-block test page of E18. Pass: the
+   score is at least E25's.
 
 Result:

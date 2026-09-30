@@ -65,14 +65,14 @@ pub mod limits {
     pub const MAX_PASSTHROUGH: usize = 128;
     /// Default for `ServeOptions::max_blocked`. A blocked connection holds one socket and
     /// the TLS and HTTP state of an intercepted client connection, but no upstream and no
-    /// response body, since a request is failed as soon as its headers arrive. Idle, that
-    /// is a few tens of KiB of TLS and HTTP buffers, so 64 use a few MiB and stay well
-    /// inside the file descriptor limit the tunnel sets (2048); headers being read take
-    /// more for a moment, within the limits of an intercepted connection. An ad-block test
-    /// page reaches about a hundred blocked hosts at once, more than the cap, so when every
-    /// slot is taken the blocked connection idle longest is closed to make room, which
-    /// costs its client nothing; a blocked host gets `403` only when none becomes idle in
-    /// time (see `crate::connect`).
+    /// response body, since a request is answered with an empty `403` or failed as soon as
+    /// its headers arrive. Idle, that is a few tens of KiB of TLS and HTTP buffers, so 64
+    /// use a few MiB and stay well inside the file descriptor limit the tunnel sets (2048);
+    /// headers being read take more for a moment, within the limits of an intercepted
+    /// connection. An ad-block test page reaches about a hundred blocked hosts at once,
+    /// more than the cap, so when every slot is taken the blocked connection idle longest
+    /// is closed to make room, which costs its client nothing; a blocked host gets `403`
+    /// only when none becomes idle in time (see `crate::connect`).
     pub const MAX_BLOCKED: usize = 64;
     /// Default for `ServeOptions::max_h1_per_host`.
     pub const MAX_H1_PER_HOST: usize = 6;

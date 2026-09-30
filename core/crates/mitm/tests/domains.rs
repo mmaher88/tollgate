@@ -1,10 +1,11 @@
 //! The DNS blocklist applies to proxied connections too: with the proxy settings on,
 //! clients send `CONNECT host` and never look the name up through the tunnel's DNS.
 //!
-//! A blocked host's `CONNECT` gets `200` and a connection that completes TLS and then fails
-//! every request, because iOS retries a refused connection over another network without
-//! the proxy. Blocked hosts the policy passes through get `403`, and so does any blocked
-//! host when memory is low, or when every blocked-connection slot is taken and no blocked
+//! A blocked host's `CONNECT` gets `200` and a connection that completes TLS and then
+//! answers every request as blocked, an app's with an empty `403` and a browser's with no
+//! response, because iOS retries a refused connection over another network without the
+//! proxy. Blocked hosts the policy passes through get `403`, and so does any blocked host
+//! when memory is low, or when every blocked-connection slot is taken and no blocked
 //! connection becomes idle in time to be closed.
 
 mod support;
@@ -13,7 +14,11 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hyper::StatusCode;
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::client::conn::http2::{self as hyper_http2, SendRequest};
+use hyper::{Request, StatusCode};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -24,7 +29,9 @@ use tollgate_filter::{DomainSet, ListFormat, ListSource};
 use tollgate_mitm::{CertAuthority, ProxyContext, ServeOptions};
 use tollgate_policy::{Config, Decision, RejectionKind};
 
-use support::client::{get, proxy_get, proxy_try_get, read_to_close, wait_for};
+use support::client::{
+    get, http1, proxy_get, proxy_try_get, read_reply, read_to_close, send1, wait_for,
+};
 use support::tunnel::{
     alpn, connect, connect_status, http2, peer_issuer, reset_reason, send2, tls, tls_config,
 };
@@ -153,8 +160,23 @@ fn assert_not_intercepted(s: &Setup) {
     assert_eq!(s.origin.connections(), 0);
 }
 
+/// An HTTP/2 client over `io` whose requests carry a body.
+async fn http2_with_bodies(io: TlsStream<TcpStream>) -> SendRequest<Full<Bytes>> {
+    let (sender, conn) = hyper_http2::handshake(TokioExecutor::new(), TokioIo::new(io))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    sender
+}
+
+/// An app's requests on a blocked host's connection get the empty `403` of a request the
+/// filter engine blocks, so an SDK that retries network errors stops: POSTs with a body,
+/// as a telemetry SDK sends its batches, more of them than the 11 failures in a row after
+/// which CFNetwork drops an HTTP/2 connection, all on one connection that stays open.
 #[tokio::test]
-async fn a_dns_blocked_host_gets_a_connection_whose_http2_requests_are_reset() {
+async fn an_apps_http2_requests_to_a_dns_blocked_host_get_an_empty_403() {
     let s = setup(Config::default()).await;
     let (status, tcp) = connect_status(s.proxy.addr, &s.target("Tracker.Ads.Example.")).await;
     assert_eq!(status, 200);
@@ -163,17 +185,19 @@ async fn a_dns_blocked_host_gets_a_connection_whose_http2_requests_are_reset() {
     assert_eq!(peer_issuer(&tls), TOLLGATE);
     assert_eq!(alpn(&tls).as_deref(), Some(&b"h2"[..]));
 
-    let mut h2 = http2(tls).await;
-    for path in ["/pixel.gif", "/track.js"] {
-        let url = s.url("tracker.ads.example", path);
-        let error = h2.send_request(get(&url, &[])).await.unwrap_err();
-        assert_eq!(
-            reset_reason(&error),
-            Some(h2::Reason::INTERNAL_ERROR),
-            "{error}"
-        );
-        // Only the stream is reset: the connection stays open for the next request.
-        assert!(!h2.is_closed(), "{path}");
+    let mut h2 = http2_with_bodies(tls).await;
+    let url = s.url("tracker.ads.example", "/v1/batch");
+    for n in 0..12 {
+        let size = if n % 2 == 0 { 2938 } else { 372 };
+        let request = Request::post(&url)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(vec![b' '; size])))
+            .unwrap();
+        let reply = read_reply(h2.send_request(request).await.unwrap()).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{n}");
+        assert_eq!(reply.headers["access-control-allow-origin"], "*", "{n}");
+        assert_eq!(reply.body, "", "{n}");
+        assert!(!h2.is_closed(), "{n}");
     }
 
     assert_eq!(s.proxy.stats().dns_blocked, 1);
@@ -190,16 +214,73 @@ async fn a_dns_blocked_host_gets_a_connection_whose_http2_requests_are_reset() {
     assert_not_intercepted(&s);
 }
 
+/// A browser's requests on a blocked host's connection get no response, a navigation
+/// included, as when the host is blocked by DNS alone: the stream is reset, and the
+/// connection stays open for the next request.
 #[tokio::test]
-async fn an_http1_request_to_a_blocked_host_gets_no_response_and_the_connection_closes() {
+async fn a_browsers_http2_requests_to_a_dns_blocked_host_are_reset() {
     let s = setup(Config::default()).await;
-    let mut tls = s
+    let tls = s
+        .tls(
+            &s.target("tracker.ads.example"),
+            "tracker.ads.example",
+            &[b"h2"],
+        )
+        .await;
+    let mut h2 = http2(tls).await;
+    for (path, dest) in [
+        ("/", "document"),
+        ("/pixel.gif", "image"),
+        ("/track.js", "script"),
+        ("/t", "empty"),
+    ] {
+        let url = s.url("tracker.ads.example", path);
+        let error = h2
+            .send_request(get(&url, &[("sec-fetch-dest", dest)]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            reset_reason(&error),
+            Some(h2::Reason::INTERNAL_ERROR),
+            "{dest}: {error}"
+        );
+        assert!(!h2.is_closed(), "{dest}");
+    }
+
+    assert_eq!(s.proxy.stats().dns_blocked, 1);
+    assert_eq!(dns_blocks(&s.events), ["tracker.ads.example"]);
+    assert_not_intercepted(&s);
+}
+
+#[tokio::test]
+async fn an_apps_http1_requests_to_a_blocked_host_get_403_on_a_connection_that_stays_open() {
+    let s = setup(Config::default()).await;
+    let tls = s
         .tls(&s.target("ads.example"), "ads.example", &[b"http/1.1"])
         .await;
     assert_eq!(peer_issuer(&tls), TOLLGATE);
     assert_eq!(alpn(&tls).as_deref(), Some(&b"http/1.1"[..]));
 
-    tls.write_all(b"GET /pixel.gif HTTP/1.1\r\nHost: ads.example\r\n\r\n")
+    let mut h1 = http1(tls).await;
+    let url = s.url("ads.example", "/pixel.gif");
+    for n in 0..2 {
+        let reply = send1(&mut h1, get(&url, &[])).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{n}");
+        assert_eq!(reply.body, "", "{n}");
+    }
+
+    assert_eq!(s.proxy.stats().dns_blocked, 1);
+    assert_eq!(dns_blocks(&s.events), ["ads.example"]);
+    assert_not_intercepted(&s);
+}
+
+#[tokio::test]
+async fn a_browsers_http1_request_to_a_blocked_host_closes_the_connection() {
+    let s = setup(Config::default()).await;
+    let mut tls = s
+        .tls(&s.target("ads.example"), "ads.example", &[b"http/1.1"])
+        .await;
+    tls.write_all(b"GET /pixel.gif HTTP/1.1\r\nHost: ads.example\r\nSec-Fetch-Dest: image\r\n\r\n")
         .await
         .unwrap();
     let received = read_to_close(&mut tls, Duration::from_secs(5)).await;
@@ -346,7 +427,7 @@ async fn an_idle_blocked_connection_gives_its_slot_to_a_new_blocked_host() {
         .await;
     let mut held = http2(tls_a).await;
     let url = s.url("a.ads.example", "/");
-    assert!(held.send_request(get(&url, &[])).await.is_err());
+    assert_eq!(send2(&mut held, get(&url, &[])).await.status, 403);
 
     // Idle only for a moment, which is enough: closing it costs its client nothing.
     let (status, tcp) = connect_status(s.proxy.addr, &s.target("b.ads.example")).await;
@@ -398,8 +479,7 @@ async fn a_blocked_connection_closes_once_the_lists_change() {
         .await;
     let mut h2 = http2(tls).await;
     let url = s.url("cdn.ads.example", "/");
-    let error = h2.send_request(get(&url, &[])).await.unwrap_err();
-    assert_eq!(reset_reason(&error), Some(h2::Reason::INTERNAL_ERROR));
+    assert_eq!(send2(&mut h2, get(&url, &[])).await.status, 403);
 
     // The lists are reloaded without the rule that blocked the host: the next request is
     // refused, so the client may retry it, and the connection closes.
@@ -486,11 +566,8 @@ async fn a_blocked_server_name_behind_an_address_gets_a_blocked_connection() {
     let tls = s.tls(&s.address(), "ads.example", &[b"h2"]).await;
     assert_eq!(peer_issuer(&tls), TOLLGATE);
     let mut h2 = http2(tls).await;
-    let error = h2
-        .send_request(get(&s.url("ads.example", "/"), &[]))
-        .await
-        .unwrap_err();
-    assert_eq!(reset_reason(&error), Some(h2::Reason::INTERNAL_ERROR));
+    let reply = send2(&mut h2, get(&s.url("ads.example", "/"), &[])).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
     assert!(!h2.is_closed());
     assert_eq!(s.proxy.stats().dns_blocked, 1);
     assert_eq!(dns_blocks(&s.events), ["ads.example"]);
@@ -519,7 +596,7 @@ async fn an_idle_blocked_connection_is_closed_and_gives_back_its_slot() {
     let mut h2 = http2(tls).await;
     let url = s.url("ads.example", "/");
     let before_request = Instant::now();
-    assert!(h2.send_request(get(&url, &[])).await.is_err());
+    assert_eq!(send2(&mut h2, get(&url, &[])).await.status, 403);
 
     wait_for("the idle connection to close", || h2.is_closed()).await;
     assert!(

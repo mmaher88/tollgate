@@ -48,9 +48,10 @@ pub struct ProxyContext {
     pub filter: ArcSwapOption<FilterEngine>,
     /// The DNS blocklist, the same one the tunnel's DNS responder uses. Clients using the
     /// proxy do not look names up themselves, so the proxy blocks those hosts itself: a
-    /// `CONNECT` gets a connection whose requests all fail (see `ServeOptions::max_blocked`
-    /// for when it gets `403` instead), and a request in absolute form is answered like a
-    /// request the filter engine blocks (see `crate::request::answer_blocked`).
+    /// `CONNECT` gets a connection whose requests are all answered as blocked (see
+    /// `crate::sink`, and `ServeOptions::max_blocked` for when it gets `403` instead), and
+    /// a request in absolute form is answered like a request the filter engine blocks (see
+    /// `crate::request::answer_blocked`).
     pub domains: ArcSwapOption<DomainSet>,
     pub ca: Arc<CertAuthority>,
     pub stats: Arc<Stats>,

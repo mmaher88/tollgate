@@ -44,8 +44,9 @@ pub(crate) fn text(code: StatusCode, message: String) -> Response<Body> {
 
 /// An empty `403` that any origin may read, so a page that gets it does not stall on a CORS
 /// error: the answer to a blocked request from an app, which sends no `Sec-Fetch-Dest` (see
-/// `crate::request::answer_blocked`), and to a `CONNECT` for a blocked host that gets no
-/// blocked connection (see `crate::connect`).
+/// `crate::request::answer_blocked`), to an app's request on a blocked host's connection
+/// (see `crate::sink`), and to a `CONNECT` for a blocked host that gets no blocked
+/// connection (see `crate::connect`).
 pub(crate) fn blocked() -> Response<Body> {
     let mut response = status(StatusCode::FORBIDDEN);
     response

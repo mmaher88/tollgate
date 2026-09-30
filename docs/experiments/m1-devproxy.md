@@ -41,16 +41,18 @@ Result: pass. doubleclick.net A 0.0.0.0, AAAA ::, stats.g.doubleclick.net 0.0.0.
 3. Blocking, in two parts.
    a. A host on the DNS blocklist (doubleclick.net is on both default DNS lists): the proxy
       answers its `CONNECT` with `200` without dialing anything, completes TLS with a
-      Tollgate leaf for the host, then resets the request's HTTP/2 stream without a
-      response, so curl gets no HTTP status.
-      `curl -sS -x http://127.0.0.1:8080 --cacert /tmp/tollgate-dev/ca.pem -o /dev/null -w '%{http_connect}\n' https://securepubads.g.doubleclick.net/tag/js/gpt.js`.
-      Pass: curl exits with code 92 and prints an HTTP/2 stream reset, for example
-      `curl: (92) HTTP/2 stream 1 reset by server (error 0x2 INTERNAL_ERROR)` (the wording
-      varies with the curl version), and then `200`. With `RUST_LOG=debug` the devproxy log
-      shows `blocked host securepubads.g.doubleclick.net by the DNS blocklist`. With
-      `--http1.1` added, the connection is closed without a response instead (curl exits
-      with code 56, an unexpected end of file). A blocked host that is passed through (the
-      bundled list, the user's passthrough list, a learned pin) still gets
+      Tollgate leaf for the host, then answers the request itself. curl, like an app, sends
+      no `Sec-Fetch-Dest` header, so it gets an empty `403`.
+      `curl -sS -x http://127.0.0.1:8080 --cacert /tmp/tollgate-dev/ca.pem -o /dev/null -w '%{http_connect} %{http_code}\n' https://securepubads.g.doubleclick.net/tag/js/gpt.js`.
+      Pass: `200 403`. With `RUST_LOG=debug` the devproxy log shows `blocked host
+      securepubads.g.doubleclick.net by the DNS blocklist`. With `-H 'Sec-Fetch-Dest:
+      script'` added, as a browser sends, the request's HTTP/2 stream is reset without a
+      response instead: curl exits with code 92 and prints an HTTP/2 stream reset, for
+      example `curl: (92) HTTP/2 stream 1 reset by server (error 0x2 INTERNAL_ERROR)` (the
+      wording varies with the curl version), and then `200 000`. With the header and
+      `--http1.1`, the connection is closed without a response (curl exits with code 56, an
+      unexpected end of file). A blocked host that is passed through (the bundled list, the
+      user's passthrough list, a learned pin) still gets
       `curl: (7) CONNECT tunnel failed, response 403`.
    b. A URL rule on a host that is not on the DNS blocklist: the `CONNECT` is intercepted
       and the request inside the tunnel gets `403`. This needs a second devproxy with a
@@ -65,7 +67,7 @@ Result: pass. doubleclick.net A 0.0.0.0, AAAA ::, stats.g.doubleclick.net 0.0.0.
    16,000 on the workstation after three intercepted HTTPS pages; the phone's budget for the
    engine and the blocklist alone is about 10 MiB.
 
-Result: pass. http://example.com 200; https://example.com intercepted (issuer CN=Tollgate Root CA; O=Tollgate) 200 over HTTP/2; gpt.js and adsbygoogle.js 403 (this run predates the DNS blocklist check on `CONNECT` in 7b569f0, when DNS-listed hosts were still intercepted and answered `403` inside the tunnel; step 3.3a was later changed to expect the `CONNECT` refusal, and now, since blocked hosts get `200` and a connection whose requests fail, expects the reset stream); www.apple.com passed through with Apple's own certificate. Memory, measured as RssAnon because RSS includes the 26 MB unstripped binary: 5.6 MB after loading the compiled lists, 7.0 MB after intercepting eight real sites over HTTP/2 (including a 6.4 MB page); peak VmHWM 17 MB. A run that also downloads and compiles the lists peaks higher (compile happens in the app on iOS, not in the tunnel).
+Result: pass. http://example.com 200; https://example.com intercepted (issuer CN=Tollgate Root CA; O=Tollgate) 200 over HTTP/2; gpt.js and adsbygoogle.js 403 (this run predates the DNS blocklist check on `CONNECT` in 7b569f0, when DNS-listed hosts were still intercepted and answered `403` inside the tunnel; step 3.3a was later changed to expect the `CONNECT` refusal, then, since blocked hosts get `200` and a connection whose requests fail, the reset stream, and now, since that connection answers requests without `Sec-Fetch-Dest` with `403`, expects the `403` and the reset stream only for a request with the header); www.apple.com passed through with Apple's own certificate. Memory, measured as RssAnon because RSS includes the 26 MB unstripped binary: 5.6 MB after loading the compiled lists, 7.0 MB after intercepting eight real sites over HTTP/2 (including a 6.4 MB page); peak VmHWM 17 MB. A run that also downloads and compiles the lists peaks higher (compile happens in the app on iOS, not in the tunnel).
 
 ## 4. Pin learning
 

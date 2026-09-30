@@ -963,9 +963,9 @@ sections, this section wins.
 ## Alpha 2: floods, bad certificates and more lists (2026-09-30)
 
 Learns pins from apps that refuse our certificate for a host other clients trust, fails
-browser requests to servers with bad certificates, and blocks more hosts by DNS without
-blocking those of banks. Where this section disagrees with earlier sections, this
-section wins.
+browser requests to servers with bad certificates, blocks more hosts by DNS without
+blocking those of banks, and answers apps' requests to blocked hosts. Where this section
+disagrees with earlier sections, this section wins.
 
 - **Pins from a flood of silent refusals.** A device log showed Messenger cancel 286
   connections to one host in its certificate check, in 39 different seconds within a
@@ -1066,4 +1066,21 @@ section wins.
   on all of google.com and googleapis.com, Meta's domains (the Pixel and Audience Network
   rules), and the rest of banks.txt (in the exemption it would unblock 46 tracker
   hosts). The source of every entry is in the comment at the head of its group.
-- On-device checks: `docs/experiments/alpha2.md` (E31 to E36).
+- **Apps' requests to blocked hosts get `403`.** A device log showed Claude's telemetry
+  SDKs send 239 requests in 5 minutes to two hosts the DNS lists block, each reset with
+  INTERNAL_ERROR on the blocked connection within 13 ms and failed by CFNetwork with
+  `-1005`, over 28 `CONNECT`s and handshakes: CFNetwork dropped 19 connections after 11
+  failures in a row each, and the sink closed most of the others after 10 s idle. The
+  same app sent nothing again after the `403` of two requests the filter engine blocked.
+  A blocked host's connection now answers each request by `answer_on_blocked_connection`:
+  no `Sec-Fetch-Dest` (an app) gets the empty `403` with `access-control-allow-origin: *`
+  that `answer_blocked` gives an app, and the connection stays open, HTTP/1.1 included;
+  any value, `document` included, still gets no response, so a navigation to a
+  DNS-blocked host still shows the browser's own error page, as with HTTPS filtering off
+  (the blocked page stays for filter-engine blocks and absolute-form requests). After a
+  list reload the next request is still refused with `REFUSED_STREAM` and the connection
+  closes. Nothing is dialed, the block is still counted and recorded once, at the
+  `CONNECT`, and the attempt is ready for Connectivity Assist once TLS completes, as
+  before. A blocked host that is passed through still gets a `CONNECT` answered `403`,
+  which an app sees as a network error.
+- On-device checks: `docs/experiments/alpha2.md` (E31 to E37).
