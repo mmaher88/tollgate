@@ -2,32 +2,49 @@
 
 use std::collections::HashSet;
 
+use crate::wildcard::is_valid_pattern;
 use crate::{ListFormat, ListSource};
 
 /// Host names taken from filter lists, lowercase, without a trailing dot, sorted, unique,
 /// and without names whose parent is in the same set (a lookup checks every parent, so
 /// those children can never change a result).
+///
+/// Rules whose name has a `*` become patterns instead, in which `*` matches any run of
+/// characters (dots included, and none). A pattern means what the rule means to adblock
+/// for a request to `https://host/`: `||log*.example.com^` becomes the pattern
+/// `log*.example.com` for the host and its parents, `|ads.*.example^` and
+/// `://ads.*.example^` become `ads.*.example` for the host only, an unanchored rule such
+/// as `-ulog*.example^` may start anywhere in the host (`*-ulog*.example`, host only), and
+/// a rule without a caret may end anywhere in it (`||adx-*.example.` becomes
+/// `adx-*.example.*`). Patterns are sorted and unique.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DomainRules {
-    /// `$important` blocks. They win over `allow`.
+    /// `$important` blocks. They win over every exception.
     pub important: Vec<String>,
-    /// `@@` exceptions. They win over `block` and `exact_block`.
+    /// `@@` exceptions. They win over every block but `important`.
     pub allow: Vec<String>,
     pub block: Vec<String>,
     /// `@@|name^|` and `@@|name^` exceptions: the host itself, not its subdomains. They win
-    /// over `block`, so a list can unblock one host under a blocked parent. Kept even when
-    /// a parent is in `block`.
+    /// over every block but `important`, so a list can unblock one host under a blocked
+    /// parent. Kept even when a parent is in `block`.
     pub exact_allow: Vec<String>,
     /// `|name^|` and `|name^`: the host itself, not its subdomains.
     pub exact_block: Vec<String>,
-    /// `@@||pattern^` exceptions whose name has a `*`, which matches any run of characters
-    /// (dots included). They unblock a host when the host or one of its parents matches,
-    /// but never win over `important`. Sorted and unique.
+    /// Exception patterns matched against the host and its parents (`@@||pattern^`). Like
+    /// the other exceptions they win over every block but `important`.
     pub wildcard_allow: Vec<String>,
-    /// `@@|pattern^|` and `@@|pattern^` exceptions with a `*`: the host itself must match.
+    /// Exception patterns matched against the host only (`@@|pattern^|`, and unanchored
+    /// rules).
     pub exact_wildcard_allow: Vec<String>,
+    /// Block patterns matched against the host and its parents (`||pattern^`). They are
+    /// plain blocks: every kind of exception wins over them.
+    pub wildcard_block: Vec<String>,
+    /// Block patterns matched against the host only (`|pattern^|`, `://pattern^`, and
+    /// unanchored rules).
+    pub exact_wildcard_block: Vec<String>,
     /// Lines that are neither comments nor host rules: rules with other options, paths,
-    /// wildcard blocks, regexes, and hosts lines without a usable name.
+    /// regexes, `$important` exact-host and wildcard blocks, and hosts lines without a
+    /// usable name.
     pub skipped: u64,
 }
 
@@ -40,6 +57,8 @@ enum Kind {
     ExactBlock,
     WildcardAllow,
     ExactWildcardAllow,
+    WildcardBlock,
+    ExactWildcardBlock,
 }
 
 enum Line {
@@ -61,6 +80,8 @@ struct Builder {
     exact_block: HashSet<String>,
     wildcard_allow: HashSet<String>,
     exact_wildcard_allow: HashSet<String>,
+    wildcard_block: HashSet<String>,
+    exact_wildcard_block: HashSet<String>,
     badfilter: HashSet<(Kind, String)>,
     skipped: u64,
 }
@@ -70,11 +91,13 @@ impl DomainRules {
     /// does not end in a dot), `.name^` and the unanchored `name^` and `name^|` (the name
     /// must start with a letter or digit; all treated as the name and its subdomains), the
     /// exact-host forms `|name^|`, `|name^`, `://name^` and `://name^|` (the name only),
-    /// their `@@` forms, `$important` (not on exact-host blocks) and `$badfilter`.
-    /// Exceptions whose name has a `*` are kept as wildcard exceptions; blocks with a `*`
-    /// are skipped. Any other option, a path, a regex, a rule without a caret such as
-    /// `ads.example` or a `|` prefix rule such as `|ads.` is skipped. Hosts lists
-    /// contribute every name on `address name...` lines and bare `name` lines.
+    /// their `@@` forms, `$important` (not on exact-host blocks) and `$badfilter`. A rule
+    /// of any of these forms whose name has a `*` is kept as a pattern (see
+    /// [`DomainRules`]), and so are unanchored and caretless rules with a `*`; `$important`
+    /// is not supported on those. Any other option, a path, a regex, a rule without a `*`
+    /// and without a caret such as `ads.example` or a `|` prefix rule such as `|ads.` is
+    /// skipped. Hosts lists contribute every name on `address name...` lines and bare
+    /// `name` lines.
     pub fn parse(lists: &[ListSource]) -> DomainRules {
         let mut builder = Builder::default();
         for list in lists {
@@ -121,6 +144,8 @@ impl Builder {
             Kind::ExactBlock => &mut self.exact_block,
             Kind::WildcardAllow => &mut self.wildcard_allow,
             Kind::ExactWildcardAllow => &mut self.exact_wildcard_allow,
+            Kind::WildcardBlock => &mut self.wildcard_block,
+            Kind::ExactWildcardBlock => &mut self.exact_wildcard_block,
         }
     }
 
@@ -166,6 +191,8 @@ impl Builder {
             exact_block: sorted(&self.exact_block),
             wildcard_allow: sorted(&self.wildcard_allow),
             exact_wildcard_allow: sorted(&self.exact_wildcard_allow),
+            wildcard_block: sorted(&self.wildcard_block),
+            exact_wildcard_block: sorted(&self.exact_wildcard_block),
             skipped: self.skipped,
         }
     }
@@ -192,6 +219,27 @@ fn parse_adblock_line(line: &str) -> Line {
             "badfilter" => badfilter = true,
             _ => return Line::Skip,
         }
+    }
+    if pattern.contains('*') {
+        // Lists unblock hosts that break sites with wildcard exceptions such as
+        // `@@||clk*.tradedoubler.com^|`, and block families of hosts with wildcard blocks
+        // such as `||log*.example.com^`.
+        let Some((parents, glob)) = wildcard_pattern(pattern) else {
+            return Line::Skip;
+        };
+        let kind = match (exception, important, parents) {
+            (true, _, true) => Kind::WildcardAllow,
+            (true, _, false) => Kind::ExactWildcardAllow,
+            // An important pattern would need a section of its own; no DNS list uses one.
+            (false, true, _) => return Line::Skip,
+            (false, false, true) => Kind::WildcardBlock,
+            (false, false, false) => Kind::ExactWildcardBlock,
+        };
+        return Line::Rule {
+            kind,
+            name: glob,
+            badfilter,
+        };
     }
     let mut exact = false;
     let name = if let Some(rest) = pattern.strip_prefix("||") {
@@ -245,24 +293,7 @@ fn parse_adblock_line(line: &str) -> Line {
         return Line::Skip;
     };
     let Some(name) = normalize_name(name) else {
-        // Lists unblock hosts that break sites with wildcard exceptions such as
-        // `@@||clk*.tradedoubler.com^|`; dropping them would block what the list allows.
-        if !exception || !name.contains('*') {
-            return Line::Skip;
-        }
-        let Some(pattern) = normalize_pattern(name) else {
-            return Line::Skip;
-        };
-        let kind = if exact {
-            Kind::ExactWildcardAllow
-        } else {
-            Kind::WildcardAllow
-        };
-        return Line::Rule {
-            kind,
-            name: pattern,
-            badfilter,
-        };
+        return Line::Skip;
     };
     // An important exception is kept as a plain exception, so an important block for
     // the same host still wins. adblock would let the exception win; no DNS list uses it.
@@ -309,30 +340,42 @@ fn normalize_name(name: &str) -> Option<String> {
     Some(name.to_ascii_lowercase())
 }
 
-/// Lowercases a wildcard exception's name and strips one trailing dot. The same checks as
-/// [`normalize_name`], except that labels may hold `*`; a name made only of `*` and dots is
-/// rejected, since it would unblock everything.
-pub(crate) fn normalize_pattern(name: &str) -> Option<String> {
-    let name = name.strip_suffix('.').unwrap_or(name);
-    if name.len() > 253 || !name.contains('.') || name.bytes().all(|b| b == b'*' || b == b'.') {
-        return None;
-    }
-    let mut last = "";
-    for label in name.split('.') {
-        let valid = !label.is_empty()
-            && label.len() <= 63
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'*');
-        if !valid {
-            return None;
+/// The pattern for the host part of a rule whose name has a `*`, and whether it also
+/// covers parents (`||`), or `None` when it is not one [`is_valid_pattern`] accepts.
+///
+/// The pattern means what the rule means to adblock for a request to `https://host/`,
+/// where `||` starts the match at the start of the host or of one of its labels, `|` and
+/// `://` at the start of the host, and no anchor anywhere, while `^` (or `^|`) ends it at
+/// the end of the host. So an unanchored rule gets a leading `*` and a rule without a caret
+/// a trailing one. A caret after one trailing dot (`||x*.example.^`) ends the host as well.
+/// Runs of `*` are merged, so `$badfilter` finds the same pattern however it is written.
+fn wildcard_pattern(pattern: &str) -> Option<(bool, String)> {
+    let (parents, start, rest) = if let Some(rest) = pattern.strip_prefix("||") {
+        (true, "", rest)
+    } else if let Some(rest) = pattern
+        .strip_prefix("://")
+        .or_else(|| pattern.strip_prefix('|'))
+    {
+        (false, "", rest)
+    } else {
+        (false, "*", pattern)
+    };
+    let mut glob = String::with_capacity(rest.len() + 2);
+    glob.push_str(start);
+    match rest.strip_suffix("^|").or_else(|| rest.strip_suffix('^')) {
+        Some(name) => glob.push_str(name.strip_suffix('.').unwrap_or(name)),
+        None => {
+            glob.push_str(rest);
+            glob.push('*');
         }
-        last = label;
     }
-    if last.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+    let mut merged = String::with_capacity(glob.len());
+    for c in glob.chars() {
+        if c != '*' || !merged.ends_with('*') {
+            merged.push(c.to_ascii_lowercase());
+        }
     }
-    Some(name.to_ascii_lowercase())
+    is_valid_pattern(&merged).then_some((parents, merged))
 }
 
 fn sorted(names: &HashSet<String>) -> Vec<String> {

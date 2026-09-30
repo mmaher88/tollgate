@@ -7,7 +7,8 @@ use tollgate_filter::{
 
 const EASYLIST: &str =
     "! Title: snippet\n||ads.example^\n/banner/*/img^\n##.ad\n||tracker.example^$third-party\n";
-const DNS_ADBLOCK: &str = "||dns-only.example^\n@@||ok.ads.example^\n";
+const DNS_ADBLOCK: &str = "||dns-only.example^\n@@||ok.ads.example^\n||log*.dns.example^\n\
+                           @@||log-ok*.dns.example^\n";
 const HOSTS: &str = "0.0.0.0 hosts-only.example\n127.0.0.1 localhost\n";
 
 fn lists() -> [ListSource<'static>; 2] {
@@ -55,7 +56,8 @@ fn compile_writes_both_files_and_reports_them() {
         report.domains_bytes,
         fs::metadata(out.join(DOMAINS_FILE)).unwrap().len()
     );
-    assert_eq!(report.domains_bytes, 32 + 8 * 2);
+    assert_eq!(report.domains_bytes, 40 + 8 * 2);
+    assert_eq!(report.domain_patterns, 0);
 
     let engine = FilterEngine::load(&out.join(ENGINE_FILE)).unwrap();
     assert_eq!(
@@ -105,6 +107,8 @@ fn compile_split_routes_lists() {
     let report = compile_split(&engine_lists, &dns_lists, dir.path()).unwrap();
     assert_eq!(report.network_rules, 3);
     assert_eq!(report.domain_entries, 3);
+    // The wildcard block and the wildcard exception.
+    assert_eq!(report.domain_patterns, 2);
 
     let engine = FilterEngine::load(&dir.path().join(ENGINE_FILE)).unwrap();
     assert_eq!(
@@ -118,6 +122,9 @@ fn compile_split_routes_lists() {
     let domains = DomainSet::load(&dir.path().join(DOMAINS_FILE)).unwrap();
     assert!(domains.is_blocked("dns-only.example"));
     assert!(domains.is_blocked("hosts-only.example"));
+    assert!(domains.is_blocked("log1.dns.example"));
+    assert!(!domains.is_blocked("log-ok1.dns.example"));
+    assert_eq!(domains.pattern_count(), 2);
     // DNS lists alone decide the DNS blocklist.
     assert!(!domains.is_blocked("ads.example"));
 }

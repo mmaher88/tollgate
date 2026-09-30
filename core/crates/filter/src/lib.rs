@@ -6,6 +6,7 @@ mod domain_rules;
 mod domain_set;
 mod engine;
 mod request_type;
+mod wildcard;
 
 use std::path::PathBuf;
 
