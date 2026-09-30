@@ -7,6 +7,10 @@ import os
 /// Every successful download is kept in `core/list-cache/`. A list that fails to download
 /// falls back to its cached copy, so one broken list never stops the others, and settings
 /// changes (toggles, custom lists, My rules) can be applied without the network.
+///
+/// A custom list with the same address as an enabled built-in list is skipped. A custom
+/// list whose content does not match its type (a hosts file added as Request rules, say)
+/// is compiled as the type its content has, and that type is saved in lists.json.
 @MainActor
 final class ListUpdater: ObservableObject {
     enum State: Equatable {
@@ -26,15 +30,21 @@ final class ListUpdater: ObservableObject {
     @Published private(set) var lastAttempt: Date?
     /// The last full update could not download every list (or failed altogether).
     @Published private(set) var lastAttemptPartial = false
-    /// Lists that could not be downloaded in the last run (a cached copy may have been used).
-    /// Kept across launches, so the reason for a retry backoff stays visible.
+    /// Lists that could not be downloaded in the last run (a cached copy may have been used),
+    /// and custom lists whose type the last run changed to match their content. Kept across
+    /// launches, so the reason for a retry backoff stays visible.
     @Published private(set) var warnings: [String] = [] {
         didSet { UserDefaults.standard.set(warnings, forKey: Self.warningsKey) }
     }
     /// Whether compiled lists exist, observable by the UI.
     @Published private(set) var compiled = FilterLists.compiled
     /// Settings changed since the last successful compile; applied at the next opportunity.
+    /// Also set when an app update adds or removes a built-in list (see
+    /// `builtInListsChanged`).
     @Published private(set) var pendingSettingsChange: Bool
+    /// Counts the times this updater rewrote lists.json itself (to correct a custom list's
+    /// type), so a view that keeps a copy of the settings can load them again.
+    @Published private(set) var settingsRevision = 0
 
     private let log = Logger(subsystem: "dev.tollgate.app", category: "lists")
     private static let lastUpdatedKey = "lists.lastUpdated"
@@ -42,6 +52,7 @@ final class ListUpdater: ObservableObject {
     private static let lastAttemptPartialKey = "lists.lastAttemptPartial"
     private static let warningsKey = "lists.warnings"
     private static let pendingKey = "lists.pendingSettingsChange"
+    private static let knownDefaultsKey = "lists.knownDefaults"
 
     /// Lists older than this are refreshed on launch, on returning to the foreground and by
     /// the background refresh task.
@@ -59,6 +70,7 @@ final class ListUpdater: ObservableObject {
     init() {
         let defaults = UserDefaults.standard
         let updated = defaults.object(forKey: Self.lastUpdatedKey) as? Date
+        if Self.builtInListsChanged() { defaults.set(true, forKey: Self.pendingKey) }
         pendingSettingsChange = defaults.bool(forKey: Self.pendingKey)
         lastUpdated = updated
         // Installs from before attempts were recorded: their last success was an attempt.
@@ -104,6 +116,27 @@ final class ListUpdater: ObservableObject {
         }
     }
 
+    /// Whether this version of the app ships other built-in lists than the version that ran
+    /// before it, and records the current ids either way. The compiled files then hold the
+    /// old set, so the change is applied like a settings change: at the next opportunity
+    /// (launch, foreground or the background refresh), from the cached copies, downloading
+    /// only lists never downloaded before. Without this a new built-in list, which is on for
+    /// existing installs (`ListSettings` stores only the lists switched off), would wait for
+    /// the next daily update. A new list that fails to download is retried like any other:
+    /// the run records a partial attempt, so a full update follows within an hour.
+    ///
+    /// Installs from before the ids were recorded have none. If they have compiled lists,
+    /// those predate at least the StevenBlack list, so they count as changed. A fresh
+    /// install has nothing compiled, and its first update downloads every list anyway.
+    private static func builtInListsChanged() -> Bool {
+        let defaults = UserDefaults.standard
+        let current = FilterLists.defaults.map(\.id)
+        let known = defaults.stringArray(forKey: knownDefaultsKey)
+        defaults.set(current, forKey: knownDefaultsKey)
+        guard let known else { return FilterLists.compiled }
+        return Set(current) != Set(known)
+    }
+
     /// Records that list settings changed; `applySettings()` or the next refresh compiles them.
     func settingsChanged() {
         pendingSettingsChange = true
@@ -129,6 +162,15 @@ final class ListUpdater: ObservableObject {
         let url: URL
         let format: ListFormat
         let target: ListTarget
+        /// The custom list this source comes from, whose type is checked against its
+        /// content; nil for a built-in list.
+        var custom: CustomList? = nil
+    }
+
+    /// A custom list compiled as another type than the one lists.json gives it.
+    private struct KindCorrection {
+        let list: CustomList
+        let kind: CustomList.Kind
     }
 
     private func run(refresh: Bool, deadline: Date?) async -> Bool {
@@ -142,23 +184,29 @@ final class ListUpdater: ObservableObject {
             state = .failed("App Group container unavailable")
             return false
         }
-        let settings = ListSettings.load()
+        var settings = ListSettings.load()
         var problems: [String] = []
         var sources = FilterLists.defaults.filter(settings.isEnabled).map {
             Source(cacheKey: $0.id, name: $0.name, url: $0.url, format: $0.format, target: $0.target)
         }
         for list in settings.custom {
+            // Settings shows the reason on the list's row.
+            if let builtIn = settings.builtInDuplicate(of: list) {
+                log.info("\(list.name, privacy: .public) skipped: same address as \(builtIn.name, privacy: .public)")
+                continue
+            }
             guard let url = URL(string: list.url), url.scheme?.lowercased() == "https", url.host != nil else {
                 problems.append("\(list.name): only https:// lists are supported")
                 continue
             }
             sources.append(Source(cacheKey: "custom-" + list.id, name: list.name, url: url,
-                                  format: list.kind.format, target: list.kind.target))
+                                  format: list.kind.format, target: list.kind.target, custom: list))
         }
 
         let cache = directory.appendingPathComponent("list-cache", isDirectory: true)
         try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
         var inputs: [ListInput] = []
+        var corrections: [KindCorrection] = []
         var allDownloaded = true
         /// A list that could not be downloaded and has no cached copy, so it is left out.
         var missingList = false
@@ -187,9 +235,20 @@ final class ListUpdater: ObservableObject {
                         : "\(source.name): using the last downloaded copy (\(error.localizedDescription))")
                 }
             }
-            if let text {
-                inputs.append(ListInput(name: source.name, text: text, format: source.format, target: source.target))
+            guard let listText = text else { continue }
+            var format = source.format
+            var target = source.target
+            if let list = source.custom, let detected = await Self.detectFormat(listText) {
+                let kind = list.kind.corrected(for: detected)
+                if kind != list.kind {
+                    corrections.append(KindCorrection(list: list, kind: kind))
+                    let content = detected == .hosts ? "a hosts file" : "written in adblock syntax"
+                    problems.append("\(list.name) is \(content), so its type was changed from \(list.kind.label) to \(kind.label).")
+                    format = kind.format
+                    target = kind.target
+                }
             }
+            inputs.append(ListInput(name: source.name, text: listText, format: format, target: target))
         }
         if !sources.isEmpty, inputs.isEmpty {
             warnings = problems
@@ -232,6 +291,9 @@ final class ListUpdater: ObservableObject {
                 // partial status and retry with a full update in an hour, not in a day.
                 recordAttempt(partial: true)
             }
+            // Saved only now, so a run that stops before its compile leaves lists.json alone
+            // and the next run finds (and reports) the same corrections.
+            if !corrections.isEmpty { settings = saveCorrections(corrections, loaded: settings) }
             if ListSettings.load() == settings {
                 pendingSettingsChange = false
                 UserDefaults.standard.set(false, forKey: Self.pendingKey)
@@ -245,6 +307,39 @@ final class ListUpdater: ObservableObject {
             state = .failed("Compile: \(error.localizedDescription)")
             return false
         }
+    }
+
+    /// How `text` is written, by the core's detector; nil when its lines give no verdict.
+    /// Off the main actor, since the detector reads the whole list.
+    private static func detectFormat(_ text: String) async -> ListFormat? {
+        await Task.detached(priority: .userInitiated) { detectListFormat(text: text) }.value
+    }
+
+    /// Saves the corrected types in lists.json, so the rows in Settings show them and the
+    /// next run has nothing to correct. A list is changed only while it still has the type
+    /// and address this run compiled it with: a type the user picked meanwhile wins.
+    /// Returns the settings the compiled files now stand for: `loaded` with the
+    /// corrections when lists.json still held `loaded`; otherwise the user changed
+    /// something meanwhile, and `loaded` is returned as it was, so the check after the
+    /// compile keeps that change pending.
+    private func saveCorrections(_ corrections: [KindCorrection], loaded: ListSettings) -> ListSettings {
+        var current = ListSettings.load()
+        let unchanged = current == loaded
+        for correction in corrections {
+            guard let index = current.custom.firstIndex(where: { $0.id == correction.list.id }),
+                  current.custom[index].kind == correction.list.kind,
+                  current.custom[index].url == correction.list.url
+            else { continue }
+            current.custom[index].kind = correction.kind
+        }
+        do {
+            try current.save()
+        } catch {
+            log.error("saving corrected list types failed: \(error.localizedDescription, privacy: .public)")
+            return loaded
+        }
+        settingsRevision += 1
+        return unchanged ? current : loaded
     }
 
     private func recordAttempt(partial: Bool) {
