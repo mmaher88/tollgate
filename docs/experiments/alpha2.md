@@ -227,10 +227,14 @@ Result:
      `https://xtollgate-wild1.example.com/` (the match must start at a label): Pass:
      neither is listed.
 3. Optional, with a real list: on the workstation, pick from the AdGuard DNS filter two
-   or three rules that start with `||`, end with `^` and have a `*` in the name. For each,
-   make up a name the rule matches (put a few letters in place of the `*`) and one it does
-   not (put a letter before the first label), and repeat step 2 with them. Pass: the same.
-   The Activity tab shows the names, so do not use names you would not want listed there.
+   or three rules that start with `||` followed by a letter or digit (not `||*`), end with
+   `^` and have a `*` in the name, and whose domain after the last `*` is not blocked on
+   its own (search the list for `||<that domain>^` and for its parents: a rule such as
+   `||ad.*.tracker.example^` is no good when the list also has `||tracker.example^`). For
+   each, make up a name the rule matches (put a few letters in place of the `*`) and one
+   it does not (put a letter before the first label), and repeat step 2 with them. Pass:
+   the same. The Activity tab shows the names, so do not use names you would not want
+   listed there.
 4. Remove the two lines from My rules and Save. Pass: after `lists compiled`,
    `https://tollgate-wild2.example.com/` is no longer listed as a domain block.
 
@@ -253,7 +257,8 @@ it; requests from apps, which do not say what they are for, still get the empty 
    `https://example.com/tollgate-check/`. Pass: a plain text page that starts with
    "Tollgate blocked this page." and says how to allow it from Activity; the Activity tab
    lists a request block for that address. Remove the line, Save, and reload the page.
-   Pass: the site's own page (a page that says it was not found), not Tollgate's.
+   Pass: the site's own "Example Domain" page (example.com answers this address with
+   status 404 but shows its usual page), not Tollgate's.
 4. Open three or four sites with heavy advertising in Safari and Chrome, as in E18. Pass:
    no ads; the pages load normally, with nothing missing that shows with protection off;
    Tollgate's blocked page never appears inside a page (in a frame), only in place of a
