@@ -3,8 +3,9 @@
 //! because clients also hang up for reasons that have nothing to do with the certificate.
 
 use tollgate_policy::{
-    Config, Decision, PassthroughReason, Policy, RejectionKind, SILENT_BURST_HOSTS,
-    SILENT_BURST_SECS, SILENT_REFUSALS, SILENT_SUPPRESS_SECS, SILENT_WINDOW_SECS,
+    Config, Decision, PassthroughReason, Policy, REJECTION_WINDOW_SECS, RejectionKind,
+    SILENT_BURST_HOSTS, SILENT_BURST_SECS, SILENT_RECENT_SECS, SILENT_REFUSALS,
+    SILENT_SUPPRESS_SECS,
 };
 
 const T0: u64 = 1_790_000_000;
@@ -29,9 +30,10 @@ fn silent_pin(p: &Policy, host: &str, start: u64) {
 }
 
 #[test]
-fn the_rule_is_three_refusals_in_different_seconds_within_a_minute() {
+fn the_rule_is_three_refusals_in_different_seconds_within_ten_minutes() {
     assert_eq!(SILENT_REFUSALS, 3);
-    assert_eq!(SILENT_WINDOW_SECS, 60);
+    assert_eq!(REJECTION_WINDOW_SECS, 600);
+    assert_eq!(SILENT_RECENT_SECS, 60);
     assert_eq!(SILENT_BURST_HOSTS, 4);
     assert_eq!(SILENT_BURST_SECS, 10);
     assert_eq!(SILENT_SUPPRESS_SECS, 60);
@@ -74,11 +76,38 @@ fn refusals_within_one_second_count_once() {
 fn refusals_must_fall_within_the_window() {
     let p = policy();
     assert!(!p.record_silent_refusal("slow.example", T0));
-    assert!(!p.record_silent_refusal("slow.example", T0 + 30));
-    assert!(!p.record_silent_refusal("slow.example", T0 + SILENT_WINDOW_SECS + 1));
+    assert!(!p.record_silent_refusal("slow.example", T0 + 300));
+    assert!(!p.record_silent_refusal("slow.example", T0 + REJECTION_WINDOW_SECS + 1));
     assert!(hosts(&p).is_empty());
-    // The window slides: the last three are within a minute.
-    assert!(p.record_silent_refusal("slow.example", T0 + SILENT_WINDOW_SECS + 2));
+    // The window slides: the last three are within ten minutes.
+    assert!(p.record_silent_refusal("slow.example", T0 + REJECTION_WINDOW_SECS + 2));
+}
+
+#[test]
+fn a_host_refused_in_two_seconds_per_use_is_learned_on_the_next_use() {
+    // The X app's second pinned host on 2026-09-30, from the device log: refused at
+    // 08:48:46 and 08:48:50 during one use of the app, and in no other second. The same
+    // use two minutes later brings the third second.
+    let p = policy();
+    let host = "upload.x.example";
+    assert!(!p.record_silent_refusal(host, T0 + 46));
+    assert!(!p.record_silent_refusal(host, T0 + 50));
+    assert!(hosts(&p).is_empty());
+    let next = T0 + 120;
+    assert!(p.record_silent_refusal(host, next + 46));
+    assert_eq!(hosts(&p), [host]);
+}
+
+#[test]
+fn uses_further_apart_than_the_window_teach_nothing() {
+    let p = policy();
+    let host = "upload.x.example";
+    for n in 0..5 {
+        let start = T0 + n * 11 * 60;
+        assert!(!p.record_silent_refusal(host, start + 46));
+        assert!(!p.record_silent_refusal(host, start + 50));
+    }
+    assert!(hosts(&p).is_empty());
 }
 
 #[test]
@@ -89,9 +118,21 @@ fn a_trusted_handshake_keeps_the_host_from_being_learned_for_the_window() {
         assert!(!p.record_silent_refusal("www.site.example", at));
     }
     assert!(hosts(&p).is_empty());
-    // A minute after the last success, refusals count again.
-    let later = T0 + SILENT_WINDOW_SECS + 1;
+    // Ten minutes after the last success, refusals count again.
+    let later = T0 + REJECTION_WINDOW_SECS + 1;
     silent_pin(&p, "www.site.example", later);
+}
+
+#[test]
+fn a_trusted_handshake_guards_the_whole_window() {
+    // A browser completed one handshake and keeps using that connection, so it makes no
+    // new handshakes; hang-ups of its other connections minutes apart must not add up.
+    let p = policy();
+    p.record_intercepted_handshake("news.example", T0);
+    for at in [T0 + 100, T0 + 400, T0 + 650] {
+        assert!(!p.record_silent_refusal("news.example", at));
+    }
+    assert!(hosts(&p).is_empty());
 }
 
 #[test]

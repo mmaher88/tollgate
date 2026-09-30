@@ -906,19 +906,23 @@ sections, this section wins.
   write found nothing waiting (a client that closed before our answer does not count).
   Refusals are counted (`tls_silent_refusals`, Diagnostics "Silent certificate
   refusals") and taught to the policy, which learns a pin from refusals of the same host
-  in 3 different wall-clock seconds within 60 s: a client that loses a race or is
-  suspended hangs up all its connections of that moment together, while a pinning app
-  keeps retrying. No pin is learned while any client has completed a handshake with our
-  certificate for that host in the last 60 s, and such a success clears the host's
-  pending refusals. Refusals on 4 or more hosts within 10 s are a burst with a common
-  cause (a network change, sleep, a lost race, an untrusted certificate): the pending
-  refusals are cleared, pins learned from silent refusals in that window are taken back,
-  and silent refusals teach nothing for 60 s, counted again from each burst. A wake or a
-  path change drops silent pins learned in the last 60 s. Pins learned from alerts or
-  from upstream failures are never taken back by these rules. Silent pins are saved and
-  listed with the others; pending refusals are not saved. Known limits: an app that pins
-  4 or more hosts and hits them within 10 s is never learned this way, and a race the
-  proxy keeps losing for a host with no successful handshake could be.
+  in 3 different wall-clock seconds within 10 minutes, the window of the alert rule: a
+  client that loses a race or is suspended hangs up all its connections of that moment
+  together, while a pinning app keeps retrying, and may reach a second host only once or
+  twice each time it is used (the X app hung up on its second pinned host in two seconds
+  only), so the count must span uses. No pin is learned while any client has completed a
+  handshake with our certificate for that host in the last 10 minutes (a browser may use
+  one connection for minutes without a new handshake), and such a success clears the
+  host's pending refusals. Refusals on 4 or more hosts within 10 s are a burst with a
+  common cause (a network change, sleep, a lost race, an untrusted certificate): the
+  pending refusals are cleared, pins learned from silent refusals in that window are
+  taken back, and silent refusals teach nothing for 60 s, counted again from each burst.
+  A wake or a path change drops silent pins learned in the last 60 s and clears the
+  pending refusals. Pins learned from alerts or from upstream failures are never taken
+  back by these rules. Silent pins are saved and listed with the others; pending
+  refusals are not saved. Known limits: an app that pins 4 or more hosts and hits them
+  within 10 s is never learned this way, and a race the proxy keeps losing for a host
+  with no successful handshake in 10 minutes could be.
 - **A fifth built-in list.** StevenBlack hosts (id `stevenblack`, hosts format, DNS) adds
   host names the AdGuard DNS filter lacks: about 34,000 more hashes, about 270 KB of
   `domains.bin`. Built-in lists are on unless switched off, so it is on for existing

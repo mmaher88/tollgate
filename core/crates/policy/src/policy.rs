@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Config, HostPattern, PolicyError, bundled_passthrough};
 
 /// Two client rejections of the same host at most this many seconds apart make it a pin.
+/// Silent refusals are counted over the same window (see [`SILENT_REFUSALS`]).
 pub const REJECTION_WINDOW_SECS: u64 = 10 * 60;
 /// A learned pin is kept for this long after it was learned.
 pub const PIN_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
@@ -34,15 +35,24 @@ pub const UPSTREAM_SUPPRESS_SECS: u64 = 10 * 60;
 pub const UPSTREAM_RECENT_SECS: u64 = 5 * 60;
 
 /// Silent refusals of the same host in this many different seconds, all within
-/// [`SILENT_WINDOW_SECS`], make it a pin. Refusals within one second count once: a client
-/// that loses a race or is suspended hangs up all its connections of that moment together,
-/// while a pinning app keeps retrying and is refused again each time (the X app for iOS
-/// hung up 13 times on one host within 5 seconds, Messenger 147 times within 45).
+/// [`REJECTION_WINDOW_SECS`], make it a pin. Refusals within one second count once: a
+/// client that loses a race or is suspended hangs up all its connections of that moment
+/// together, while a pinning app keeps retrying and is refused again each time (the X app
+/// for iOS hung up 13 times on one host within 5 seconds, Messenger 147 times within 45).
+/// The window spans several uses of an app, as the alert rule's does: a pinning app may
+/// reach a second host only once or twice each time it is used (the X app hung up on its
+/// second pinned host in two seconds only, 4 seconds apart), so a window of a minute would
+/// never learn that host, however often the app is opened.
+///
+/// A client's successful handshake with our certificate for the host keeps it from being
+/// learned this way for the same [`REJECTION_WINDOW_SECS`]: that client trusts us, and its
+/// hang-ups have other causes. A browser can keep using one connection for minutes without
+/// a new handshake, so a shorter guard would let its rare hang-ups add up over the window.
 pub const SILENT_REFUSALS: usize = 3;
-/// See [`SILENT_REFUSALS`]. Also how long a client's successful handshake with our
-/// certificate keeps its host from being learned from silent refusals: that client trusts
-/// us, and its hang-ups have other causes.
-pub const SILENT_WINDOW_SECS: u64 = 60;
+/// Pins learned from silent refusals this recently are taken back when the device wakes or
+/// the network path changes (see [`Policy::on_network_change`]), since clients hang up the
+/// connections they were setting up then.
+pub const SILENT_RECENT_SECS: u64 = 60;
 /// Silent refusals on this many different hosts within [`SILENT_BURST_SECS`] have a common
 /// cause rather than pinning apps: a network change, the device sleeping, a browser's
 /// connections losing a race all at once, or the Tollgate certificate no longer being
@@ -164,15 +174,15 @@ struct Learning {
     /// Upstream failures teach nothing before this time (after a burst).
     upstream_suppressed_until: Option<u64>,
     /// Host to the different seconds of its silent refusals in the last
-    /// [`SILENT_WINDOW_SECS`], while they have not made it a pin.
+    /// [`REJECTION_WINDOW_SECS`], while they have not made it a pin.
     silent_pending: HashMap<String, Vec<u64>>,
     /// Host to the time of its last silent refusal in the last [`SILENT_BURST_SECS`],
     /// whether it counted or not, to see a burst.
     silent_hosts: HashMap<String, u64>,
     /// Host to the time a client last completed a handshake with our certificate for it,
-    /// kept for [`SILENT_WINDOW_SECS`].
+    /// kept for [`REJECTION_WINDOW_SECS`].
     trusted: HashMap<String, u64>,
-    /// Pins learned from silent refusals in the last [`SILENT_WINDOW_SECS`] of this session,
+    /// Pins learned from silent refusals in the last [`SILENT_RECENT_SECS`] of this session,
     /// oldest first, with the time each was learned, so a burst or a network change can
     /// take them back. Not saved: only fresh pins are taken back.
     silent: Vec<(String, u64)>,
@@ -450,18 +460,20 @@ impl Policy {
     /// needs: one that lost a race to another network, was suspended, or preconnected. So
     /// the rule is stricter than for alerts:
     ///
-    /// - refusals in [`SILENT_REFUSALS`] different seconds within [`SILENT_WINDOW_SECS`]
-    ///   make the host a pin;
+    /// - refusals in [`SILENT_REFUSALS`] different seconds within
+    ///   [`REJECTION_WINDOW_SECS`] make the host a pin;
     /// - but none while a client has completed a handshake with our certificate for the
-    ///   host in the last [`SILENT_WINDOW_SECS`] ([`Policy::record_intercepted_handshake`]):
-    ///   that client trusts us, as browsers do, so the hang-ups have other causes;
+    ///   host in the last [`REJECTION_WINDOW_SECS`]
+    ///   ([`Policy::record_intercepted_handshake`]): that client trusts us, as browsers do,
+    ///   so the hang-ups have other causes;
     /// - and none from a burst: when refusals hit [`SILENT_BURST_HOSTS`] different hosts
     ///   within [`SILENT_BURST_SECS`], the pending refusals are forgotten, the pins learned
     ///   from silent refusals within that window are taken back (other pins are kept), and
     ///   silent refusals teach nothing for [`SILENT_SUPPRESS_SECS`], counted again from
     ///   every refusal while the burst lasts.
     ///
-    /// Pending refusals are not saved. Returns true when this refusal made the host a pin;
+    /// Pending refusals are not saved, and a wake or a network change forgets them (see
+    /// [`Policy::on_network_change`]). Returns true when this refusal made the host a pin;
     /// false when it already was one, `host` is empty, or the refusal did not complete the
     /// rule.
     pub fn record_silent_refusal(&self, host: &str, now: u64) -> bool {
@@ -482,7 +494,7 @@ impl Policy {
             return false;
         }
         let trusted = learning.trusted.get(&key).copied();
-        if trusted.is_some_and(|at| within(at, now, SILENT_WINDOW_SECS)) {
+        if trusted.is_some_and(|at| within(at, now, REJECTION_WINDOW_SECS)) {
             learning.silent_pending.remove(&key);
             log::debug!("{key} hung up during the handshake, but a client trusted us for it");
             return false;
@@ -491,13 +503,13 @@ impl Policy {
             let fresh = |seconds: &Vec<u64>| {
                 seconds
                     .iter()
-                    .any(|at| within(*at, now, SILENT_WINDOW_SECS))
+                    .any(|at| within(*at, now, REJECTION_WINDOW_SECS))
             };
             let last = |seconds: &Vec<u64>| seconds.iter().copied().max().unwrap_or(0);
             make_room(&mut learning.silent_pending, fresh, last);
         }
         let seconds = learning.silent_pending.entry(key.clone()).or_default();
-        seconds.retain(|at| within(*at, now, SILENT_WINDOW_SECS));
+        seconds.retain(|at| within(*at, now, REJECTION_WINDOW_SECS));
         if seconds.contains(&now) {
             return false;
         }
@@ -511,7 +523,7 @@ impl Policy {
         learning.upstream.retain(|(host, _)| *host != key);
         learning
             .silent
-            .retain(|(_, at)| within(*at, now, SILENT_WINDOW_SECS));
+            .retain(|(_, at)| within(*at, now, SILENT_RECENT_SECS));
         learning.silent.push((key.clone(), now));
         log::info!("learned certificate pin for {key} after {SILENT_REFUSALS} silent refusals");
         learning.pins.insert(key, now);
@@ -520,7 +532,7 @@ impl Policy {
 
     /// Records that a client completed a TLS handshake with our certificate for `host`, so
     /// it trusts us: silent refusals of the host teach nothing for the next
-    /// [`SILENT_WINDOW_SECS`], and those pending are forgotten (see
+    /// [`REJECTION_WINDOW_SECS`], and those pending are forgotten (see
     /// [`Policy::record_silent_refusal`]).
     pub fn record_intercepted_handshake(&self, host: &str, now: u64) {
         let key = lookup_key(host);
@@ -530,7 +542,7 @@ impl Policy {
         let mut learning = self.lock();
         learning.silent_pending.remove(&key);
         if !learning.trusted.contains_key(&key) {
-            let fresh = |at: &u64| within(*at, now, SILENT_WINDOW_SECS);
+            let fresh = |at: &u64| within(*at, now, REJECTION_WINDOW_SECS);
             make_room(&mut learning.trusted, fresh, |at| *at);
         }
         learning.trusted.insert(key, now);
@@ -538,7 +550,7 @@ impl Policy {
 
     /// Drops the pins learned from upstream failures in the last [`UPSTREAM_RECENT_SECS`]:
     /// a captive portal or filtering network may have caused them without a burst. Also
-    /// drops the pins learned from silent refusals in the last [`SILENT_WINDOW_SECS`] and
+    /// drops the pins learned from silent refusals in the last [`SILENT_RECENT_SECS`] and
     /// forgets the pending silent refusals: while the network changes or the device goes to
     /// sleep, clients hang up the connections they were setting up. Call it when the device
     /// wakes or the network path changes (after a portal login, or on leaving the network).
@@ -563,7 +575,7 @@ impl Policy {
         let silent = std::mem::take(&mut learning.silent);
         let mut dropped = 0;
         for (host, at) in silent {
-            if within(at, now, SILENT_WINDOW_SECS) && learning.take_back(&host, at) {
+            if within(at, now, SILENT_RECENT_SECS) && learning.take_back(&host, at) {
                 dropped += 1;
             }
         }
@@ -572,7 +584,7 @@ impl Policy {
         if dropped > 0 {
             log::info!(
                 "network changed: dropped {dropped} certificate pins learned from silent \
-                 refusals in the last {SILENT_WINDOW_SECS} s"
+                 refusals in the last {SILENT_RECENT_SECS} s"
             );
         }
     }

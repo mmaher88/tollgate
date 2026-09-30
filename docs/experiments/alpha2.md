@@ -310,8 +310,8 @@ Result:
 Some apps that pin their certificates reject Tollgate's without a TLS alert: they close
 the connection during the handshake. Tollgate now counts that as a silent refusal
 (Diagnostics, Silent certificate refusals) and passes the host through once refusals
-of it come in three different seconds within a minute, unless a client completed a
-handshake for that host in the last minute, or refusals hit four or more hosts within
+of it come in three different seconds within 10 minutes, unless a client completed a
+handshake for that host in the last 10 minutes, or refusals hit four or more hosts within
 10 s (a common cause such as a network change, which also takes back pins learned from
 refusals in that time).
 
@@ -329,9 +329,11 @@ refusals in that time).
 4. Use the apps you use daily for a few minutes each, especially any that failed with
    HTTPS filtering on in earlier builds (showed no content or could not connect). Pass:
    an app that fails at first works after pulling to refresh or retrying for about ten
-   seconds, and stays working; for its host the log shows `<host> hangs up on our
-   certificate without an alert; passing it through from now on`, and the host appears
-   under Learned certificate pins. Note each such app and host.
+   seconds, and stays working (a part of the app that uses another host, such as uploads
+   or media, may fail until it has been tried again a few times within 10 minutes); for
+   its host the log shows `<host> hangs up on our certificate without an alert; passing
+   it through from now on`, and the host appears under Learned certificate pins. Note
+   each such app and host.
 5. Forget one of those hosts in Learned certificate pins and use its app again. Pass: it
    fails briefly and the host is learned again. Within a minute of that, turn airplane
    mode on and off. Pass: the log shows `network changed: dropped 1 certificate pins
