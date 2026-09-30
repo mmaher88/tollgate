@@ -210,6 +210,35 @@ async fn an_http1_request_to_a_blocked_host_gets_no_response_and_the_connection_
     assert_not_intercepted(&s);
 }
 
+/// A wildcard block in the DNS list (`||log*.example^`) blocks the hosts it matches like
+/// any other block, and its exceptions still win.
+#[tokio::test]
+async fn hosts_a_wildcard_block_matches_get_a_blocked_connection() {
+    let s = setup_with(Config::default(), |ctx, _| {
+        ctx.domains.store(Some(domains(
+            "||log*.ads.example^\n@@||log-ok*.ads.example^\n",
+        )));
+    })
+    .await;
+    let tls = s
+        .tls(&s.target("log1.ads.example"), "log1.ads.example", &[b"h2"])
+        .await;
+    assert_eq!(peer_issuer(&tls), TOLLGATE);
+    drop(tls);
+    assert_eq!(s.proxy.stats().dns_blocked, 1);
+    assert_eq!(dns_blocks(&s.events), ["log1.ads.example"]);
+    assert_not_intercepted(&s);
+
+    for name in ["blog.ads.example", "log-ok1.ads.example"] {
+        let tls = s.tls(&s.target(name), name, &[b"h2"]).await;
+        let mut h2 = http2(tls).await;
+        let reply = send2(&mut h2, get(&s.url(name, "/"), &[])).await;
+        assert_eq!(reply.status, StatusCode::OK, "{name}");
+    }
+    assert_eq!(s.proxy.stats().dns_blocked, 1);
+    assert_eq!(s.proxy.stats().connections_intercepted, 2);
+}
+
 #[tokio::test]
 async fn hosts_the_list_does_not_block_are_intercepted() {
     let s = setup(Config::default()).await;

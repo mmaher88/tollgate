@@ -92,6 +92,28 @@ fn exceptions_and_other_names_are_forwarded() {
 }
 
 #[test]
+fn wildcard_blocks_are_answered_like_other_blocks() {
+    let bytes = DomainSet::build(&[ListSource {
+        name: "test",
+        text: "||log*.tracker.test^\n@@||log-ok*.tracker.test^\n",
+        format: ListFormat::Adblock,
+    }]);
+    let stats = Arc::new(Stats::default());
+    let set = Arc::new(DomainSet::from_bytes(bytes).unwrap());
+    let handler = DnsHandler::new(Some(set), stats.clone());
+    for name in ["log1.tracker.test.", "a.LOG.tracker.test."] {
+        let packet = query_packet(3, name, RecordType::A, None);
+        let message = decode(&expect_reply(handler.handle_packet(&packet, NOW)).payload);
+        assert_eq!(message.answers[0].data, RData::A(A(Ipv4Addr::UNSPECIFIED)));
+    }
+    for name in ["blog.tracker.test.", "log-ok1.tracker.test."] {
+        expect_forward(handler.handle_packet(&query_packet(4, name, RecordType::A, None), NOW));
+    }
+    assert_eq!(stats.snapshot().dns_blocked, 2);
+    assert_eq!(stats.snapshot().dns_forwarded, 2);
+}
+
+#[test]
 fn opt_is_echoed_only_when_the_query_had_one() {
     let (handler, _) = handler();
     for dnssec_ok in [true, false] {

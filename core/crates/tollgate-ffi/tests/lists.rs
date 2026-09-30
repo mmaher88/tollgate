@@ -95,13 +95,14 @@ fn a_hosts_list_cannot_feed_the_url_filter() {
 fn no_lists_give_empty_files() {
     let tmp = tempfile::tempdir().unwrap();
     let report = compile_lists(Vec::new(), tmp.path().to_str().unwrap().to_string()).unwrap();
+    // An empty DNS blocklist is the 40-byte header alone.
     assert_eq!(
         (
             report.network_rules,
             report.domain_entries,
             report.domains_bytes
         ),
-        (0, 0, 32)
+        (0, 0, 40)
     );
     assert!(tmp.path().join(ENGINE_FILE).exists());
     assert!(tmp.path().join(DOMAINS_FILE).exists());

@@ -17,6 +17,8 @@ pub struct CompileReport {
     pub network_rules: u64,
     /// Hashes in the DNS blocklist.
     pub domain_entries: u64,
+    /// Wildcard patterns in the DNS blocklist: blocks and exceptions.
+    pub domain_patterns: u64,
     pub engine_bytes: u64,
     pub domains_bytes: u64,
 }
@@ -56,12 +58,23 @@ pub fn compile_split(
     })?;
     let network_rules = network_rule_count(engine_lists);
     let engine = FilterEngine::from_lists(engine_lists, false).serialize();
-    let domains = DomainRules::parse(dns_lists).encode();
+    let rules = DomainRules::parse(dns_lists);
+    let domains = rules.encode();
     write_atomically(&dir.join(ENGINE_FILE), &engine)?;
     write_atomically(&dir.join(DOMAINS_FILE), &domains)?;
+    let domain_patterns = [
+        &rules.wildcard_allow,
+        &rules.exact_wildcard_allow,
+        &rules.wildcard_block,
+        &rules.exact_wildcard_block,
+    ]
+    .iter()
+    .map(|patterns| patterns.len() as u64)
+    .sum();
     let report = CompileReport {
         network_rules,
         domain_entries: hash_count(&domains),
+        domain_patterns,
         engine_bytes: engine.len() as u64,
         domains_bytes: domains.len() as u64,
     };
