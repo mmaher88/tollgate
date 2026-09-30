@@ -11,7 +11,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{ActiveKeyExchange, CryptoProvider, SharedSecret, SupportedKxGroup};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, NamedGroup, SignatureScheme};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, HandshakeKind, NamedGroup,
+    SignatureScheme,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tollgate_mitm::CertAuthority;
@@ -141,16 +144,39 @@ fn reset(tcp: TcpStream) {
     drop(tcp);
 }
 
-/// A key exchange group the proxy does not support, offered first, so the proxy answers
-/// with a HelloRetryRequest for one it does. The X app offers X25519MLKEM768 first.
+/// X25519MLKEM768, a key exchange group the proxy does not support, with a made-up share,
+/// offered first. The X app offers it with an X25519 share beside it, which rustls sends
+/// when the hybrid names X25519 as its component, so the proxy picks X25519 and answers
+/// with a ServerHello at once. Without that share the proxy supports none of the client's
+/// shares, and answers with a HelloRetryRequest for a group it does support.
 #[derive(Debug)]
-struct UnsupportedGroup;
+struct UnsupportedGroup {
+    /// Whether an X25519 share is offered beside the hybrid one.
+    x25519: bool,
+}
 
-struct UnsupportedShare(Vec<u8>);
+/// The hybrid group as the X app offers it, with an X25519 share beside it.
+static WITH_X25519: UnsupportedGroup = UnsupportedGroup { x25519: true };
+/// The hybrid group alone, which gets a HelloRetryRequest.
+static ALONE: UnsupportedGroup = UnsupportedGroup { x25519: false };
+
+struct UnsupportedShare {
+    share: Vec<u8>,
+    /// The X25519 key exchange offered beside the hybrid, if any.
+    x25519: Option<Box<dyn ActiveKeyExchange>>,
+}
 
 impl SupportedKxGroup for UnsupportedGroup {
     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, rustls::Error> {
-        Ok(Box::new(UnsupportedShare(vec![7; 1216])))
+        let x25519 = if self.x25519 {
+            Some(rustls::crypto::ring::kx_group::X25519.start()?)
+        } else {
+            None
+        };
+        Ok(Box::new(UnsupportedShare {
+            share: vec![7; 1216],
+            x25519,
+        }))
     }
 
     fn name(&self) -> NamedGroup {
@@ -163,8 +189,23 @@ impl ActiveKeyExchange for UnsupportedShare {
         Err(rustls::Error::General("never negotiated".into()))
     }
 
+    fn hybrid_component(&self) -> Option<(NamedGroup, &[u8])> {
+        let x25519 = self.x25519.as_ref()?;
+        Some((NamedGroup::X25519, x25519.pub_key()))
+    }
+
+    fn complete_hybrid_component(
+        self: Box<Self>,
+        peer: &[u8],
+    ) -> Result<SharedSecret, rustls::Error> {
+        match self.x25519 {
+            Some(x25519) => x25519.complete(peer),
+            None => Err(rustls::Error::General("no X25519 share offered".into())),
+        }
+    }
+
     fn pub_key(&self) -> &[u8] {
-        &self.0
+        &self.share
     }
 
     fn group(&self) -> NamedGroup {
@@ -172,11 +213,23 @@ impl ActiveKeyExchange for UnsupportedShare {
     }
 }
 
-/// Like the X app: offers a key share the proxy does not support first, so the handshake
-/// goes through a HelloRetryRequest, and checks the certificate against `roots` only.
+/// Like the X app: offers X25519MLKEM768 first with an X25519 share beside it, so the
+/// proxy picks X25519 and sends its certificate in its first flight, with no
+/// HelloRetryRequest, and checks the certificate against `roots` only.
 fn x_like(roots: &[&CertAuthority]) -> Arc<ClientConfig> {
+    offering_first(&WITH_X25519, roots)
+}
+
+/// Offers only a key share the proxy does not support, so the handshake goes through a
+/// HelloRetryRequest, and checks the certificate against `roots` only.
+fn retry_forcing(roots: &[&CertAuthority]) -> Arc<ClientConfig> {
+    offering_first(&ALONE, roots)
+}
+
+/// A client that offers `group` before the provider's own groups, and trusts `roots`.
+fn offering_first(group: &'static UnsupportedGroup, roots: &[&CertAuthority]) -> Arc<ClientConfig> {
     let mut provider = rustls::crypto::ring::default_provider();
-    provider.kx_groups.insert(0, &UnsupportedGroup);
+    provider.kx_groups.insert(0, group);
     let mut store = rustls::RootCertStore::empty();
     for ca in roots {
         store.add(CertificateDer::from(ca.cert_der())).unwrap();
@@ -342,7 +395,7 @@ async fn hanging_up_before_the_certificate_is_not_counted() {
     s.settle(1).await;
 
     // Hangs up after a HelloRetryRequest, which carries no certificate.
-    let config = x_like(&[&s.ca]);
+    let config = retry_forcing(&[&s.ca]);
     let (mut tcp, client) =
         start_handshake(&s, config.clone(), "app.tollgate.test", Until::FirstRecord).await;
     assert!(client.wants_write(), "a second ClientHello is due");
@@ -356,6 +409,43 @@ async fn hanging_up_before_the_certificate_is_not_counted() {
     let stats = s.proxy.stats();
     assert_eq!(stats.tls_silent_refusals, 0);
     assert_eq!(stats.tls_client_rejections, 0);
+}
+
+#[tokio::test]
+async fn an_x_like_client_gets_its_certificate_in_the_first_flight() {
+    // As in the device log: X's ClientHello carries an X25519 share beside the hybrid one,
+    // so the proxy's first answer is a ServerHello for X25519, not a HelloRetryRequest.
+    let s = setup().await;
+    let config = x_like(&[&s.ca]);
+    let (tcp, client) = start_handshake(&s, config, "app.tollgate.test", Until::Flight).await;
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+    let group = client
+        .negotiated_key_exchange_group()
+        .map(|group| group.name());
+    assert_eq!(group, Some(NamedGroup::X25519));
+    drop(tcp);
+    wait_for("the silent refusal", || {
+        s.proxy.stats().tls_silent_refusals == 1
+    })
+    .await;
+    assert_eq!(s.proxy.stats().tls_client_rejections, 0);
+}
+
+#[tokio::test]
+async fn hanging_up_after_a_hello_retry_request_and_the_certificate_is_a_silent_refusal() {
+    let s = setup().await;
+    let config = retry_forcing(&[&s.ca]);
+    let (tcp, client) = start_handshake(&s, config, "app.tollgate.test", Until::Flight).await;
+    assert_eq!(
+        client.handshake_kind(),
+        Some(HandshakeKind::FullWithHelloRetryRequest)
+    );
+    drop(tcp);
+    wait_for("the silent refusal", || {
+        s.proxy.stats().tls_silent_refusals == 1
+    })
+    .await;
+    assert_eq!(s.proxy.stats().tls_client_rejections, 0);
 }
 
 #[tokio::test]

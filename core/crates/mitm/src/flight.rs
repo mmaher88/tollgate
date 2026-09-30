@@ -9,8 +9,9 @@
 //! to it, and the handshake messages among them that are sent in the clear, to tell when
 //! the record carrying the certificate has been written in full:
 //!
-//! - TLS 1.3: a ServerHello that is neither a HelloRetryRequest (which X gets, because it
-//!   offers a key share for a group the proxy does not support) nor the acceptance of a
+//! - TLS 1.3: a ServerHello that is neither a HelloRetryRequest (which the proxy sends only
+//!   to a client none of whose key shares it supports; the X app offers an X25519 share
+//!   beside X25519MLKEM768, so it gets a ServerHello at once) nor the acceptance of a
 //!   pre-shared key (a resumed session sends no certificate), then the first encrypted
 //!   record. rustls sends EncryptedExtensions through Finished as one flight message, split
 //!   into records only past 16 KiB, which Tollgate's leaf is far below.
