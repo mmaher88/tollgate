@@ -42,7 +42,7 @@ pub fn reply(packet: &[u8]) -> Message {
 }
 
 /// A temporary data directory with `url_rules` compiled into `engine.dat` and
-/// `dns_rules` into `domains.bin`.
+/// `dns_rules` into `domains.bin`, which also gets Tollgate extras.
 pub fn data_dir(url_rules: &str, dns_rules: &str) -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     compile_into(&dir, url_rules, dns_rules);
@@ -56,12 +56,14 @@ pub fn compile_into(dir: &TempDir, url_rules: &str, dns_rules: &str) {
             text: url_rules.to_string(),
             format: ListFormat::Adblock,
             target: ListTarget::Url,
+            exempt_sensitive_hosts: false,
         },
         ListInput {
             name: "dns".to_string(),
             text: dns_rules.to_string(),
             format: ListFormat::Adblock,
             target: ListTarget::Dns,
+            exempt_sensitive_hosts: false,
         },
     ];
     compile_lists(lists, path(dir)).unwrap();

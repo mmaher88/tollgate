@@ -6,7 +6,7 @@ mod config;
 mod pattern;
 mod policy;
 
-pub use bundled::bundled_passthrough;
+pub use bundled::{BundledGroup, bundled_passthrough};
 pub use config::{Config, DohUpstream};
 pub use pattern::HostPattern;
 pub use policy::{

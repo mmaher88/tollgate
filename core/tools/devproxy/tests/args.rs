@@ -34,6 +34,8 @@ fn every_option_is_read() {
         "https://example.com/dns.txt",
         "--hosts-list",
         "hosts",
+        "--exempting-dns-list",
+        "https://example.com/more-dns.txt",
         "--dns",
         "127.0.0.1:0",
         "--proxy",
@@ -56,6 +58,10 @@ fn every_option_is_read() {
                 ListSpec {
                     kind: ListKind::Hosts,
                     source: "hosts".to_string()
+                },
+                ListSpec {
+                    kind: ListKind::DnsExempting,
+                    source: "https://example.com/more-dns.txt".to_string()
                 },
             ],
             dns: "127.0.0.1:0".parse().unwrap(),
@@ -84,7 +90,9 @@ fn default_lists_expand_in_place() {
             ListKind::Url,
             ListKind::Url,
             ListKind::Dns,
-            ListKind::Hosts
+            ListKind::Hosts,
+            ListKind::DnsExempting,
+            ListKind::DnsExempting,
         ]
     );
 }
