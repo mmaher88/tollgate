@@ -4,16 +4,19 @@
 
 mod support;
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tollgate_common::resolve::{LookupFuture, Resolve};
 use tollgate_mitm::{CertAuthority, ProxyContext, ServeOptions};
 use tollgate_policy::Config;
 
+use support::client::wait_for;
 use support::origin::closed_port;
-use support::tunnel::{connect, connect_status, issuer_via, tls, tls_config};
+use support::tunnel::{connect, connect_status, issuer_via, peer_issuer, tls, tls_config};
 use support::{proxy, tls_origin};
 
 const TOLLGATE: &str = "CN=Tollgate Test CA, O=Tollgate";
@@ -87,18 +90,97 @@ async fn nothing_is_intercepted_when_mitm_is_off() {
     assert_eq!(s.issuer_for("www.tollgate.test").await, ORIGIN);
 }
 
+/// A passthrough host gets `200` before it is dialed. When it cannot be reached, the
+/// client connection is closed, so the client's TLS handshake fails, and the slot is free
+/// again.
 #[tokio::test]
-async fn unreachable_passthrough_host_gets_502() {
+async fn an_unreachable_passthrough_host_gets_its_connection_closed() {
     let config = Config {
         passthrough: vec!["127.0.0.1".to_string()],
         ..Config::default()
     };
-    let s = setup(config, |_| {}).await;
+    let s = setup_with(config, |_| {}, |options| options.max_passthrough = 1).await;
     let port = closed_port().await;
 
-    let (status, _) = connect_status(s.proxy.addr, &format!("127.0.0.1:{port}")).await;
-    assert_eq!(status, 502);
+    let (status, tcp) = connect_status(s.proxy.addr, &format!("127.0.0.1:{port}")).await;
+    assert_eq!(status, 200);
+    let config = tls_config(&[&s.ca, &s.origin_ca], &[b"h2"]);
+    assert!(tls(tcp, config, "www.tollgate.test").await.is_err());
     assert_eq!(s.proxy.stats().connections_passthrough, 0);
+
+    // The one passthrough slot was given back.
+    let mut issuer = String::new();
+    for _ in 0..100 {
+        issuer = s.issuer_for("www.tollgate.test").await;
+        if issuer == ORIGIN {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(issuer, ORIGIN);
+    assert_eq!(s.proxy.stats().connections_passthrough, 1);
+}
+
+/// Resolves every name to 127.0.0.1 after a delay, like a slow DNS lookup.
+#[derive(Debug)]
+struct SlowLookup(Duration);
+
+impl Resolve for SlowLookup {
+    fn lookup<'a>(&'a self, _host: &'a str) -> LookupFuture<'a> {
+        Box::pin(async move {
+            tokio::time::sleep(self.0).await;
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
+        })
+    }
+}
+
+/// The dial (here a lookup that takes 300 ms) no longer delays the `200`: the client
+/// starts its TLS handshake meanwhile, and the handshake completes with the origin once
+/// the tunnel is up.
+#[tokio::test]
+async fn a_passthrough_host_gets_200_before_it_is_dialed() {
+    let lookup = Duration::from_millis(300);
+    let s = setup_with(
+        localhost_passes_through(),
+        |_| {},
+        |options| options.resolver = Some(Arc::new(SlowLookup(lookup))),
+    )
+    .await;
+    let target = format!("pinned.tollgate.test:{}", s.origin.port());
+
+    let start = Instant::now();
+    let (status, tcp) = connect_status(s.proxy.addr, &target).await;
+    assert_eq!(status, 200);
+    assert!(
+        start.elapsed() < lookup,
+        "answered after {:?}",
+        start.elapsed()
+    );
+    let config = tls_config(&[&s.ca, &s.origin_ca], &[b"h2"]);
+    let tls = tls(tcp, config, "pinned.tollgate.test").await.unwrap();
+    assert_eq!(peer_issuer(&tls), ORIGIN);
+    assert!(start.elapsed() >= lookup, "{:?}", start.elapsed());
+    assert_eq!(s.proxy.stats().connections_passthrough, 1);
+}
+
+/// A passthrough host holds its slot while it is dialed, so the cap counts it.
+#[tokio::test]
+async fn a_passthrough_host_holds_its_slot_while_it_is_dialed() {
+    let s = setup_with(
+        localhost_passes_through(),
+        |_| {},
+        |options| {
+            options.max_passthrough = 1;
+            options.resolver = Some(Arc::new(SlowLookup(Duration::from_millis(300))));
+        },
+    )
+    .await;
+    let target = format!("pinned.tollgate.test:{}", s.origin.port());
+
+    let (status, _dialing) = connect_status(s.proxy.addr, &target).await;
+    assert_eq!(status, 200);
+    let (status, _) = connect_status(s.proxy.addr, &target).await;
+    assert_eq!(status, 503);
 }
 
 #[tokio::test]
@@ -191,6 +273,11 @@ async fn passthrough_tunnels_above_the_cap_are_refused() {
     let passthrough = format!("localhost:{}", s.origin.port());
 
     let held = connect(s.proxy.addr, &passthrough).await;
+    // Answered before it is dialed; counted once the dial is done.
+    wait_for("the held tunnel to be up", || {
+        s.proxy.stats().connections_passthrough == 1
+    })
+    .await;
     let (status, _) = connect_status(s.proxy.addr, &passthrough).await;
     assert_eq!(status, 503, "a passthrough host over the cap is refused");
 

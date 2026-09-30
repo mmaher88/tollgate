@@ -10,7 +10,7 @@ use tollgate_common::events::{BlockEvent, EventKind, EventLog};
 use tollgate_mitm::{CertAuthority, ServeOptions};
 use tollgate_policy::Config;
 
-use support::client::proxy_get;
+use support::client::{proxy_get, proxy_try_get};
 use support::tunnel::{connect, http2, send2, tls, tls_config};
 use support::{client, origin, proxy, tls_origin};
 
@@ -87,6 +87,34 @@ async fn blocked_request_without_a_page_has_no_source_host() {
     assert_eq!(recorded.len(), 2);
     assert!(
         recorded.iter().all(|e| e.source_host.is_none()),
+        "{recorded:?}"
+    );
+}
+
+/// A blocked request's answer depends on its `Sec-Fetch-Dest` (a page for a navigation, no
+/// response for a browser's other requests, `403` for an app), but every block is counted
+/// and recorded alike.
+#[tokio::test]
+async fn blocked_requests_are_recorded_whatever_their_answer() {
+    let (proxy, events) = start(&[]).await;
+    // Blocked before any upstream is contacted, so the name need not resolve.
+    let url = "http://ads.tollgate.test/banner.js";
+
+    let page = proxy_try_get(proxy.addr, url, &[("sec-fetch-dest", "document")]).await;
+    assert_eq!(page.map(|reply| reply.status), Some(StatusCode::FORBIDDEN));
+    let script = proxy_try_get(proxy.addr, url, &[("sec-fetch-dest", "script")]).await;
+    assert!(script.is_none(), "{script:?}");
+    let app = proxy_try_get(proxy.addr, url, &[]).await;
+    assert_eq!(app.map(|reply| reply.status), Some(StatusCode::FORBIDDEN));
+
+    let stats = proxy.stats();
+    assert_eq!((stats.http_requests, stats.http_blocked), (3, 3));
+    let recorded = events.recent(10);
+    assert_eq!(recorded.len(), 3, "{recorded:?}");
+    assert!(
+        recorded.iter().all(|event| event.kind == EventKind::Request
+            && event.host == "ads.tollgate.test"
+            && event.url.as_deref() == Some(url)),
         "{recorded:?}"
     );
 }

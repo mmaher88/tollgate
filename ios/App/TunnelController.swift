@@ -46,6 +46,14 @@ final class TunnelController: ObservableObject {
     /// Set when new lists were compiled in the background and the tunnel needed a restart
     /// to use them; the next time the app is active, `applyPendingListUpdate` does it.
     private static let listsPendingKey = "tunnel.listsPendingRestart"
+    /// Set when the app turned HTTPS filtering off because iOS did not trust the Tollgate
+    /// certificate (`noteUntrustedCertificate`); cleared when learned-pins.json is removed.
+    /// While the certificate is not trusted, every app rejects the intercepted connections,
+    /// so the engine learns pins for hosts that do not pin, and those pins must go before
+    /// filtering is on again. Otherwise learned pins are kept when HTTPS filtering is turned
+    /// off and on: they were learned with a trusted certificate, so each names a host that
+    /// really cannot be filtered, and learning it again would cost failed connections.
+    private static let pinsSuspectKey = "tunnel.pinsLearnedWhileUntrusted"
 
     private var tunnelBundleIdentifier: String {
         (Bundle.main.bundleIdentifier ?? "") + ".tunnel"
@@ -193,7 +201,8 @@ final class TunnelController: ObservableObject {
 
     /// Restarts a running tunnel so it picks up a new configuration, and waits until it is
     /// connected again. With `clearingLearnedPins`, forgets hosts learned as pinned while the
-    /// old configuration was running (for example while the certificate was untrusted).
+    /// old configuration was running (for example while the certificate was untrusted), and
+    /// with them the record that they may be wrong (`learnedPinsMayBeWrong`).
     /// Restarts run one after another, and never at the same time as `start()` or `stop()`.
     func restartIfRunning(clearingLearnedPins: Bool = false) async {
         let previous = restarting
@@ -413,6 +422,19 @@ final class TunnelController: ObservableObject {
         }
     }
 
+    /// Records that the learned pins may have been learned while iOS did not trust the
+    /// certificate, so the next time HTTPS filtering is turned on clears them (see
+    /// `pinsSuspectKey`). Call it when the app turns HTTPS filtering off for that reason.
+    static func noteUntrustedCertificate() {
+        UserDefaults.standard.set(true, forKey: pinsSuspectKey)
+    }
+
+    /// Whether the learned pins may have been learned while iOS did not trust the
+    /// certificate (see `pinsSuspectKey`), so turning HTTPS filtering on should clear them.
+    static var learnedPinsMayBeWrong: Bool {
+        UserDefaults.standard.bool(forKey: pinsSuspectKey)
+    }
+
     /// Recent blocks, newest first; nil when the tunnel is not running.
     func events() async -> [TunnelEvent]? {
         guard status == .connected, let data = await send(.events) else { return nil }
@@ -549,9 +571,16 @@ final class TunnelController: ObservableObject {
         lastError = message
     }
 
+    /// Removes learned-pins.json. Once it is gone, no pin learned while the certificate was
+    /// untrusted is left, so that record is cleared too; if the file is still there, the
+    /// record stays and the next time HTTPS filtering is turned on tries again.
     private static func removeLearnedPins() {
         guard let directory = AppGroup.coreDirectory else { return }
-        try? FileManager.default.removeItem(at: directory.appendingPathComponent("learned-pins.json"))
+        let file = directory.appendingPathComponent("learned-pins.json")
+        try? FileManager.default.removeItem(at: file)
+        if !FileManager.default.fileExists(atPath: file.path) {
+            UserDefaults.standard.removeObject(forKey: pinsSuspectKey)
+        }
     }
 
     private func report(_ error: Error, context: String) {

@@ -809,3 +809,153 @@ disagrees with earlier sections, this section wins.
   `UserDefaults`), and a Connectivity Assist section in Settings keeps the same advice and
   can show the notice again. The text never claims to know whether the setting is on.
 - On-device checks: `docs/experiments/alpha2.md` (E18 to E22).
+
+## Alpha 2: filtering fixes (2026-09-30)
+
+Makes more of the lists block, makes blocked requests look blocked to pages, and learns
+pins from apps that hang up without an alert. Where this section disagrees with earlier
+sections, this section wins.
+
+- **Wildcard rules in the DNS lists.** A rule whose host part has a `*` becomes a block or
+  exception pattern with the meaning adblock gives it for a request to `https://host/`:
+  `||` starts the match at the host or one of its labels, `|` and `://` at the host
+  itself, no anchor anywhere in it; `^` (or `^|`) ends it at the end of the host, and
+  without a caret it may end anywhere; `*` matches any run of characters, dots included,
+  and none. The AdGuard DNS filter's 407 wildcard blocks (`||log*.example.com^`), skipped
+  until now, block what they are meant to. Where adblock-rust's matcher departs from that
+  meaning (it finds the text after a `*` only at a token start, searches the scheme for
+  the text before it, and tries only its first occurrence in the host), the regex
+  meaning the list authors use wins, and a single-pipe pattern keeps meaning "this host
+  only". Order: an `$important` block; then any exception (exact, host or parent,
+  wildcard); then any block (exact, host or parent, wildcard). `$important` on a pattern
+  is skipped (no DNS list has one). An unanchored wildcard exception (`@@name*^`) now
+  matches the host only, as `*name*`. Patterns are filed under their literal head or
+  tail, whichever is longer, in tries built at load, so a lookup fully matches only the
+  patterns whose head starts one of the host's labels or whose tail ends the host; a
+  lookup that no hash decides costs about 100 ns more (about 300 ns in all, release
+  build on the workstation). A pattern with a `*` at both ends has neither and is tried
+  on every lookup, so an unanchored `*.name` (with or without `^`, and no other `*`) is
+  read as `name` and its subdomains instead, hashed like `||name^`, which blocks `name`
+  too: DNS lists in the wildcard domains format write one per line with that meaning, and
+  as patterns (`*.name*`) a list of 75,000 would cost about 1 ms per lookup and 5 MiB of
+  the tunnel's heap. `*.zip`, whose name has no dot, is skipped like `||zip^`. A compile
+  keeps at most 4,096 patterns, 64 of them with a `*` at both ends (the AdGuard DNS
+  filter has 417 and 1): exceptions first, since leaving one out would block what a list
+  unblocks, then blocks, in list order; the rest count as skipped lines and are logged.
+- **`domains.bin` version 2.** The header grows from 32 to 40 bytes: bytes 32 to 36 hold
+  the length of a wildcard block section that follows the wildcard exception section,
+  and bytes 36 to 40 are zero, keeping the hashes 8-byte aligned; bytes 0 to 32, the
+  checksum included, keep their meaning. Version 1 files still load (exceptions only), so
+  the tunnel keeps working with an older build's file until the lists are compiled again.
+  An older build rejects a version 2 file and blocks nothing by DNS until it compiles its
+  own.
+- **Lists are compiled again after an app update.** At launch the app compares its build
+  number (CFBundleVersion, the CI run number) and the ids of its built-in lists with
+  those of the build that ran before. When either differs it records a pending settings
+  change, which compiles the lists from the cached copies at the next opportunity
+  (downloading only lists never downloaded, such as a new built-in list) and has the
+  tunnel reload them. A change to how lists are read, such as the wildcard section, so
+  reaches existing installs at once instead of with the next daily update, for one
+  compile after each update. Local builds all have build number 1 and rely on the list
+  ids and the daily update.
+- **Blocked requests are answered by `Sec-Fetch-Dest`.** For a request the filter engine
+  blocks, and an absolute-form request to a host the DNS blocklist blocks: `document` (a
+  top-level navigation) gets a short plain-text `403` (`no-store`) saying that Tollgate
+  blocked the page and that Activity can allow it; any other value, empty or unknown
+  included, gets no response (HTTP/2 resets the stream with INTERNAL_ERROR and keeps the
+  connection, HTTP/1.1 closes it), as on a blocked host's connection; no header, which is
+  how apps' own HTTP clients send requests, keeps the empty `403` with
+  `access-control-allow-origin: *`, since an SDK may retry a failed request without end
+  while an HTTP error ends it. Pages that treat a failed request as blocked, ad-block
+  test pages among them, counted the `403` as loaded. Browsers send the header only to
+  `https://` URLs, so a blocked plain `http://` request keeps the `403`. Rules without a
+  type do not apply to documents in adblock-rust (`||host^` and `$document` rules do), so
+  the page appears only for those. A blocked host's connection (the sink) still fails
+  every request, navigations included.
+- **Pass-through answered first.** A `CONNECT` to a passthrough host is answered `200` at
+  once; the dial (a lookup over DoH and a TCP connection, about 40 ms on the device) runs
+  while the client starts its TLS handshake, whose ClientHello waits in the socket. When
+  the dial fails the client connection is closed, which the client sees as a failed
+  handshake, as without the proxy, instead of a `502`. The passthrough slot is still
+  taken before answering (`503` over the cap), and `connections_passthrough` counts only
+  successful dials. The handshake still waits for the upstream, so the time until the
+  connection is usable barely changes; only the answer to the `CONNECT` no longer waits.
+- **DoH connections are reused while the device is awake.** A connection is used again
+  after up to 120 s without a request (was 30 s), unless the device slept for more than
+  1 s since its last request; nothing is sent to keep it open.
+  `tollgate_common::clock::Reading` reads, in milliseconds, a clock that counts sleep and
+  one that does not (`CLOCK_MONOTONIC_RAW` and `CLOCK_UPTIME_RAW` on Apple platforms,
+  `CLOCK_BOOTTIME` and `CLOCK_MONOTONIC` on Linux); between two readings their difference
+  is the sleep. Reuse saves a TCP and a TLS handshake on the first lookup after an idle
+  time, about 40 ms to Cloudflare and 60 ms to Quad9 from a home connection. A connection
+  the server closed is seen closed and costs nothing, and a query on one the server
+  dropped fails at once and is retried on a new one; a connection lost silently while the
+  device is awake (a NAT that drops it in under two minutes) costs the 1.5 s warm
+  deadline and marks the upstream down for 30 s. A wake or a path change still drops
+  every connection. TLS sessions were already resumed; 0-RTT is not used (it saves one
+  round trip on reconnects only, can be replayed, and servers often refuse a POST in
+  early data).
+- **Silent certificate refusals.** Some apps that pin certificates reject ours without a
+  TLS alert: they close the connection inside their certificate check (the X app for iOS
+  did for its pinned hosts, within 60 ms of starting the check), so learning from alerts
+  never saw them. The proxy follows the records it writes to the client and
+  counts a silent refusal when the handshake ends by end of stream, a reset, close_notify
+  or a fatal user_canceled after our certificate reached the client: in TLS 1.3 the first
+  encrypted record after a full ServerHello (not a HelloRetryRequest, not a resumption),
+  in TLS 1.2 the Certificate message, and only when a read of the client after that
+  write found nothing waiting (a client that closed before our answer does not count).
+  Refusals are counted (`tls_silent_refusals`, Diagnostics "Silent certificate
+  refusals") and taught to the policy, which learns a pin from refusals of the same host
+  in 3 different wall-clock seconds within 10 minutes, the window of the alert rule: a
+  client that loses a race or is suspended hangs up all its connections of that moment
+  together, while a pinning app keeps retrying, and may reach a second host only once or
+  twice each time it is used (the X app hung up on its second pinned host in two seconds
+  only), so the count must span uses. No pin is learned while any client has completed a
+  handshake with our certificate for that host in the last 10 minutes (a browser may use
+  one connection for minutes without a new handshake), and such a success clears the
+  host's pending refusals. Refusals on 4 or more hosts within 10 s are a burst with a
+  common cause (a network change, sleep, a lost race, an untrusted certificate): the
+  pending refusals are cleared, pins learned from silent refusals in that window are
+  taken back, and silent refusals teach nothing for 60 s, counted again from each burst.
+  A wake or a path change drops silent pins learned in the last 60 s and clears the
+  pending refusals. Pins learned from alerts or from upstream failures are never taken
+  back by these rules. Silent pins are saved and listed with the others; pending
+  refusals are not saved. Known limits: an app that pins 4 or more hosts and hits them
+  within 10 s is never learned this way, and a race the proxy keeps losing for a host
+  with no successful handshake in 10 minutes could be.
+- **A fifth built-in list.** StevenBlack hosts (id `stevenblack`, hosts format, DNS) adds
+  host names the AdGuard DNS filter lacks: about 34,000 more hashes, about 270 KB of
+  `domains.bin`. Built-in lists are on unless switched off, so it is on for existing
+  installs, and the compile after the update picks it up. A custom list with the address
+  of an enabled built-in list (scheme and host in any case, port, path and query) that
+  feeds the same file is skipped and its row says so; one that feeds the other file (a
+  copy of EasyPrivacy typed Domain rules, whose hosts the built-in list does not put in
+  `domains.bin`) is used, and so is any with the built-in list switched off. A built-in
+  list never downloaded starts from the cached copy of a custom list with its address, so
+  the compile after the update keeps the hosts of a StevenBlack list added by hand even
+  when the download fails, and needs no download when it compiles from the cached copies.
+- **Hosts files are recognized by their content.** A custom list added with the wrong
+  type compiles into nothing useful: a hosts file added as Request rules became about
+  75,000 request rules that blocked nothing and grew `engine.dat`, which the tunnel
+  loads, from 4.8 to 8.8 MB. After each download the app asks
+  `tollgate_filter::detect_format` (FFI `detect_list_format`) how a custom list is
+  written: blank lines, `!` and `#` comments and `[` headers are left out; a line that is
+  an IP address followed by a name, or a single host name with an optional `# comment`,
+  is a hosts line, and anything else adblock syntax; the majority decides, and a tie or no
+  rule lines gives no verdict. A hosts file typed Request rules or Domain rules is
+  compiled as a Hosts file, and adblock rules typed Hosts file as Domain rules, which
+  keeps them in the DNS blocklist the user chose and out of the tunnel's engine. The
+  corrected type is saved to `lists.json` after a successful compile, unless the user
+  changed that list meanwhile, and a warning under the Filter lists status says what was
+  changed. A list that is half names and half URL rules goes to DNS and loses its URL
+  rules.
+- **When learned pins are cleared.** Turning HTTPS filtering on used to clear every
+  learned pin. Now it does only after the app itself turned filtering off because iOS did
+  not trust the certificate (recorded as `tunnel.pinsLearnedWhileUntrusted` in the app's
+  `UserDefaults`, and cleared once `learned-pins.json` is gone): while the certificate is
+  untrusted every app rejects the intercepted connections, so pins learned then may be
+  wrong. Pins learned with a trusted certificate name hosts that cannot be filtered, and
+  learning them again costs failed connections, so turning filtering off and on keeps
+  them. Turning filtering off by hand while the certificate is untrusted, before the app
+  notices, does not set the record; Forget all and the 30-day expiry cover that.
+- On-device checks: `docs/experiments/alpha2.md` (E23 to E30).

@@ -1,5 +1,6 @@
-//! Pin learning: only TLS alerts that reject our certificate count, and two of them within
-//! ten minutes make the host a learned pin that is passed through from then on.
+//! Pin learning from TLS alerts: only alerts that reject our certificate count, and two of
+//! them within ten minutes make the host a learned pin that is passed through from then on.
+//! Clients that hang up without an alert are in `silent.rs`.
 
 mod support;
 

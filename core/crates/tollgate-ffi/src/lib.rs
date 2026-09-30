@@ -28,7 +28,9 @@ pub use engine::{
     LOCAL_PENDING, LocalResolver, PINS_SAVE_INTERVAL, PacketSink, RUNTIME_THREAD, Stats,
 };
 pub use error::{TollgateError, catch_panic, panic_message};
-pub use lists::{CompileReport, ListFormat, ListInput, ListTarget, compile_lists};
+pub use lists::{
+    CompileReport, ListFormat, ListInput, ListTarget, compile_lists, detect_list_format,
+};
 pub use logging::{CoreLogger, LogLevel, set_logger};
 
 /// Version of the Rust core, shown in the app and logged by the tunnel.

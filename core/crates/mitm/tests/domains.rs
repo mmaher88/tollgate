@@ -24,7 +24,7 @@ use tollgate_filter::{DomainSet, ListFormat, ListSource};
 use tollgate_mitm::{CertAuthority, ProxyContext, ServeOptions};
 use tollgate_policy::{Config, Decision, RejectionKind};
 
-use support::client::{get, proxy_get, read_to_close, wait_for};
+use support::client::{get, proxy_get, proxy_try_get, read_to_close, wait_for};
 use support::tunnel::{
     alpn, connect, connect_status, http2, peer_issuer, reset_reason, send2, tls, tls_config,
 };
@@ -208,6 +208,35 @@ async fn an_http1_request_to_a_blocked_host_gets_no_response_and_the_connection_
     assert_eq!(s.proxy.stats().dns_blocked, 1);
     assert_eq!(dns_blocks(&s.events), ["ads.example"]);
     assert_not_intercepted(&s);
+}
+
+/// A wildcard block in the DNS list (`||log*.example^`) blocks the hosts it matches like
+/// any other block, and its exceptions still win.
+#[tokio::test]
+async fn hosts_a_wildcard_block_matches_get_a_blocked_connection() {
+    let s = setup_with(Config::default(), |ctx, _| {
+        ctx.domains.store(Some(domains(
+            "||log*.ads.example^\n@@||log-ok*.ads.example^\n",
+        )));
+    })
+    .await;
+    let tls = s
+        .tls(&s.target("log1.ads.example"), "log1.ads.example", &[b"h2"])
+        .await;
+    assert_eq!(peer_issuer(&tls), TOLLGATE);
+    drop(tls);
+    assert_eq!(s.proxy.stats().dns_blocked, 1);
+    assert_eq!(dns_blocks(&s.events), ["log1.ads.example"]);
+    assert_not_intercepted(&s);
+
+    for name in ["blog.ads.example", "log-ok1.ads.example"] {
+        let tls = s.tls(&s.target(name), name, &[b"h2"]).await;
+        let mut h2 = http2(tls).await;
+        let reply = send2(&mut h2, get(&s.url(name, "/"), &[])).await;
+        assert_eq!(reply.status, StatusCode::OK, "{name}");
+    }
+    assert_eq!(s.proxy.stats().dns_blocked, 1);
+    assert_eq!(s.proxy.stats().connections_intercepted, 2);
 }
 
 #[tokio::test]
@@ -529,8 +558,29 @@ async fn absolute_form_requests_to_a_blocked_host_get_403() {
     let s = setup(Config::default()).await;
     let reply = proxy_get(s.proxy.addr, "http://ads.example/pixel.gif", &[]).await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(reply.headers["access-control-allow-origin"], "*");
     let reply = proxy_get(s.proxy.addr, "https://ads.example/pixel.gif", &[]).await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     assert_eq!(s.proxy.stats().dns_blocked, 2);
+    assert_eq!(s.origin.connections(), 0);
+}
+
+/// Like a request the filter engine blocks: a browser's navigation gets a page saying that
+/// Tollgate blocked it, and its other requests no response.
+#[tokio::test]
+async fn absolute_form_requests_to_a_blocked_host_from_a_browser() {
+    let s = setup(Config::default()).await;
+    for url in ["http://ads.example/", "https://ads.example/"] {
+        let page = proxy_get(s.proxy.addr, url, &[("sec-fetch-dest", "document")]).await;
+        assert_eq!(page.status, StatusCode::FORBIDDEN, "{url}");
+        assert!(
+            page.body.starts_with("Tollgate blocked this page."),
+            "{url}"
+        );
+        let script = proxy_try_get(s.proxy.addr, url, &[("sec-fetch-dest", "script")]).await;
+        assert!(script.is_none(), "{url}: {script:?}");
+    }
+    assert_eq!(s.proxy.stats().dns_blocked, 4);
+    assert_eq!(dns_blocks(&s.events).len(), 4);
     assert_eq!(s.origin.connections(), 0);
 }

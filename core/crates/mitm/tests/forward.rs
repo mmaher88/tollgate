@@ -11,11 +11,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tollgate_mitm::{CertAuthority, ServeOptions, accept_backoff};
 use tollgate_policy::Config;
 
-use support::client::{proxy_get, proxy_get_raw, read_to_close, wait_for};
+use support::client::{
+    proxy_get, proxy_get_raw, proxy_get_raw_with, proxy_try_get, read_to_close, wait_for,
+};
 use support::{origin, proxy};
 
 const RULES: &str = "\
 /ads/*
+! Rules without a type skip top-level documents; this one blocks them.
+/ads/*$document
 /track/*$image
 /banner/*$domain=news.test
 ";
@@ -72,6 +76,52 @@ async fn blocked_request_gets_an_empty_403_readable_by_any_origin() {
     assert_eq!(proxy.stats().http_blocked, 1);
 }
 
+/// Browsers send `Sec-Fetch-Dest` and apps do not. A blocked navigation gets a page that
+/// says so; any other blocked request from a browser gets no response, which the page sees
+/// as a network error; an app gets the empty `403`.
+#[tokio::test]
+async fn a_blocked_request_is_answered_by_its_fetch_destination() {
+    let origin = origin::http().await;
+    let proxy = start(ServeOptions::default()).await;
+    let url = format!("http://127.0.0.1:{}/ads/page", origin.port());
+
+    let page = proxy_get(proxy.addr, &url, &[("sec-fetch-dest", "document")]).await;
+    assert_eq!(page.status, StatusCode::FORBIDDEN);
+    assert_eq!(page.headers["content-type"], "text/plain; charset=utf-8");
+    assert_eq!(page.headers["cache-control"], "no-store");
+    assert!(
+        page.body.starts_with("Tollgate blocked this page."),
+        "{}",
+        page.body
+    );
+
+    let others = [
+        "script",
+        "image",
+        "style",
+        "font",
+        "iframe",
+        "empty",
+        "video",
+        "websocket",
+    ];
+    for dest in others {
+        // The connection closes without a byte written.
+        let response = proxy_get_raw_with(proxy.addr, &url, &[("sec-fetch-dest", dest)]).await;
+        assert_eq!(String::from_utf8_lossy(&response), "", "{dest}");
+    }
+
+    let app = proxy_get(proxy.addr, &url, &[]).await;
+    assert_eq!(app.status, StatusCode::FORBIDDEN);
+    assert_eq!(app.headers["access-control-allow-origin"], "*");
+    assert_eq!(app.body, "");
+
+    assert_eq!(origin.connections(), 0);
+    let requests = others.len() as u64 + 2;
+    assert_eq!(proxy.stats().http_requests, requests);
+    assert_eq!(proxy.stats().http_blocked, requests);
+}
+
 #[tokio::test]
 async fn request_type_comes_from_fetch_dest_then_accept_then_extension() {
     let origin = origin::http().await;
@@ -86,8 +136,15 @@ async fn request_type_comes_from_fetch_dest_then_accept_then_extension() {
     assert_eq!(status("/track/p", &image).await, StatusCode::FORBIDDEN);
     let html = [("accept", "text/html")];
     assert_eq!(status("/track/p", &html).await, StatusCode::OK);
+    // A browser's blocked image gets no response (see the test above).
     let dest_first = [("sec-fetch-dest", "image"), ("accept", "text/html")];
-    assert_eq!(status("/track/p", &dest_first).await, StatusCode::FORBIDDEN);
+    assert!(
+        proxy_try_get(proxy.addr, &url("/track/p"), &dest_first)
+            .await
+            .is_none()
+    );
+    let dest_first = [("sec-fetch-dest", "document"), ("accept", "image/webp")];
+    assert_eq!(status("/track/p", &dest_first).await, StatusCode::OK);
     assert_eq!(status("/track/p.gif", &[]).await, StatusCode::FORBIDDEN);
     assert_eq!(status("/track/p", &[]).await, StatusCode::OK);
 }

@@ -7,9 +7,11 @@ use std::time::{Duration, Instant};
 use hickory_proto::rr::RecordType;
 use support::doh_server::{Mode, TestServer, silent_upstream, trusting};
 use support::{decode, query};
+use tollgate_common::clock::Reading;
 use tollgate_common::resolve::Resolve;
 use tollgate_dns::{
-    COLD_DEADLINE, DOWN_FOR, DohError, DohResolver, HostResolver, MAX_IDLE, WARM_DEADLINE,
+    COLD_DEADLINE, DOWN_FOR, DohError, DohResolver, HostResolver, MAX_IDLE, MAX_SLEEP,
+    WARM_DEADLINE,
 };
 
 fn assert_between(elapsed: Duration, low: Duration, high: Duration) {
@@ -23,18 +25,48 @@ fn assert_between(elapsed: Duration, low: Duration, high: Duration) {
 fn deadlines() {
     assert_eq!(COLD_DEADLINE, Duration::from_millis(2000));
     assert_eq!(WARM_DEADLINE, Duration::from_millis(1500));
-    assert_eq!(MAX_IDLE, Duration::from_secs(30));
+    assert_eq!(MAX_IDLE, Duration::from_secs(120));
+    assert_eq!(MAX_SLEEP, Duration::from_secs(1));
     assert_eq!(DOWN_FOR, Duration::from_secs(30));
 }
 
-/// A resolver whose clock the test moves by hand.
-fn with_manual_clock(resolver: DohResolver) -> (DohResolver, Arc<AtomicU64>) {
-    let now = Arc::new(AtomicU64::new(1_000));
-    let clock = now.clone();
-    (
-        resolver.with_clock(move || clock.load(Ordering::SeqCst)),
-        now,
-    )
+/// The resolver's clocks, moved by hand: time passes with the device awake or asleep.
+#[derive(Clone)]
+struct ManualClock {
+    total_ms: Arc<AtomicU64>,
+    awake_ms: Arc<AtomicU64>,
+}
+
+impl ManualClock {
+    fn read(&self) -> Reading {
+        Reading {
+            total_ms: self.total_ms.load(Ordering::SeqCst),
+            awake_ms: self.awake_ms.load(Ordering::SeqCst),
+        }
+    }
+
+    /// `time` passes with the device awake.
+    fn awake(&self, time: Duration) {
+        let ms = time.as_millis() as u64;
+        self.total_ms.fetch_add(ms, Ordering::SeqCst);
+        self.awake_ms.fetch_add(ms, Ordering::SeqCst);
+    }
+
+    /// The device sleeps for `time`.
+    fn sleep(&self, time: Duration) {
+        self.total_ms
+            .fetch_add(time.as_millis() as u64, Ordering::SeqCst);
+    }
+}
+
+/// A resolver whose clocks the test moves by hand.
+fn with_manual_clock(resolver: DohResolver) -> (DohResolver, ManualClock) {
+    let clock = ManualClock {
+        total_ms: Arc::new(AtomicU64::new(1_000_000)),
+        awake_ms: Arc::new(AtomicU64::new(500_000)),
+    };
+    let read = clock.clone();
+    (resolver.with_clock(move || read.read()), clock)
 }
 
 #[tokio::test]
@@ -95,7 +127,7 @@ async fn a_hung_warm_connection_marks_its_upstream_down() {
 async fn a_down_upstream_is_probed_in_the_background_when_its_time_is_up() {
     let first = TestServer::start().await;
     let second = TestServer::start().await;
-    let (resolver, now) = with_manual_clock(trusting(
+    let (resolver, clock) = with_manual_clock(trusting(
         vec![first.upstream(), second.upstream()],
         &[&first, &second],
     ));
@@ -106,14 +138,14 @@ async fn a_down_upstream_is_probed_in_the_background_when_its_time_is_up() {
 
     // Still down: the answer comes from the second upstream without touching the first.
     first.set_mode(Mode::Answer);
-    now.fetch_add(DOWN_FOR.as_secs() - 1, Ordering::SeqCst);
+    clock.awake(DOWN_FOR - Duration::from_secs(1));
     resolver.resolve(&query).await.unwrap();
     assert_eq!(first.requests(), 1);
     assert_eq!(second.requests(), 2);
 
     // The time is up: this query does not wait for the first upstream, which is probed
     // on the side.
-    now.fetch_add(2, Ordering::SeqCst);
+    clock.awake(Duration::from_secs(2));
     let start = Instant::now();
     resolver.resolve(&query).await.unwrap();
     assert!(
@@ -141,11 +173,12 @@ async fn a_down_upstream_is_probed_in_the_background_when_its_time_is_up() {
 async fn a_failed_probe_keeps_the_upstream_down() {
     let (_listener, silent) = silent_upstream().await;
     let server = TestServer::start().await;
-    let (resolver, now) = with_manual_clock(trusting(vec![silent, server.upstream()], &[&server]));
+    let (resolver, clock) =
+        with_manual_clock(trusting(vec![silent, server.upstream()], &[&server]));
     let query = query(1, "example.com.", RecordType::A, None);
     resolver.resolve(&query).await.unwrap();
 
-    now.fetch_add(DOWN_FOR.as_secs() + 1, Ordering::SeqCst);
+    clock.awake(DOWN_FOR + Duration::from_secs(1));
     resolver.resolve(&query).await.unwrap();
     // Let the probe time out.
     tokio::time::sleep(COLD_DEADLINE + Duration::from_millis(300)).await;
@@ -399,33 +432,64 @@ async fn reconnects_after_the_server_closes_an_idle_connection() {
     assert_eq!(server.requests(), 2);
 }
 
-#[tokio::test]
-async fn a_connection_idle_longer_than_max_idle_is_replaced_before_use() {
-    let server = TestServer::start().await;
-    let now = Arc::new(AtomicU64::new(1_000));
-    let clock = now.clone();
-    let resolver = trusting(vec![server.upstream()], &[&server])
-        .with_clock(move || clock.load(Ordering::SeqCst));
-    let query = query(1, "example.com.", RecordType::A, None);
-    resolver.resolve(&query).await.unwrap();
-
-    // Idle for less than MAX_IDLE: the connection is used again.
-    now.fetch_add(MAX_IDLE.as_secs() - 1, Ordering::SeqCst);
-    resolver.resolve(&query).await.unwrap();
-    assert_eq!(server.connections(), 1);
-    // Idle time counts from the last request, not from when the connection opened.
-    now.fetch_add(MAX_IDLE.as_secs() - 1, Ordering::SeqCst);
-    resolver.resolve(&query).await.unwrap();
-    assert_eq!(server.connections(), 1);
-
-    // The device slept: the first connection is dead, and has been idle too long.
+/// Asserts that a query on `resolver`, whose first connection to `server` hangs, is
+/// answered at once on a second connection, without sending anything on the first.
+async fn answered_on_a_new_connection(resolver: &DohResolver, server: &TestServer) {
+    let requests = server.requests();
     server.set_mode(Mode::HangConnection(1));
-    now.fetch_add(MAX_IDLE.as_secs() + 1, Ordering::SeqCst);
+    let query = query(1, "example.com.", RecordType::A, None);
     let start = Instant::now();
     let answer = resolver.resolve(&query).await.unwrap();
     assert!(start.elapsed() < COLD_DEADLINE, "{:?}", start.elapsed());
     assert_eq!(decode(&answer).answers.len(), 1);
     assert_eq!(server.connections(), 2);
     // The dead connection never saw the query.
-    assert_eq!(server.requests(), 4);
+    assert_eq!(server.requests(), requests + 1);
+}
+
+#[tokio::test]
+async fn a_connection_idle_while_awake_is_used_again_up_to_max_idle() {
+    let server = TestServer::start().await;
+    let (resolver, clock) = with_manual_clock(trusting(vec![server.upstream()], &[&server]));
+    let query = query(1, "example.com.", RecordType::A, None);
+    resolver.resolve(&query).await.unwrap();
+
+    // Idle for less than MAX_IDLE: the connection is used again.
+    clock.awake(MAX_IDLE - Duration::from_secs(1));
+    resolver.resolve(&query).await.unwrap();
+    assert_eq!(server.connections(), 1);
+    // Idle time counts from the last request, not from when the connection opened.
+    clock.awake(MAX_IDLE - Duration::from_secs(1));
+    resolver.resolve(&query).await.unwrap();
+    assert_eq!(server.connections(), 1);
+
+    // Idle for longer: not trusted to be alive (here it is dead).
+    clock.awake(MAX_IDLE + Duration::from_secs(1));
+    answered_on_a_new_connection(&resolver, &server).await;
+}
+
+/// After the device slept, however briefly, the connection is probably dead: the next
+/// query opens a new one instead of waiting out the warm deadline on the old one.
+#[tokio::test]
+async fn a_connection_is_not_used_again_after_the_device_slept() {
+    let server = TestServer::start().await;
+    let (resolver, clock) = with_manual_clock(trusting(vec![server.upstream()], &[&server]));
+    let query = query(1, "example.com.", RecordType::A, None);
+    resolver.resolve(&query).await.unwrap();
+
+    // A difference between the clocks up to MAX_SLEEP is not taken for sleep.
+    clock.awake(Duration::from_secs(5));
+    clock.sleep(MAX_SLEEP);
+    resolver.resolve(&query).await.unwrap();
+    assert_eq!(server.connections(), 1);
+
+    clock.awake(Duration::from_secs(5));
+    clock.sleep(MAX_SLEEP + Duration::from_millis(500));
+    answered_on_a_new_connection(&resolver, &server).await;
+
+    // The new connection is used again while the device stays awake.
+    server.set_mode(Mode::Answer);
+    clock.awake(Duration::from_secs(60));
+    resolver.resolve(&query).await.unwrap();
+    assert_eq!(server.connections(), 2);
 }

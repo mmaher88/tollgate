@@ -69,7 +69,10 @@ struct SettingsView: View {
         allowCount = config.allowlist.count
         passthroughCount = config.passthrough.count
         let settings = ListSettings.load()
-        enabledLists = FilterLists.defaults.filter(settings.isEnabled).count + settings.custom.count
+        // A custom copy of an enabled built-in list feeding the same file is skipped, so it
+        // does not count (see ListSettings.builtInDuplicate).
+        enabledLists = FilterLists.defaults.filter(settings.isEnabled).count
+            + settings.custom.filter { settings.builtInDuplicate(of: $0) == nil }.count
     }
 }
 
@@ -108,6 +111,10 @@ struct FilterListsView: View {
                         Text(list.name)
                         Text("\(list.kind.label) · \(list.url)")
                             .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        if let builtIn = settings.builtInDuplicate(of: list) {
+                            Text("Not used: the same list as the built-in \(builtIn.name). You can delete it.")
+                                .font(.caption).foregroundStyle(.orange)
+                        }
                     }
                 }
                 .onDelete { offsets in
@@ -140,6 +147,9 @@ struct FilterListsView: View {
             }
         }
         .navigationTitle("Filter lists")
+        // The updater saved a corrected list type: show it, and keep the next save here
+        // from writing the old type back.
+        .onChange(of: lists.settingsRevision) { _, _ in settings = ListSettings.load() }
         .sheet(isPresented: $adding) {
             AddListView { list in
                 settings.custom.append(list)
@@ -200,7 +210,7 @@ struct AddListView: View {
                 Picker("Type", selection: $kind) {
                     ForEach(CustomList.Kind.allCases) { Text($0.label).tag($0) }
                 }
-                Text("Request rules use adblock syntax and filter requests (HTTPS sites need HTTPS filtering). Domain rules and hosts files block names for every app.")
+                Text("Request rules use adblock syntax and filter requests (HTTPS sites need HTTPS filtering). Domain rules and hosts files block names for every app. If the downloaded list turns out to be a hosts file, or adblock rules when you picked Hosts file, its type is corrected.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             .navigationTitle("Add a list")

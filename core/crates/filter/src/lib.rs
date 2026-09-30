@@ -2,15 +2,18 @@
 //! blocklist, and compiling both from filter lists.
 
 mod compile;
+mod detect;
 mod domain_rules;
 mod domain_set;
 mod engine;
 mod request_type;
+mod wildcard;
 
 use std::path::PathBuf;
 
 pub use compile::{CompileReport, DOMAINS_FILE, ENGINE_FILE, compile, compile_split};
-pub use domain_rules::DomainRules;
+pub use detect::detect_format;
+pub use domain_rules::{DomainRules, MAX_UNKEYED_PATTERNS, MAX_WILDCARD_PATTERNS};
 pub use domain_set::{DomainSet, DomainSetError};
 pub use engine::{
     FilterEngine, REGEX_CLEANUP_INTERVAL, REGEX_DISCARD_UNUSED, Verdict, network_rule_count,

@@ -5,11 +5,11 @@ use std::sync::Arc;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{CONNECTION, HeaderValue};
-use hyper::{Request, Response, StatusCode, Uri, Version};
+use hyper::{HeaderMap, Request, Response, StatusCode, Uri, Version};
 use tollgate_common::clock::unix_secs;
 use tollgate_policy::Decision;
 
-use crate::body::{Body, DoneBody, blocked, status, text};
+use crate::body::{Body, DoneBody, blocked, blocked_page, status, text};
 use crate::filtering::is_blocked;
 use crate::idle::InFlight;
 use crate::intercept::Origin;
@@ -36,12 +36,13 @@ pub(crate) enum NoResponse {
     /// connection, whose `CONNECT` is now passed through.
     #[error("no response: the host is passed through from now on")]
     PassedThrough(#[source] h2::Error),
-    /// Every request on a blocked host's connection (see `crate::sink`). It does not close
-    /// the connection by itself: the HTTP/2 stream is reset with the reason carried here
-    /// and the connection stays open for the client's next request, while HTTP/1.1 closes
-    /// the connection, as after any error. Built by [`NoResponse::blocked`], whose reason is
-    /// chosen there.
-    #[error("no response: the host is blocked")]
+    /// Every request on a blocked host's connection (see `crate::sink`), and a blocked
+    /// request from a browser that is not a top-level navigation (see [`answer_blocked`]).
+    /// It does not close the connection by itself: the HTTP/2 stream is reset with the
+    /// reason carried here and the connection stays open for the client's next request,
+    /// while HTTP/1.1 closes the connection, as after any error. Built by
+    /// [`NoResponse::blocked`], whose reason is chosen there.
+    #[error("no response: blocked")]
     Blocked(#[source] h2::Error),
     /// A request on a blocked host's connection after the DNS blocklist was reloaded, which
     /// may no longer block the host. The client connection closes too (HTTP/2 GOAWAY), and
@@ -59,9 +60,10 @@ impl NoResponse {
         NoResponse::PassedThrough(reason.into())
     }
 
-    /// For a request to a blocked host. The HTTP/2 stream is reset with INTERNAL_ERROR,
-    /// which says only that the request failed, as [`NoResponse::Closed`] says for an
-    /// unreachable upstream, so a blocked request fails like any other network error.
+    /// For a request to a blocked host, and for a blocked request from a browser (see
+    /// [`answer_blocked`]). The HTTP/2 stream is reset with INTERNAL_ERROR, which says
+    /// only that the request failed, as [`NoResponse::Closed`] says for an unreachable
+    /// upstream, so a blocked request fails like any other network error.
     /// The other reasons say more than that: REFUSED_STREAM tells the client that the
     /// request was never processed and may be retried, on a new connection if need be (RFC
     /// 9113, section 8.7), and HTTP_1_1_REQUIRED asks for a retry over HTTP/1.1 on a new
@@ -92,7 +94,8 @@ impl NoResponse {
 /// pin, gets [`NoResponse`] rather than a `502`: the proxy answered the `CONNECT` and the
 /// TLS handshake itself, so a `502` over its trusted leaf would be an ordinary server
 /// response to the browser, shown as an empty page, and would keep it from falling back
-/// from `https://` to `http://`.
+/// from `https://` to `http://`. A blocked request from a browser that is not a
+/// navigation gets [`NoResponse`] too (see [`answer_blocked`]).
 pub(crate) async fn handle(
     state: Arc<State>,
     origin: Arc<Origin>,
@@ -100,11 +103,18 @@ pub(crate) async fn handle(
     request: Request<Incoming>,
 ) -> Result<Response<Body>, NoResponse> {
     let http1 = request.version() < Version::HTTP_2;
-    let (mut response, close) = match respond(&state, &origin, request).await {
+    // The client connection closes after this request when its host is now passed through
+    // (a pin learned on another connection, or by this request), so the client's next
+    // request opens a new `CONNECT` instead of coming back here.
+    let passed_through = matches!(
+        state.ctx.policy.classify(&origin.name, unix_secs()),
+        Decision::Passthrough(_)
+    );
+    let (mut response, untrusted) = match forward(&state, &origin, request).await {
         Ok(answer) => answer,
         Err(e) => {
             // HTTP/2 gets GOAWAY; HTTP/1.1 closes after any service error anyway.
-            if e.closes_connection() {
+            if passed_through || e.closes_connection() {
                 in_flight.request_close();
             }
             drop(in_flight);
@@ -112,7 +122,7 @@ pub(crate) async fn handle(
         }
     };
     // An upgraded WebSocket no longer belongs to the HTTP connection; leave it alone.
-    if close && response.status() != StatusCode::SWITCHING_PROTOCOLS {
+    if (passed_through || untrusted) && response.status() != StatusCode::SWITCHING_PROTOCOLS {
         // HTTP/2 gets GOAWAY; HTTP/1.1 closes after this response, which says so.
         in_flight.request_close();
         if http1 {
@@ -124,23 +134,40 @@ pub(crate) async fn handle(
     Ok(response.map(|body| DoneBody::new(body, move || drop(in_flight)).boxed_unsync()))
 }
 
-/// The response, and whether the client connection should close after it: its host is
-/// now passed through (a pin learned on another connection, or by this request), so the
-/// client's next request should open a new `CONNECT` instead of coming back here.
-async fn respond(
-    state: &State,
-    origin: &Origin,
-    request: Request<Incoming>,
-) -> Result<(Response<Body>, bool), NoResponse> {
-    let passed_through = matches!(
-        state.ctx.policy.classify(&origin.name, unix_secs()),
-        Decision::Passthrough(_)
-    );
-    let (response, untrusted) = forward(state, origin, request).await?;
-    Ok((response, passed_through || untrusted))
+/// The answer to a request that the filter engine blocks, or, in absolute form, whose host
+/// the DNS blocklist blocks, chosen from the request's `Sec-Fetch-Dest` header. Browsers,
+/// WebKit among them, send it with every request to an `https://` URL (Fetch Metadata),
+/// and apps' own HTTP clients send none:
+///
+/// - `document`, a top-level navigation, gets [`blocked_page`], which says that Tollgate
+///   blocked it.
+/// - Any other value (`script`, `image`, `style`, `font`, `iframe`, `websocket`, `empty`
+///   for `fetch()` and XHR, and so on) gets no response ([`NoResponse::blocked`]): the
+///   HTTP/2 stream is reset and the connection stays open, and an HTTP/1.1 connection
+///   closes. The page sees a network error, as it would with a blocker inside the browser,
+///   so pages that treat a failed request as blocked, such as ad-block tests, see it
+///   blocked; to them a `403` is a response, so the request loaded. A request that fails
+///   on a working connection gives iOS no reason to try another network (see
+///   `crate::sink`).
+/// - No header, an app, gets [`blocked`]'s empty `403`: an SDK that retries network errors
+///   could retry a request that fails without a response again and again, while an HTTP
+///   error ends it.
+///
+/// Stats and the blocked log do not depend on the answer: `crate::filtering` records the
+/// block before this is called.
+pub(crate) fn answer_blocked(headers: &HeaderMap) -> Result<Response<Body>, NoResponse> {
+    match headers.get(SEC_FETCH_DEST) {
+        None => Ok(blocked()),
+        Some(dest) if dest.as_bytes().eq_ignore_ascii_case(b"document") => Ok(blocked_page()),
+        Some(_) => Err(NoResponse::blocked()),
+    }
 }
 
-/// Filters and forwards one request. The flag is true when a WebSocket upstream's TLS
+/// The Fetch Metadata request header that says what a browser will do with the response.
+const SEC_FETCH_DEST: &str = "sec-fetch-dest";
+
+/// Filters and forwards one request; a blocked one, WebSocket upgrades included, is
+/// answered by [`answer_blocked`]. The flag is true when a WebSocket upstream's TLS
 /// failed in a way that makes the host a learned pin (see `upstream::needs_passthrough`);
 /// any other request that teaches a pin gets [`NoResponse::PassedThrough`].
 async fn forward(
@@ -175,7 +202,7 @@ async fn forward(
         request.headers(),
         forced_type,
     ) {
-        return Ok((blocked(), false));
+        return answer_blocked(request.headers()).map(|response| (response, false));
     }
     if websocket {
         return Ok(websocket::forward(state, origin.target(), request).await);
@@ -274,7 +301,7 @@ mod tests {
     use std::io;
 
     use http_body_util::BodyExt;
-    use hyper::header::{CACHE_CONTROL, CONTENT_TYPE};
+    use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE};
     use rustls::CertificateError;
 
     use super::*;
@@ -289,6 +316,52 @@ mod tests {
     async fn text(response: Response<Body>) -> String {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    fn fetch_dest(value: Option<&'static str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = value {
+            headers.insert(SEC_FETCH_DEST, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    #[tokio::test]
+    async fn a_blocked_navigation_gets_a_page_that_says_so() {
+        for dest in ["document", "Document"] {
+            let response = answer_blocked(&fetch_dest(Some(dest))).unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let headers = response.headers();
+            assert_eq!(headers[CONTENT_TYPE], "text/plain; charset=utf-8");
+            assert_eq!(headers[CACHE_CONTROL], "no-store");
+            assert!(
+                text(response)
+                    .await
+                    .starts_with("Tollgate blocked this page.")
+            );
+        }
+    }
+
+    #[test]
+    fn other_blocked_requests_from_a_browser_get_no_response() {
+        let dests = "empty script image style font iframe frame video audio websocket worker";
+        // A value the Fetch standard does not define, and an empty one.
+        for dest in dests.split(' ').chain(["unknown", ""]) {
+            let answer = answer_blocked(&fetch_dest(Some(dest)));
+            let Err(no_response) = answer else {
+                panic!("{dest:?}: {answer:?}");
+            };
+            assert!(matches!(no_response, NoResponse::Blocked(_)), "{dest:?}");
+            assert!(!no_response.closes_connection(), "{dest:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blocked_request_from_an_app_gets_an_empty_403() {
+        let response = answer_blocked(&fetch_dest(None)).unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(text(response).await, "");
     }
 
     #[tokio::test]

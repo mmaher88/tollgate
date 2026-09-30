@@ -24,6 +24,7 @@ fn snapshot_copies_each_counter_into_its_own_field() {
         &stats.connections_passthrough,
         &stats.tls_client_rejections,
         &stats.tls_abandoned_after_handshake,
+        &stats.tls_silent_refusals,
     ];
     for (i, counter) in counters.iter().enumerate() {
         counter.fetch_add(i as u64 + 1, Ordering::Relaxed);
@@ -43,6 +44,7 @@ fn snapshot_copies_each_counter_into_its_own_field() {
             connections_passthrough: 10,
             tls_client_rejections: 11,
             tls_abandoned_after_handshake: 12,
+            tls_silent_refusals: 13,
         }
     );
 }

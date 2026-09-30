@@ -19,6 +19,10 @@ pub struct Stats {
     pub connections_passthrough: AtomicU64,
     pub tls_client_rejections: AtomicU64,
     pub tls_abandoned_after_handshake: AtomicU64,
+    /// Intercepted clients that hung up during the TLS handshake, without an alert, after
+    /// our certificate reached them. Pinning apps do; so do clients that no longer need
+    /// the connection.
+    pub tls_silent_refusals: AtomicU64,
 }
 
 /// A copy of every counter at one moment.
@@ -36,6 +40,7 @@ pub struct StatsSnapshot {
     pub connections_passthrough: u64,
     pub tls_client_rejections: u64,
     pub tls_abandoned_after_handshake: u64,
+    pub tls_silent_refusals: u64,
 }
 
 impl Stats {
@@ -61,6 +66,7 @@ impl Stats {
             connections_passthrough: get(&self.connections_passthrough),
             tls_client_rejections: get(&self.tls_client_rejections),
             tls_abandoned_after_handshake: get(&self.tls_abandoned_after_handshake),
+            tls_silent_refusals: get(&self.tls_silent_refusals),
         }
     }
 }

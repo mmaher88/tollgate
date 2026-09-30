@@ -1,4 +1,7 @@
-use tollgate_filter::{DomainRules, DomainSet, ListFormat, ListSource};
+use tollgate_filter::{
+    DomainRules, DomainSet, ListFormat, ListSource, MAX_UNKEYED_PATTERNS, MAX_WILDCARD_PATTERNS,
+    detect_format,
+};
 
 fn parse(format: ListFormat, text: &str) -> DomainRules {
     DomainRules::parse(&[ListSource {
@@ -57,7 +60,6 @@ fn non_host_rules_are_skipped() {
         "|prefix.example",
         "|imp.example^$important",
         "||prefix.",
-        "||*.wildcard.example^",
         "/regex-ad[0-9]+/",
         "||path.example/ads^",
         "||opt.example^$third-party",
@@ -218,7 +220,7 @@ fn badfilter_cancels_exact_rules() {
 }
 
 #[test]
-fn wildcard_exceptions_are_kept_and_wildcard_blocks_skipped() {
+fn wildcard_exceptions_are_kept() {
     let rules = parse(
         ListFormat::Adblock,
         "||tradedoubler.com^\n\
@@ -230,9 +232,6 @@ fn wildcard_exceptions_are_kept_and_wildcard_blocks_skipped() {
          @@||gone*.example^\n\
          @@||gone*.example^$badfilter\n\
          @@||clk*.tradedoubler.com^|\n\
-         ||ad*.example^\n\
-         ||*.wildcard.example^\n\
-         ||imp*.example^$important\n\
          @@||nodot*^\n\
          @@||*.*^\n\
          @@||bad*char!.example^\n\
@@ -243,18 +242,123 @@ fn wildcard_exceptions_are_kept_and_wildcard_blocks_skipped() {
         names(&[
             "bcicl.*.evergage.com",
             "clk*.tradedoubler.com",
-            "dot*.example",
             "static-v*.trbo.com",
         ])
     );
-    assert_eq!(rules.exact_wildcard_allow, names(&["only*.example"]));
+    // An unanchored `.dot*.example^` needs the dot in front: subdomains of the matches.
+    assert_eq!(
+        rules.exact_wildcard_allow,
+        names(&["*.dot*.example", "only*.example"])
+    );
     assert!(rules.allow.is_empty());
     assert!(rules.exact_allow.is_empty());
     assert_eq!(rules.block, names(&["tradedoubler.com"]));
     assert!(rules.important.is_empty());
-    // The wildcard block, the wildcard important block, a pattern without a dot, one
-    // with nothing but wildcards, a bad character and a path.
-    assert_eq!(rules.skipped, 7);
+    assert!(rules.wildcard_block.is_empty());
+    // A pattern without a dot, one with nothing but wildcards, a bad character and a path.
+    assert_eq!(rules.skipped, 4);
+}
+
+/// Each rule's pattern means what the rule means to adblock for `https://host/`: `||`
+/// starts at the host or a label, `|` and `://` at the host, no anchor anywhere; `^` ends
+/// at the end of the host, no caret anywhere.
+#[test]
+fn wildcard_blocks_become_patterns_with_their_anchors() {
+    let rules = parse(
+        ListFormat::Adblock,
+        "||log*.tracker.example^\n\
+         ||Tracking.*.PHONE.example^|\n\
+         ||*.cdn.example^\n\
+         ||adservice.search.example.*\n\
+         ||adx-*.cloudstore.\n\
+         ||pixel*.audio.example\n\
+         ||x*.fqdn.example.^\n\
+         ||double**star.example^\n\
+         |c.blue.*.example^|\n\
+         |pipe*.example^\n\
+         ://*.cdn-edge.example^\n\
+         -ulog*.short.example^\n\
+         *ad.banner.example^\n\
+         analytics-*.stats.example\n\
+         .sub*.example^\n",
+    );
+    assert_eq!(
+        rules.wildcard_block,
+        names(&[
+            "*.cdn.example",
+            "adservice.search.example.*",
+            "adx-*.cloudstore.*",
+            "double*star.example",
+            "log*.tracker.example",
+            "pixel*.audio.example*",
+            "tracking.*.phone.example",
+            "x*.fqdn.example",
+        ])
+    );
+    assert_eq!(
+        rules.exact_wildcard_block,
+        names(&[
+            "*-ulog*.short.example",
+            "*.cdn-edge.example",
+            "*.sub*.example",
+            "*ad.banner.example",
+            "*analytics-*.stats.example*",
+            "c.blue.*.example",
+            "pipe*.example",
+        ])
+    );
+    assert!(rules.block.is_empty());
+    assert!(rules.exact_block.is_empty());
+    assert_eq!(rules.skipped, 0);
+}
+
+#[test]
+fn wildcard_blocks_that_cannot_be_patterns_are_skipped() {
+    let skipped = [
+        // `$important` would need a section of its own.
+        "||imp*.example^$important",
+        "|imp*.example^$important",
+        // Other options, paths, ports and characters no host has.
+        "||opt*.example^$third-party",
+        "||path*.example/ads",
+        "||port*.example:8080^",
+        "||bad*char!.example^",
+        "||tail.example^*",
+        // A `|` that ends the URL, not the host: never `https://host/`.
+        "||end*.example|",
+        // No dot, only wildcards and dots, an empty label, an address.
+        "||ads*^",
+        "||*.*^",
+        "||a*..example^",
+        "||10.0.*.1^",
+    ];
+    let rules = parse(ListFormat::Adblock, &skipped.join("\n"));
+    assert_eq!(
+        rules,
+        DomainRules {
+            skipped: skipped.len() as u64,
+            ..DomainRules::default()
+        }
+    );
+}
+
+#[test]
+fn badfilter_cancels_wildcard_rules() {
+    let rules = parse(
+        ListFormat::Adblock,
+        "||gone*.example^\n\
+         ||gone*.example^$badfilter\n\
+         |gone-exact*.example^|\n\
+         |gone-exact*.example^|$badfilter\n\
+         ||merged**.example^\n\
+         ||merged*.example^$badfilter\n\
+         ||kept*.example^\n\
+         |kept*.example^$badfilter\n\
+         @@||kept*.example^$badfilter\n",
+    );
+    assert_eq!(rules.wildcard_block, names(&["kept*.example"]));
+    assert!(rules.exact_wildcard_block.is_empty());
+    assert_eq!(rules.skipped, 0);
 }
 
 /// The AdGuard DNS filter writes some host blocks without an anchor (`name^`, the host and
@@ -286,8 +390,9 @@ fn unanchored_and_scheme_anchored_host_rules() {
     assert_eq!(rules.important, names(&["imp.example"]));
     assert_eq!(rules.exact_wildcard_allow, names(&["exc*.example"]));
     assert!(rules.wildcard_allow.is_empty());
-    // A leading `-`, the wildcard block, two rules without a caret and a path.
-    assert_eq!(rules.skipped, 6);
+    assert_eq!(rules.exact_wildcard_block, names(&["*.a-akamaihd.com"]));
+    // A leading `-`, two rules without a caret and a path.
+    assert_eq!(rules.skipped, 5);
 
     let set = DomainSet::from_bytes(rules.encode()).unwrap();
     assert!(set.is_blocked("dlsdk.appsflyer.com"));
@@ -317,4 +422,121 @@ fn badfilter_cancels_unanchored_and_scheme_anchored_rules() {
     assert!(rules.allow.is_empty());
     assert!(rules.exact_allow.is_empty());
     assert_eq!(rules.skipped, 0);
+}
+
+/// DNS lists in the wildcard domains format write one `*.name` per line for `name` and its
+/// subdomains. Such a line becomes the hashed name, like `||name^`, not a pattern that
+/// every lookup would try.
+#[test]
+fn the_wildcard_domains_format_gives_names() {
+    let text = "# Title: wildcard domains\n\
+                # Syntax: Domains Wildcard\n\
+                *.telemetry.ads.example\n\
+                *.Tracker.Example.\n\
+                *.caret.example^\n\
+                *.pipe.example^|\n\
+                *.sub.telemetry.ads.example\n\
+                @@*.ok.tracker.example^\n\
+                *.imp.example^$important\n\
+                *.gone.example\n\
+                *.gone.example$badfilter\n\
+                *.zip\n\
+                *.bad!.example\n\
+                *.10.0.0.1\n";
+    // Adblock syntax to the detector, so the app compiles a list of these typed Hosts file
+    // as Domain rules; the hosts parser reads none of its lines.
+    assert_eq!(detect_format(text), Some(ListFormat::Adblock));
+    assert!(parse(ListFormat::Hosts, text).block.is_empty());
+
+    let rules = parse(ListFormat::Adblock, text);
+    assert_eq!(
+        rules,
+        DomainRules {
+            important: names(&["imp.example"]),
+            allow: names(&["ok.tracker.example"]),
+            block: names(&[
+                "caret.example",
+                "pipe.example",
+                "telemetry.ads.example",
+                "tracker.example",
+            ]),
+            // A top-level domain, a bad character and an address.
+            skipped: 3,
+            ..DomainRules::default()
+        }
+    );
+
+    let set = DomainSet::from_bytes(rules.encode()).unwrap();
+    assert_eq!(set.pattern_count(), 0);
+    for host in [
+        "telemetry.ads.example",
+        "a.telemetry.ads.example",
+        "tracker.example",
+        "x.y.tracker.example",
+        "caret.example",
+        "imp.example",
+    ] {
+        assert!(set.is_blocked(host), "{host}");
+    }
+    for host in [
+        "telemetry.ads.example.other.example",
+        "ads.example",
+        "xtracker.example",
+        "tracker.example.net",
+        "ok.tracker.example",
+        "a.ok.tracker.example",
+        "gone.example",
+    ] {
+        assert!(!set.is_blocked(host), "{host}");
+    }
+}
+
+/// Patterns over the limits are left out: exceptions are kept first, then blocks in the
+/// order the lists give them, and patterns `$badfilter` cancels take no room.
+#[test]
+fn wildcard_patterns_are_limited() {
+    let unkeyed_over = 3;
+    let mut blocks = String::new();
+    // Unanchored and caretless: `*mid0*.example*`, with neither a head nor a tail.
+    for i in 0..MAX_UNKEYED_PATTERNS + unkeyed_over {
+        blocks += &format!("mid{i}*.example\n");
+    }
+    for i in 0..10 {
+        blocks += &format!("||gone{i}*.example^\n||gone{i}*.example^$badfilter\n");
+    }
+    for i in 0..MAX_WILDCARD_PATTERNS {
+        blocks += &format!("||k{i}*.example^\n");
+    }
+    let exceptions = "@@||ok0*.example^\n@@|ok1*.example^|\n";
+    let rules = DomainRules::parse(&[
+        ListSource {
+            name: "blocks",
+            text: &blocks,
+            format: ListFormat::Adblock,
+        },
+        ListSource {
+            name: "exceptions",
+            text: exceptions,
+            format: ListFormat::Adblock,
+        },
+    ]);
+
+    assert_eq!(rules.wildcard_allow, names(&["ok0*.example"]));
+    assert_eq!(rules.exact_wildcard_allow, names(&["ok1*.example"]));
+    let unkeyed = &rules.exact_wildcard_block;
+    assert_eq!(unkeyed.len(), MAX_UNKEYED_PATTERNS);
+    let last = MAX_UNKEYED_PATTERNS - 1;
+    assert!(unkeyed.contains(&"*mid0*.example*".to_string()));
+    assert!(unkeyed.contains(&format!("*mid{last}*.example*")));
+    assert!(!unkeyed.contains(&format!("*mid{}*.example*", last + 1)));
+    let keyed = &rules.wildcard_block;
+    let room = MAX_WILDCARD_PATTERNS - MAX_UNKEYED_PATTERNS - 2;
+    assert_eq!(keyed.len(), room);
+    assert!(keyed.contains(&"k0*.example".to_string()));
+    assert!(keyed.contains(&format!("k{}*.example", room - 1)));
+    assert!(!keyed.contains(&format!("k{room}*.example")));
+    assert!(!keyed.iter().any(|p| p.starts_with("gone")));
+    // Each pattern left out is a skipped line.
+    let left_out = unkeyed_over + (MAX_WILDCARD_PATTERNS - room);
+    assert_eq!(rules.skipped, left_out as u64);
 }
