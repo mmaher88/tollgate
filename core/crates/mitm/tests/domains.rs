@@ -274,6 +274,40 @@ async fn an_apps_http1_requests_to_a_blocked_host_get_403_on_a_connection_that_s
     assert_not_intercepted(&s);
 }
 
+/// The body of an app's request on a blocked host's connection is not read. hyper drains
+/// once what has arrived of it, so an HTTP/1.1 upload that has not all arrived when the
+/// `403` is sent gets it with `connection: close`, and the connection closes; the client
+/// still reads the `403`.
+#[tokio::test]
+async fn an_apps_http1_upload_to_a_blocked_host_gets_403_and_the_connection_closes() {
+    let s = setup(Config::default()).await;
+    let tls = s
+        .tls(&s.target("ads.example"), "ads.example", &[b"http/1.1"])
+        .await;
+    let (mut h1, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    let conn = tokio::spawn(conn);
+
+    let request = Request::post(s.url("ads.example", "/v1/batch"))
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(vec![b' '; 64 * 1024])))
+        .unwrap();
+    let response = h1.send_request(request).await.unwrap();
+    assert_eq!(response.headers()["connection"], "close");
+    let reply = read_reply(response).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(reply.body, "");
+
+    let closed = tokio::time::timeout(Duration::from_secs(5), h1.ready()).await;
+    assert!(closed.expect("the connection closes").is_err());
+    let ended = tokio::time::timeout(Duration::from_secs(5), conn).await;
+    assert!(ended.is_ok(), "the connection closes");
+
+    assert_eq!(s.proxy.stats().dns_blocked, 1);
+    assert_not_intercepted(&s);
+}
+
 #[tokio::test]
 async fn a_browsers_http1_request_to_a_blocked_host_closes_the_connection() {
     let s = setup(Config::default()).await;

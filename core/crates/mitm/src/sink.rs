@@ -17,8 +17,12 @@
 //! error, as a refused `CONNECT` was, so pages that treat a failed request as blocked still
 //! do. An app's request, which carries no such header, gets the empty `403` of a request
 //! the filter engine blocks, so an SDK that retries network errors stops, and the
-//! connection stays open. To iOS the connection works either way, so it has no reason to
-//! try another network.
+//! connection stays open. Its body is not read, though: hyper drains once what has arrived
+//! of it and otherwise gives up on the connection. So an HTTP/1.1 request whose body has
+//! not all arrived when the answer is sent (in tests, a body of 16 KiB or more, which no
+//! longer fits in the TLS record of the request's head) gets the `403` with `connection:
+//! close`, and the connection closes; the client still reads the `403`. To iOS the
+//! connection works either way, so it has no reason to try another network.
 //!
 //! A client whose ClientHello offers ALPN protocols but no HTTP one (an app's own protocol
 //! over TLS) would fail the handshake if the proxy insisted on HTTP, so it gets no ALPN

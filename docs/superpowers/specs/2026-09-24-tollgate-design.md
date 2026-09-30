@@ -1075,15 +1075,18 @@ section wins.
   same app sent nothing again after the `403` of two requests the filter engine blocked.
   A blocked host's connection now answers each request by `answer_on_blocked_connection`:
   no `Sec-Fetch-Dest` (an app) gets the empty `403` with `access-control-allow-origin: *`
-  that `answer_blocked` gives an app, and the connection stays open, HTTP/1.1 included;
-  any value, `document` included, still gets no response, so a navigation to a
-  DNS-blocked host still shows the browser's own error page, as with HTTPS filtering off
-  (the blocked page stays for filter-engine blocks and absolute-form requests). After a
-  list reload the next request is still refused with `REFUSED_STREAM` and the connection
-  closes. Nothing is dialed, the block is still counted and recorded once, at the
-  `CONNECT`, and the attempt is ready for Connectivity Assist once TLS completes, as
-  before. A blocked host that is passed through still gets a `CONNECT` answered `403`,
-  which an app sees as a network error.
+  that `answer_blocked` gives an app, and the connection stays open, HTTP/1.1 included,
+  but for an HTTP/1.1 request whose body has not all arrived when the answer is sent
+  (from 16 KiB in tests): the body is not read, and hyper, which drains once what has
+  arrived of it, sends that `403` with `connection: close` and closes the connection,
+  and the client still reads the `403`; any value, `document` included, still gets no
+  response, so a navigation to a DNS-blocked host still shows the browser's own error
+  page, as with HTTPS filtering off (the blocked page stays for filter-engine blocks and
+  absolute-form requests). After a list reload the next request is still refused with
+  `REFUSED_STREAM` and the connection closes. Nothing is dialed, the block is still
+  counted and recorded once, at the `CONNECT`, and the attempt is ready for Connectivity
+  Assist once TLS completes, as before. A blocked host that is passed through still gets
+  a `CONNECT` answered `403`, which an app sees as a network error.
 - **Certificates a browser would refuse are logged.** Three device logs showed SwiftKey
   get the 85-byte text `502` ("is for another name") 21 times from one of its hosts,
   whose server presents a certificate for another name (with Tollgate off iOS refuses it
