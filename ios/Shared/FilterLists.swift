@@ -12,6 +12,10 @@ struct FilterList: Identifiable {
 }
 
 enum FilterLists {
+    /// The built-in lists, each on unless the user switches it off. `ListSettings` stores
+    /// only the ones switched off, so a list added here in an app update is on for existing
+    /// installs, and `ListUpdater` downloads and compiles it at the next opportunity rather
+    /// than with the next daily update.
     static let defaults: [FilterList] = [
         FilterList(
             id: "easylist", name: "EasyList",
@@ -29,7 +33,27 @@ enum FilterLists {
             id: "adguard-dns", name: "AdGuard DNS filter",
             url: URL(string: "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt")!,
             format: .adblock, target: .dns),
+        // Ad and tracker hosts the AdGuard DNS filter does not have; about 270 KB more in
+        // domains.bin.
+        FilterList(
+            id: "stevenblack", name: "StevenBlack hosts",
+            url: URL(string: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts")!,
+            format: .hosts, target: .dns),
     ]
+
+    /// Whether `address` names the same list as `url`: the same scheme and host in any
+    /// letter case, and the same port, path and query. The fragment is ignored, since it is
+    /// never sent to the server.
+    static func sameAddress(_ url: URL, _ address: String) -> Bool {
+        guard let a = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let b = URLComponents(string: address.trimmingCharacters(in: .whitespaces))
+        else { return false }
+        return a.scheme?.lowercased() == b.scheme?.lowercased()
+            && a.host?.lowercased() == b.host?.lowercased()
+            && a.port == b.port
+            && a.path == b.path
+            && a.query == b.query
+    }
 
     static let engineFile = "engine.dat"
     static let domainsFile = "domains.bin"
@@ -65,6 +89,21 @@ struct CustomList: Codable, Hashable, Identifiable {
 
         var format: ListFormat { self == .hosts ? .hosts : .adblock }
         var target: ListTarget { self == .requestRules ? .url : .dns }
+
+        /// The type to compile a list of this type as, when its content is written in
+        /// `format` (see `detectListFormat`): itself when the two agree. A hosts file under
+        /// Request rules or Domain rules becomes a Hosts file: the DNS parser for adblock
+        /// syntax reads none of its lines, and as request rules it would only fill the
+        /// tunnel's engine with host blocks that belong in the DNS blocklist. Adblock rules
+        /// under Hosts file become Domain rules, which keeps the list in the DNS blocklist
+        /// the user chose instead of moving it into the tunnel's engine.
+        func corrected(for format: ListFormat) -> Kind {
+            switch (self, format) {
+            case (.requestRules, .hosts), (.dnsRules, .hosts): .hosts
+            case (.hosts, .adblock): .dnsRules
+            default: self
+            }
+        }
     }
 
     var id = UUID().uuidString
@@ -102,5 +141,13 @@ struct ListSettings: Codable, Equatable {
 
     func isEnabled(_ list: FilterList) -> Bool {
         !disabledDefaults.contains(list.id)
+    }
+
+    /// The enabled built-in list with the same address as `list`, if any. Such a custom
+    /// list is skipped, so the list is downloaded and compiled once, with the built-in
+    /// list's type, and Settings says so on its row so the user can delete it. With the
+    /// built-in list switched off, the custom one is used.
+    func builtInDuplicate(of list: CustomList) -> FilterList? {
+        FilterLists.defaults.first { isEnabled($0) && FilterLists.sameAddress($0.url, list.url) }
     }
 }

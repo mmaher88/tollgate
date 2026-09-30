@@ -2,6 +2,7 @@
 //! blocklist, and compiling both from filter lists.
 
 mod compile;
+mod detect;
 mod domain_rules;
 mod domain_set;
 mod engine;
@@ -11,6 +12,7 @@ mod wildcard;
 use std::path::PathBuf;
 
 pub use compile::{CompileReport, DOMAINS_FILE, ENGINE_FILE, compile, compile_split};
+pub use detect::detect_format;
 pub use domain_rules::DomainRules;
 pub use domain_set::{DomainSet, DomainSetError};
 pub use engine::{
