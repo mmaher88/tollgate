@@ -8,6 +8,7 @@ mod ca;
 mod connect;
 mod cut;
 mod filtering;
+mod flight;
 mod forward;
 mod hello;
 mod http;

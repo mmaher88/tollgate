@@ -132,6 +132,25 @@ fn records_have_the_expected_swift_fields() {
         struct_fields(&swift, "DnsRecord"),
         ["rtype:UInt16", "rclass:UInt16", "ttl:UInt32", "data:Data"]
     );
+    // ios/Tunnel/PacketTunnelProvider.swift copies each counter into TunnelStats by name.
+    assert_eq!(
+        struct_fields(&swift, "Stats"),
+        [
+            "dnsQueries:UInt64",
+            "dnsBlocked:UInt64",
+            "dnsCacheHits:UInt64",
+            "dnsForwarded:UInt64",
+            "dnsFailed:UInt64",
+            "packetsDropped:UInt64",
+            "httpRequests:UInt64",
+            "httpBlocked:UInt64",
+            "connectionsIntercepted:UInt64",
+            "connectionsPassthrough:UInt64",
+            "tlsClientRejections:UInt64",
+            "tlsAbandonedAfterHandshake:UInt64",
+            "tlsSilentRefusals:UInt64",
+        ]
+    );
     let start = swift.find("public enum EventKind").expect("enum EventKind");
     let body = &swift[start..start + swift[start..].find('}').unwrap()];
     let cases: Vec<&str> = body

@@ -271,6 +271,7 @@ struct ContentView: View {
                                value: ByteCountFormatter.string(fromByteCount: Int64(stats.availableMemoryBytes), countStyle: .memory))
                 LabeledContent("DNS failures", value: stats.dnsFailed.formatted())
                 LabeledContent("Certificate rejections", value: stats.tlsClientRejections.formatted())
+                LabeledContent("Silent certificate refusals", value: stats.tlsSilentRefusals.formatted())
             }
             if let startedAt = tunnel.stats?.tunnelStartedAt ?? heartbeat?.startedAt {
                 LabeledContent("Tunnel started", value: startedAt.formatted(date: .omitted, time: .standard))
