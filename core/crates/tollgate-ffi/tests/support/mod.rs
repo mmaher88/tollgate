@@ -42,7 +42,7 @@ pub fn reply(packet: &[u8]) -> Message {
 }
 
 /// A temporary data directory with `url_rules` compiled into `engine.dat` and
-/// `dns_rules` into `domains.bin`.
+/// `dns_rules` into `domains.bin`, which also gets Tollgate extras.
 pub fn data_dir(url_rules: &str, dns_rules: &str) -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     compile_into(&dir, url_rules, dns_rules);

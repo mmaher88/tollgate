@@ -1,7 +1,8 @@
 use std::fs;
 
 use tollgate_ffi::{
-    ListFormat, ListInput, ListTarget, TollgateError, compile_lists, detect_list_format,
+    ListFormat, ListInput, ListTarget, TOLLGATE_EXTRAS, TollgateError, compile_lists,
+    detect_list_format,
 };
 use tollgate_filter::{DOMAINS_FILE, DomainSet, ENGINE_FILE, FilterEngine, Verdict};
 use tollgate_policy::BundledGroup;
@@ -10,6 +11,10 @@ const URL_RULES: &str =
     "! Title: test URL list\n||ads.example^\n||tracker.example^$third-party\n/banner/*$image\n";
 const DNS_RULES: &str = "! Title: test DNS list\n||dns-block.example^\n@@||ok.dns-block.example^\n";
 const HOSTS: &str = "# test hosts\n0.0.0.0 hosts-block.example\n127.0.0.1 localhost\n";
+
+/// The hashes Tollgate extras add to every DNS blocklist: `ads.huawei.com` and the one
+/// host `rudderstack.com`.
+const EXTRAS_ENTRIES: u64 = 2;
 
 fn input(name: &str, text: &str, format: ListFormat, target: ListTarget) -> ListInput {
     ListInput {
@@ -54,7 +59,7 @@ fn url_lists_feed_the_engine_and_dns_lists_the_blocklist() {
     )
     .unwrap();
     assert_eq!(report.network_rules, 3);
-    assert_eq!(report.domain_entries, 3);
+    assert_eq!(report.domain_entries, 3 + EXTRAS_ENTRIES);
     assert_eq!(
         report.engine_bytes,
         fs::metadata(dir.join(ENGINE_FILE)).unwrap().len()
@@ -110,17 +115,17 @@ fn a_hosts_list_cannot_feed_the_url_filter() {
 }
 
 #[test]
-fn no_lists_give_empty_files() {
+fn no_lists_give_an_empty_engine_and_the_extras_alone() {
     let tmp = tempfile::tempdir().unwrap();
     let report = compile_lists(Vec::new(), tmp.path().to_str().unwrap().to_string()).unwrap();
-    // An empty DNS blocklist is the 40-byte header alone.
+    // The DNS blocklist is the 40-byte header and the hashes of Tollgate extras.
     assert_eq!(
         (
             report.network_rules,
             report.domain_entries,
             report.domains_bytes
         ),
-        (0, 0, 40)
+        (0, EXTRAS_ENTRIES, 40 + 8 * EXTRAS_ENTRIES)
     );
     assert!(tmp.path().join(ENGINE_FILE).exists());
     assert!(tmp.path().join(DOMAINS_FILE).exists());
@@ -154,6 +159,43 @@ fn detect_list_format_reports_the_majority_format() {
     );
     assert_eq!(detect_list_format("# only a comment\n".to_string()), None);
     assert_eq!(detect_list_format(String::new()), None);
+}
+
+#[test]
+fn tollgate_extras_block_exactly_their_hosts() {
+    let rules: Vec<&str> = TOLLGATE_EXTRAS.iter().map(|(rule, _)| *rule).collect();
+    assert_eq!(rules, ["||ads.huawei.com^", "|rudderstack.com^"]);
+    for (rule, reason) in TOLLGATE_EXTRAS {
+        assert!(reason.len() > 40, "{rule} needs a reason");
+    }
+
+    let domains = compile_blocklist(Vec::new());
+    for host in ["ads.huawei.com", "x.ads.huawei.com", "rudderstack.com"] {
+        assert!(domains.is_blocked(host), "{host}");
+    }
+    for host in [
+        "huawei.com",
+        "consumer.huawei.com",
+        "developer.huawei.com",
+        "api.rudderstack.com",
+        "www.rudderstack.com",
+        "app.rudderstack.com",
+        "x.dataplane.rudderstack.com",
+    ] {
+        assert!(!domains.is_blocked(host), "{host}");
+    }
+}
+
+#[test]
+fn an_exception_in_a_list_wins_over_the_extras() {
+    let domains = compile_blocklist(vec![input(
+        "My rules (DNS)",
+        "@@||ads.huawei.com^\n",
+        ListFormat::Adblock,
+        ListTarget::Dns,
+    )]);
+    assert!(!domains.is_blocked("ads.huawei.com"));
+    assert!(domains.is_blocked("rudderstack.com"));
 }
 
 /// The names of the patterns of `groups`, without `*.`, each with whether it had one

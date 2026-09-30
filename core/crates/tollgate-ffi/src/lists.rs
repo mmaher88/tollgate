@@ -8,6 +8,36 @@ use tollgate_policy::BundledGroup;
 
 use crate::error::{TollgateError, catch_panic};
 
+/// The name of the built-in DNS rule set in log messages and errors.
+pub const TOLLGATE_EXTRAS_NAME: &str = "Tollgate extras";
+
+/// A few ad and tracker hosts that no default list blocks and that are safe to block, each
+/// with the reason it is here. Compiled into every DNS blocklist, after the lists given,
+/// as the list [`TOLLGATE_EXTRAS_NAME`]; every exception in a list (My rules included)
+/// still wins over it. Rules in adblock syntax.
+pub const TOLLGATE_EXTRAS: &[(&str, &str)] = &[
+    (
+        "||ads.huawei.com^",
+        "HUAWEI Ads, Huawei's ad platform. HaGeZi's Pro and larger lists block it, the \
+         default lists do not; Huawei's other hosts stay open.",
+    ),
+    (
+        "|rudderstack.com^",
+        "RudderStack, a service that collects analytics events from apps and sites. Only \
+         the name itself, which serves nothing but a redirect to www.rudderstack.com: its \
+         subdomains (api.rudderstack.com, app.rudderstack.com, www.rudderstack.com) run \
+         RudderStack's own service and site and stay open.",
+    ),
+];
+
+/// The rules of [`TOLLGATE_EXTRAS`] as the text of a list.
+fn extras_text() -> String {
+    TOLLGATE_EXTRAS
+        .iter()
+        .map(|(rule, _reason)| format!("{rule}\n"))
+        .collect()
+}
+
 /// The hosts of the bundled passthrough groups for sensitive services and banks, which
 /// a list with `exempt_sensitive_hosts` must not block.
 static SENSITIVE_HOSTS: LazyLock<Exemption> = LazyLock::new(|| {
@@ -128,6 +158,7 @@ fn compile_in(sources: &[ListInput], dir: &Path) -> Result<CompileReport, Tollga
         .filter(|l| l.target == ListTarget::Url)
         .map(source)
         .collect();
+    let extras = extras_text();
     let dns_lists: Vec<DnsList> = sources
         .iter()
         .filter(|l| l.target == ListTarget::Dns)
@@ -135,6 +166,11 @@ fn compile_in(sources: &[ListInput], dir: &Path) -> Result<CompileReport, Tollga
             source: source(l),
             exempt: l.exempt_sensitive_hosts.then_some(&*SENSITIVE_HOSTS),
         })
+        .chain(std::iter::once(DnsList::from(ListSource {
+            name: TOLLGATE_EXTRAS_NAME,
+            text: &extras,
+            format: tollgate_filter::ListFormat::Adblock,
+        })))
         .collect();
     tollgate_filter::compile_split_exempting(&url_lists, &dns_lists, dir)
         .map(CompileReport::from)
@@ -144,9 +180,9 @@ fn compile_in(sources: &[ListInput], dir: &Path) -> Result<CompileReport, Tollga
 }
 
 /// Builds `engine.dat` from the `Url` lists and `domains.bin` from the `Dns` lists and
-/// writes both into `data_dir` (created if missing), each file atomically. Runs in the
-/// app, which has far more memory than the tunnel; the tunnel then calls
-/// `Engine.reload_lists`.
+/// [`TOLLGATE_EXTRAS`], and writes both into `data_dir` (created if missing), each file
+/// atomically. Runs in the app, which has far more memory than the tunnel; the tunnel then
+/// calls `Engine.reload_lists`.
 #[uniffi::export]
 pub fn compile_lists(
     sources: Vec<ListInput>,
