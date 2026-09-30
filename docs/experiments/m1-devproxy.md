@@ -95,8 +95,10 @@ Result: pass. Runs 1 and 2: Verify return code 20; the log shows "learned certif
    the page loads and works. In the network panel (F12), requests to ad and tracker hosts
    on the DNS blocklist fail with no HTTP status (the `CONNECT` and the TLS handshake
    succeed, then the stream is reset, or the connection closed over HTTP/1.1): Firefox
-   shows them as failed or blocked. Only requests that a URL rule blocks on an otherwise
-   allowed host come back as `403` responses. Restart devproxy with `RUST_LOG=debug` to see
+   shows them as failed or blocked. Requests that a URL rule blocks on an otherwise
+   allowed host fail the same way, since Firefox says what each request is for
+   (`Sec-Fetch-Dest`); only a blocked top-level page comes back as a `403`, a plain text
+   page that says Tollgate blocked it. Restart devproxy with `RUST_LOG=debug` to see
    the reasons: `blocked host ... by the DNS blocklist` for hosts the DNS blocklist blocks
    and `blocked <type> <url>` for URL rules.
 4. Open `https://www.icloud.com`. Pass: it loads with an Apple certificate (passthrough).
