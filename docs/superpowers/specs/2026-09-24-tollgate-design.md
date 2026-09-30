@@ -959,3 +959,85 @@ sections, this section wins.
   them. Turning filtering off by hand while the certificate is untrusted, before the app
   notices, does not set the record; Forget all and the 30-day expiry cover that.
 - On-device checks: `docs/experiments/alpha2.md` (E23 to E30).
+
+## Alpha 2: floods, bad certificates and more lists (2026-09-30)
+
+Learns pins from apps that refuse our certificate for a host other clients trust, fails
+browser requests to servers with bad certificates, and blocks more hosts by DNS without
+blocking those of banks. Where this section disagrees with earlier sections, this
+section wins.
+
+- **Pins from a flood of silent refusals.** A device log showed Messenger cancel 286
+  connections to one host in its certificate check, in 39 different seconds within a
+  minute (a second process cancelled 465 more), with no pin learned: the Facebook app,
+  Messenger's notification extension and a browser had completed handshakes for Meta
+  hosts in the same minutes, so the success guard held. While the guard holds, silent
+  refusals of a host now still make it a pin when they fall in `SILENT_FLOOD_SECONDS` = 10
+  different seconds within the last `SILENT_FLOOD_SECS` = 60 s and number at least
+  `SILENT_FLOOD_RATIO` = 5 times the handshakes clients completed for that host in the
+  same 60 s, both counted in connections. A browser's hang-ups of a moment fall in 1 or 2
+  seconds, and the worst seen (7 on two hosts that completed 18 and 2 handshakes) is
+  below 4 to 1 even against the quieter host; Messenger reached 10 seconds 19 s into its
+  refusals, 133 against 1. The policy keeps each host's refusals and handshakes per
+  second for the last minute (`silent_flood`, `trusted`), within the 1024-host bound of
+  the other maps. A handshake no longer clears the flood counts; a burst, a wake or path
+  change, `forget_pins` and learning the host do. A flood pin is a silent pin (a burst or
+  a network change within 60 s takes it back), and a flood on one host is not a burst.
+  Limit: a trusting client that completes more than about 57 handshakes a minute for
+  the same host keeps an app refused as often as Messenger from being learned.
+- **Held-back refusals are logged.** Once the refusals the guard holds back fall in 3
+  different seconds within 60 s (what would make a pin without the guard), an info line
+  `not learning a certificate pin for <host> yet: ...` names the host, the refusals and
+  their seconds, how long ago a client trusted us for it and the handshakes of the
+  minute, at most once per host in `SILENT_HELD_BACK_LOG_SECS` = 5 minutes. It gives the
+  host name that Network.framework's log hashes. A flood pin logs `learned certificate
+  pin for <host> after a flood of <n> silent refusals ...`. A host refused in only 1 or 2
+  seconds per use while trusted is never named.
+- **Browser requests fail on bad upstream certificates.** An ad-block test page counted 4
+  ad and telemetry hosts as loaded: their servers' certificates were bad or untrusted (an
+  untrusted one fails this way only when it teaches no pin, as in an upstream burst), and
+  `failure()` answered the text `502` of `bad_gateway()`, a response to the page. A request
+  whose `Sec-Fetch-Dest` is present and not `document` now gets no response wherever it got
+  a `502` (the certificate and passthrough texts, and the empty `502` of a TLS alert, a
+  garbled response or response headers over the limit): HTTP/2 resets the stream with
+  INTERNAL_ERROR, HTTP/1.1 closes the connection, as without the proxy, where the browser
+  would refuse the certificate itself. Navigations keep the text `502`, and apps (no
+  header) keep the `502`, as they keep the `403` of a block. A failure that learns a pin
+  still answers `REFUSED_STREAM` and closes the connection. The absolute-form path,
+  WebSocket dial failures and the `503` of an exhausted pool are unchanged.
+- **Two more default DNS lists.** HaGeZi Multi LIGHT (id `hagezi-light`) and OISD small
+  (id `oisd-small`), both adblock syntax with plain `||name^` rules, built by their
+  maintainers to avoid breakage. They block 22 hosts the test page reached (analytics
+  and attribution SDKs, ad networks, fingerprinting, pixels) and add 21,781 hashes
+  (231,985 in all, extras included) and 174 KB to `domains.bin`; a compile in the app
+  peaks at 70 MiB instead of 65 and takes 244 ms instead of 205 (release build, on the
+  workstation). Existing installs compile them after the update, since the built-in
+  list ids change. `FilterLists.sameAddress` now counts an empty path as `/`, so a custom
+  copy of OISD small typed with a trailing slash is still skipped as a duplicate.
+- **DNS lists that leave sensitive hosts alone.** Both lists also block hosts under the
+  bundled passthrough patterns (43 in the sensitive and bank groups, telemetry hosts of
+  banking apps among them), which could break those apps. `bundled.rs` is split into
+  `BundledGroup`s (Apple, Sensitive, Banks, SilentRefusers; `bundled_passthrough()`
+  returns the same patterns in the same order), and `ListInput.exempt_sensitive_hosts`
+  (Swift `exemptSensitiveHosts`, default false; set by `FilterList.exemptSensitiveHosts`
+  for the two lists only) makes the compile (`compile_split_exempting`, `DnsList`,
+  `Exemption`) leave out each of that list's block rules that covers a host of the
+  Sensitive or Banks group: a `||name^`, hosts line or `$important` block whose name is
+  exempt, under an exempt `*.name` or a parent of an exempt name; a `|name^` block of an
+  exempt host; a wildcard block that matches an exempt host, could match a name under
+  an exempt `*.name` (every pattern open at the end could) or, for `||`, matches a parent
+  of one. Exceptions are kept, and the other lists and My rules still block what they
+  list. The flag on a URL list is a configuration error. The counts are logged per list
+  (`<list>: left out <n> blocks of exempt hosts`, 115 for HaGeZi and 22 for OISD) and in
+  the filter crate's `CompileReport::domain_exempted`. The Apple and X groups are not
+  exempt, so the lists block 8 Apple names (ad and attribution hosts, and two of the
+  feedback service) and 3 of X.
+- **Built-in extras.** `TOLLGATE_EXTRAS` (`tollgate-ffi` `lists.rs`) holds hosts no default
+  list blocks and that are safe to block, each with its reason: `||ads.huawei.com^` and
+  `|rudderstack.com^` (the name only, which just redirects; its subdomains run the
+  service and its site). They are compiled into every DNS blocklist, after the lists
+  given, as the list "Tollgate extras"; any exception, My rules included, still wins,
+  and an empty compile now has 2 entries. Left out on purpose: Google Tag Manager's
+  host, since several apps embed Tag Manager for Firebase, which may fetch containers
+  from it, and an LG webOS file-transfer host used for updates, which is not a tracker.
+- On-device checks: `docs/experiments/alpha2.md` (E31 to E35).
