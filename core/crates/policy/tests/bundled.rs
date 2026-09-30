@@ -23,7 +23,7 @@ fn the_groups_make_up_the_bundled_list_in_order() {
         .collect();
     assert_eq!(joined, bundled_passthrough());
     let sizes = BundledGroup::ALL.map(|group| group.patterns().len());
-    assert_eq!(sizes, [24, 183, 420, 3]);
+    assert_eq!(sizes, [24, 183, 423, 3, 6, 6, 3, 1]);
 }
 
 #[test]
@@ -43,7 +43,16 @@ fn each_host_falls_in_the_group_of_its_source() {
         (BundledGroup::Sensitive, "www.army.mil"),
         (BundledGroup::Banks, "secure.chase.com"),
         (BundledGroup::Banks, "api.stripe.com"),
+        (BundledGroup::Banks, "pay.google.com"),
+        (BundledGroup::Banks, "api.braintreegateway.com"),
         (BundledGroup::SilentRefusers, "api.x.com"),
+        (BundledGroup::DeviceManagement, "i.manage.microsoft.com"),
+        (BundledGroup::DeclaredPins, "api.atlassian.com"),
+        (BundledGroup::ReportedPins, "mmg.whatsapp.net"),
+        (
+            BundledGroup::LearnedPins,
+            "meta-ohttp-relay-prod.fastly-edge.com",
+        ),
     ] {
         for other in BundledGroup::ALL {
             assert_eq!(
@@ -67,7 +76,7 @@ fn every_entry_is_a_canonical_pattern() {
 fn entries_are_unique_and_the_snapshot_is_complete() {
     let unique: HashSet<&str> = bundled_passthrough().iter().copied().collect();
     assert_eq!(unique.len(), bundled_passthrough().len());
-    assert_eq!(bundled_passthrough().len(), 630);
+    assert_eq!(bundled_passthrough().len(), 649);
 }
 
 #[test]
@@ -100,6 +109,9 @@ fn covers_banking_and_sensitive_services() {
         "vault.bitwarden.com",
         "my.1password.com",
         "login.live.com",
+        "pay.google.com",
+        "payments.braintree-api.com",
+        "api.braintreegateway.com",
     ] {
         assert!(bundled_matches(host), "{host}");
     }
@@ -119,6 +131,59 @@ fn covers_apps_that_refuse_our_certificate_silently() {
 }
 
 #[test]
+fn covers_device_management_hosts() {
+    for host in [
+        "i.manage.microsoft.com",
+        "enrollment.manage.microsoft.com",
+        "r.manage.microsoft.com",
+        "fef.msuc03.manage.microsoft.com",
+        "checkin.dm.microsoft.com",
+        "enterpriseregistration.windows.net",
+        "certauth.enterpriseregistration.windows.net",
+        "device.login.microsoftonline.com",
+        "t.certauth.login.microsoftonline.com",
+        "config.edge.skype.com",
+    ] {
+        assert!(bundled_matches(host), "{host}");
+    }
+}
+
+#[test]
+fn covers_pinned_hosts_of_apps() {
+    for host in [
+        // Declared in Info.plist.
+        "api.atlassian.com",
+        "api-private.atlassian.com",
+        "auth.atlassian.com",
+        "media-cdn.atlassian.com",
+        "api.media.atlassian.com",
+        "jira.atlassian-isolated.net",
+        // Listed by vendors.
+        "mmg.whatsapp.net",
+        "media-iad3-1.cdn.whatsapp.net",
+        "wd5.myworkday.com",
+        "www.eventbriteapi.com",
+        // Learned in a device log.
+        "meta-ohttp-relay-prod.fastly-edge.com",
+    ] {
+        assert!(bundled_matches(host), "{host}");
+    }
+}
+
+#[test]
+fn leaves_trackers_next_to_the_newer_groups_alone() {
+    // Tracker hosts under the same domains as entries added for payment services, device
+    // management and pins, which the default lists block.
+    for host in [
+        "client-analytics.braintreegateway.com",
+        "xp.atlassian.com",
+        "clicks.eventbrite.com",
+    ] {
+        assert!(!bundled_matches(host), "{host}");
+    }
+}
+
+#[test]
 fn leaves_ordinary_hosts_alone() {
     for host in [
         "www.google.com",
@@ -128,6 +193,16 @@ fn leaves_ordinary_hosts_alone() {
         "cloudflare.com",
         "fox.com",
         "notx.com",
+        // Next to the newer groups: their domains' public sites and other hosts, and hosts
+        // left out because they cost filtering or rest on no evidence.
+        "login.microsoftonline.com",
+        "www.microsoft.com",
+        "www.atlassian.com",
+        "zoom.us",
+        "api.viber.com",
+        "graph.facebook.com",
+        "googlehomefoyer-pa.googleapis.com",
+        "fastly-edge.com",
     ] {
         assert!(!bundled_matches(host), "{host}");
     }

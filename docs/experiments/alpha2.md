@@ -34,7 +34,8 @@ E31 to E35 check the changes made after E30: two more built-in DNS lists that le
 hosts of banks and sensitive services alone, two hosts Tollgate blocks on its own, browser
 requests that fail when a server's certificate is bad, and pins learned from an app that
 keeps refusing Tollgate's certificate for a host that other apps trust it for. Run E31
-right after installing the build, for the same reason as E23.
+right after installing the build, for the same reason as E23. E36 checks the apps behind
+the hosts added to the built-in passthrough list.
 
 ## Logs
 
@@ -567,5 +568,30 @@ pins (Network.framework names hosts only by hash).
    none of their hosts appears under Learned certificate pins. Note each `not learning a
    certificate pin for <host> yet` line with its numbers; a browser should cause few, and
    each names a host some client trusted within 10 minutes.
+
+Result:
+
+## E36: apps behind the newer built-in passthrough hosts
+
+The built-in list (`core/crates/policy/src/bundled.rs`) now also passes through, without
+decrypting or filtering them: the Microsoft Intune, Entra ID and Enterprise SSO plug-in
+hosts that Microsoft says must not be TLS-inspected, hosts that apps pin in their
+Info.plist or that vendors list as pinning, Meta's OHTTP relay, and the hosts of two
+payment services, Google Pay and Braintree. The DNS lists still block what they list
+under them. Tollgate logs no line for a built-in passthrough.
+
+1. Only on a phone enrolled in Microsoft Intune; skip it otherwise. HTTPS filtering on.
+   Add `-e 'mdmd'` to the log command above. In Company Portal, open Devices, this
+   device, and tap Check status. Pass: the check finishes without an error and the device
+   is shown as compliant (or as before the build, with the same reasons), and mdmd logs no
+   `Could not send response to MDM server`.
+2. HTTPS filtering on. Use the apps whose hosts the new groups list (the comment at the
+   head of each group names them; in a messaging app, send and open a photo), and make a
+   payment through Google Pay or Braintree if an app offers one: sign in and open the
+   screens you use. Pass: each works as with HTTPS filtering off, and the log shows no
+   `learned certificate pin` line for their hosts.
+3. Settings, Learned certificate pins. Pass: none of the hosts of step 2 is added, and
+   `meta-ohttp-relay-prod.fastly-edge.com` is not added again once forgotten and the
+   Facebook app is used.
 
 Result:

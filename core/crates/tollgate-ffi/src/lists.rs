@@ -39,7 +39,8 @@ fn extras_text() -> String {
 }
 
 /// The hosts of the bundled passthrough groups for sensitive services and banks, which
-/// a list with `exempt_sensitive_hosts` must not block.
+/// a list with `exempt_sensitive_hosts` must not block. The other groups are not exempt:
+/// such a list still blocks the hosts it lists under them.
 static SENSITIVE_HOSTS: LazyLock<Exemption> = LazyLock::new(|| {
     Exemption::new(
         [BundledGroup::Sensitive, BundledGroup::Banks]

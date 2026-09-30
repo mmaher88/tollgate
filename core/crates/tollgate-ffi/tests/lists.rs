@@ -226,13 +226,19 @@ fn exempting_lists_leave_sensitive_and_bank_hosts_unblocked() {
             hosts += &format!("0.0.0.0 metrics.{name}\n");
         }
     }
-    // The other bundled groups (Apple, and the apps that refuse our certificate) are not
-    // exempt: ad hosts under them stay blockable.
-    let others = group_names(&[BundledGroup::Apple, BundledGroup::SilentRefusers]);
+    // The other bundled groups (Apple, device management, and the apps that refuse or pin
+    // our certificate) are not exempt: ad hosts under them stay blockable.
+    let other_groups: Vec<BundledGroup> = BundledGroup::ALL
+        .into_iter()
+        .filter(|group| ![BundledGroup::Sensitive, BundledGroup::Banks].contains(group))
+        .collect();
+    assert_eq!(other_groups.len(), 6);
+    let others = group_names(&other_groups);
     for (name, _) in &others {
         text += &format!("||ads.{name}^\n");
     }
-    let bank = exempt[exempt.len() - 1].0;
+    // The last bank domain: a host under it is a bank host.
+    let (bank, _) = *exempt.iter().rev().find(|(_, domain)| *domain).unwrap();
     let domains = compile_blocklist(vec![
         // A list that exempts nothing still blocks a bank host.
         input(

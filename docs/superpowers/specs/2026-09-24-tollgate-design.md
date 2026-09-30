@@ -1040,4 +1040,30 @@ section wins.
   and an empty compile now has 2 entries. Left out on purpose: Google Tag Manager's
   host, since several apps embed Tag Manager for Firebase, which may fetch containers
   from it, and an LG webOS file-transfer host used for updates, which is not a tracker.
-- On-device checks: `docs/experiments/alpha2.md` (E31 to E35).
+- **More built-in passthrough hosts.** `bundled.rs` gains four groups after
+  SilentRefusers, none of them exempt from the DNS lists (`SENSITIVE_HOSTS` is still
+  Sensitive and Banks): DeviceManagement (6: the Intune, Entra ID and Enterprise SSO
+  plug-in hosts that Microsoft says must not be TLS-inspected, most of them since they
+  take a client certificate; Intune check-ins were observed failing through the proxy,
+  redirected to Intune's certificate fallback page after a handshake with Tollgate's
+  certificate, so pin learning never saw them), DeclaredPins (6: hosts that an app pins
+  in its Info.plist), ReportedPins (3: apps that proxy and security vendors list as
+  pinning, narrowed to their media, tenant and API domains) and LearnedPins (1: Meta's
+  OHTTP relay, learned in a device log). Banks gains the banks.txt entries of two payment
+  services that are not second-level `.com`, `.org` or `.net` domains, Google Pay and
+  Braintree, and Braintree's client API host, which its iOS SDK pins: 649
+  patterns in all. Every added host costs no request filtering with the default lists:
+  no URL rule for it, no request of the services' public pages and scripts that the
+  filter engine blocks, and every host under it that a URL list blocks by name is still
+  blocked by a DNS list; the exempting lists still leave out the same 137 blocks. Under
+  the new groups the default DNS lists block `dit.whatsapp.net` and
+  `privatestats.whatsapp.net`, whose `CONNECT` gets `403` like that of any blocked host
+  that is passed through, so a browser can reach them over cellular with Connectivity
+  Assist on (a WhatsApp Web script reports to the first); the app, reported to pin,
+  would fail a blocked connection's handshake the same way, and narrowing
+  `*.whatsapp.net` would intercept its other hosts. Left out for what they would cost:
+  `*.zoom.us` (EasyPrivacy blocks the telemetry of Zoom's join page), Google Home's pins
+  on all of google.com and googleapis.com, Meta's domains (the Pixel and Audience Network
+  rules), and the rest of banks.txt (in the exemption it would unblock 46 tracker
+  hosts). The source of every entry is in the comment at the head of its group.
+- On-device checks: `docs/experiments/alpha2.md` (E31 to E36).

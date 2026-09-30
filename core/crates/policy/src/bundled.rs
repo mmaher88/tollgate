@@ -1,30 +1,49 @@
 //! Hosts that are never intercepted, compiled in, in one group per source (see
 //! [`BundledGroup`]).
 //!
-//! Sources, fetched 2026-09-25:
+//! Sources, fetched 2026-09-25 (the first three) and 2026-09-30 (the rest, and the payment
+//! service hosts added to Banks):
 //! - Apple: every host in support.apple.com/101555, collapsed to `*.domain` where the
 //!   article lists the whole domain or several of its hosts.
 //! - AdGuard HttpsExclusions (github.com/AdguardTeam/HttpsExclusions) at commit
 //!   a8eda6ecc184cc7000436302d64fb932d5205fe0 (2026-09-14): all of
-//!   `exclusions/sensitive.txt`, and the second-level `.com`, `.org` and `.net` domains of
-//!   `exclusions/banks.txt`. The rest of banks.txt (about 3,600 domains, mostly regional
-//!   banks, 1,439 of them German) is left to pin learning and the user list. AdGuard excludes
-//!   each listed domain with its subdomains, so every entry becomes `*.domain`. Entries
-//!   limited to a desktop app (`$app=`) are left out.
+//!   `exclusions/sensitive.txt`, the second-level `.com`, `.org` and `.net` domains of
+//!   `exclusions/banks.txt`, and its entries for two payment services that apps embed,
+//!   Google Pay and Braintree. With them, Braintree's client API host
+//!   `api.braintreegateway.com`, which AdGuard does not list: the Braintree iOS SDK trusts
+//!   only its own root certificates for both of its API hosts (braintree_ios at 440dd16,
+//!   `BTHTTP.swift`). The rest of banks.txt (about 3,600 domains, mostly regional banks,
+//!   1,439 of them German) is left to pin learning and the user list. AdGuard excludes each
+//!   listed domain with its subdomains, so every entry becomes `*.domain`. Entries limited
+//!   to a desktop app (`$app=`) are left out.
 //! - Apps that refuse Tollgate's certificate without a TLS alert, confirmed in a device log.
 //!   Such an app gives up in its own certificate check and closes the connection silently.
 //!   Pin learning learns such a host only once the refusals repeat in several different
 //!   seconds and nothing has trusted us for it lately, or once they flood it (see
 //!   `Policy::record_silent_refusal`), so each of the app's hosts would fail a few times
 //!   first, and none would be learned while the app refuses on many hosts at once.
+//! - Microsoft Intune, Entra ID and Enterprise SSO plug-in hosts that Microsoft says must not
+//!   be TLS-inspected. Most of them authenticate the device or the user with a client
+//!   certificate, which an intercepting proxy cannot pass on. A server that asks for the
+//!   certificate only optionally lets the handshake complete and fails the request later, as
+//!   Intune's check-ins were observed to do through the proxy, so pin learning never learns
+//!   it.
+//! - Hosts that apps pin in their Info.plist: they fail every time they are intercepted.
+//! - Apps that vendors of proxies and security products list as pinning, narrowed to their
+//!   API or tenant domains.
+//! - Hosts that pin learning learned in a device log, so that they do not fail again each
+//!   time the learned pin expires.
 //!
-//! Each group is sorted; a host listed in an earlier group is not repeated.
+//! The comment at the head of each group names the sources of its entries. Each group is
+//! sorted; a host listed in an earlier group is not repeated.
 
 use std::sync::LazyLock;
 
 /// One group of the bundled passthrough list, named by its source. The proxy passes every
 /// group through alike; the groups exist for uses that need only some of them, such as
-/// the DNS lists that must leave the hosts of sensitive services and banks unblocked.
+/// the DNS lists that must leave the hosts of sensitive services and banks unblocked. Only
+/// `Sensitive` and `Banks` are exempt from those lists: a host they list under another
+/// group is still blocked, and its `CONNECT` gets a `403`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BundledGroup {
     /// Apple services, from Apple's article on enterprise networks.
@@ -33,19 +52,34 @@ pub enum BundledGroup {
     /// other services with sensitive personal information.
     Sensitive,
     /// AdGuard's `banks.txt`, its second-level `.com`, `.org` and `.net` domains: banks,
-    /// card issuers, payment processors, brokers and exchanges.
+    /// card issuers, payment processors, brokers and exchanges; and its entries for Google
+    /// Pay and Braintree, with Braintree's client API host.
     Banks,
     /// Apps that refuse Tollgate's certificate without a TLS alert.
     SilentRefusers,
+    /// Device management and sign-in hosts that Microsoft says must not be TLS-inspected
+    /// (Microsoft Intune, Entra ID and the Enterprise SSO plug-in), most of them since they
+    /// take a client certificate.
+    DeviceManagement,
+    /// Hosts that apps pin in their Info.plist.
+    DeclaredPins,
+    /// Apps that vendors of proxies and security products list as pinning.
+    ReportedPins,
+    /// Hosts that pin learning learned in a device log.
+    LearnedPins,
 }
 
 impl BundledGroup {
     /// Every group, in the order [`bundled_passthrough`] lists them.
-    pub const ALL: [BundledGroup; 4] = [
+    pub const ALL: [BundledGroup; 8] = [
         BundledGroup::Apple,
         BundledGroup::Sensitive,
         BundledGroup::Banks,
         BundledGroup::SilentRefusers,
+        BundledGroup::DeviceManagement,
+        BundledGroup::DeclaredPins,
+        BundledGroup::ReportedPins,
+        BundledGroup::LearnedPins,
     ];
 
     /// The group's patterns, in [`crate::HostPattern`] syntax, sorted.
@@ -55,6 +89,10 @@ impl BundledGroup {
             BundledGroup::Sensitive => SENSITIVE,
             BundledGroup::Banks => BANKS,
             BundledGroup::SilentRefusers => SILENT_REFUSERS,
+            BundledGroup::DeviceManagement => DEVICE_MANAGEMENT,
+            BundledGroup::DeclaredPins => DECLARED_PINS,
+            BundledGroup::ReportedPins => REPORTED_PINS,
+            BundledGroup::LearnedPins => LEARNED_PINS,
         }
     }
 }
@@ -135,7 +173,15 @@ static SENSITIVE: &[&str] = &[
 #[rustfmt::skip]
 static BANKS: &[&str] = &[
     // AdGuard HttpsExclusions exclusions/banks.txt: second-level .com, .org and .net
-    // domains (banks, card issuers, payment processors, brokers, exchanges).
+    // domains (banks, card issuers, payment processors, brokers, exchanges). From its other
+    // entries, those of two payment services that apps embed: Google Pay (pay.google.com)
+    // and Braintree (payments.braintree-api.com). And Braintree's client API host
+    // api.braintreegateway.com, which AdGuard does not list: in braintree_ios at 440dd16,
+    // BTHTTP.swift makes the SDK's own root certificates the only anchors and rejects the
+    // server otherwise, for this host (TokenizationKey.swift) as for the other.
+    // It is one host, since client-analytics.braintreegateway.com is a tracker. Checked on
+    // 2026-09-30: with these entries the exempting DNS lists leave out the same 137 blocks
+    // as before.
     "*.1stnorcalcu.org", "*.2checkout.com", "*.53.com", "*.abanca.com", "*.abchina.com",
     "*.accessbankplc.com", "*.acledabank-internetbanking.com", "*.acorns.com",
     "*.acs-education.com", "*.adelfibanking.com", "*.adyen.com", "*.agranisme.org", "*.akbank.com",
@@ -198,7 +244,8 @@ static BANKS: &[&str] = &[
     "*.nordea.com", "*.nsandi.com", "*.nwolb.com", "*.o-bank.com", "*.oddo-bhf.com",
     "*.oneaccount.com", "*.onfastspring.com", "*.onlinebanking-ibb-ag.com", "*.optumbank.com",
     "*.oregonstatecu.com", "*.oschad24.com", "*.pagbrasil.com", "*.palmettohealthcu.org",
-    "*.payco.com", "*.payeer.com", "*.paykun.com", "*.payonlinesystem.com", "*.paypal-nakit.com",
+    "*.pay.google.com", "*.payco.com", "*.payeer.com", "*.paykun.com",
+    "*.payments.braintree-api.com", "*.payonlinesystem.com", "*.paypal-nakit.com",
     "*.paypal.com", "*.paypalobjects.com", "*.payproglobal.com", "*.paytm.com", "*.paytr.com",
     "*.payture.com", "*.pbbdirekt.com", "*.pbebank.com", "*.pcbac.com", "*.pearler.com",
     "*.penfed.org", "*.picpay.com", "*.pictet.com", "*.piraeusbank.com", "*.plategka.com",
@@ -229,7 +276,7 @@ static BANKS: &[&str] = &[
     "*.wealthfront.com", "*.wealthsimple.com", "*.webbankir.com", "*.wellsfargo.com",
     "*.westconsincu.org", "*.wideup.net", "*.wise.com", "*.wlp-acs.com", "*.wmtransfer.com",
     "*.wooppay.com", "*.wooribank.com", "*.xtb.com", "*.yesrewardz.com", "*.youneedabudget.com",
-    "*.zaim.com",
+    "*.zaim.com", "api.braintreegateway.com",
 ];
 
 #[rustfmt::skip]
@@ -238,4 +285,61 @@ static SILENT_REFUSERS: &[&str] = &[
     // 2026-09-30: every intercepted API connection was cancelled in the app's certificate
     // check ("Cancelled during verify block", task error -999), without a TLS alert.
     "*.twimg.com", "*.twitter.com", "*.x.com",
+];
+
+#[rustfmt::skip]
+static DEVICE_MANAGEMENT: &[&str] = &[
+    // Microsoft Intune (learn.microsoft.com/intune/fundamentals/endpoints, ms.date
+    // 2026-08-21): SSL inspection "isn't supported for '*.manage.microsoft.com',
+    // '*.dm.microsoft.com'". Intune check-ins were observed failing through the proxy on
+    // 2026-09-30: each MDM check-in to i.manage.microsoft.com completed its handshake with
+    // Tollgate's certificate, was redirected to /EnrollmentServer/CertificateFallback.aspx
+    // and failed with a 404 ("Could not send response to MDM server").
+    // Microsoft Entra ID (MicrosoftDocs/entra-docs at 95d306db), to be kept out of TLS
+    // inspection for client certificate authentication: device registration
+    // (enterpriseregistration.windows.net and certauth. under it, plan-device-deployment.md),
+    // hybrid join (device.login.microsoftonline.com, how-to-hybrid-join.md) and
+    // certificate-based sign-in (*.certauth.login.microsoftonline.com,
+    // concept-certificate-based-authentication-technical-deep-dive.md). And the Enterprise SSO
+    // plug-in's configuration service config.edge.skype.com, among the URLs to exclude from
+    // TLS break-and-inspect (entra-docs at a4be4ac4, apple-sso-plugin.md).
+    "*.certauth.login.microsoftonline.com", "*.dm.microsoft.com",
+    "*.enterpriseregistration.windows.net", "*.manage.microsoft.com", "config.edge.skype.com",
+    "device.login.microsoftonline.com",
+];
+
+#[rustfmt::skip]
+static DECLARED_PINS: &[&str] = &[
+    // Pins that apps declare in their Info.plist, read on 2026-09-30. Jira 264.0.0:
+    // NSPinnedDomains, which iOS enforces, for its production hosts (atlassian-isolated.net
+    // with its subdomains, the others without). Staging hosts are left out.
+    "*.atlassian-isolated.net", "api-private.atlassian.com", "api.atlassian.com",
+    "api.media.atlassian.com", "auth.atlassian.com", "media-cdn.atlassian.com",
+];
+
+#[rustfmt::skip]
+static REPORTED_PINS: &[&str] = &[
+    // Apps that vendors list as pinning; none ran in a device log. Netskope's list of
+    // certificate-pinned applications
+    // (docs.netskope.com/en/certificate-pinned-applications, 2026-09-30): Eventbrite and
+    // Workday on iOS, narrowed to Eventbrite's API domain and to Workday's tenant domain
+    // myworkday.com, one of the app's associated domains. WhatsApp: Proxyman's
+    // troubleshooting page names it among the apps protected by SSL pinning on iOS, and
+    // AdGuard HttpsExclusions (at a8eda6ec) android.txt excludes whatsapp.net for the Android
+    // WhatsApp app among the apps known to pin (AdguardForAndroid#3052). The hosts the DNS
+    // lists block under these domains (dit. and privatestats.whatsapp.net) still get a 403
+    // for their CONNECT, which with Connectivity Assist on a browser can retry over cellular
+    // (a WhatsApp Web script reports to dit.); the app, reported to pin, would fail a
+    // blocked connection's handshake the same way. Narrowing the pattern to the media hosts
+    // would instead intercept the app's other hosts, whose pins nothing has ruled out.
+    "*.eventbriteapi.com", "*.myworkday.com", "*.whatsapp.net",
+];
+
+#[rustfmt::skip]
+static LEARNED_PINS: &[&str] = &[
+    // Device log of 2026-09-30: "learned certificate pin for
+    // meta-ohttp-relay-prod.fastly-edge.com after UnknownCa". Meta's OHTTP relay, run by
+    // Fastly, carries only requests encrypted to Meta's gateway, so passing it through
+    // loses no filtering.
+    "meta-ohttp-relay-prod.fastly-edge.com",
 ];
