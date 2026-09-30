@@ -42,15 +42,30 @@ pub(crate) fn text(code: StatusCode, message: String) -> Response<Body> {
     response
 }
 
-/// The answer to a blocked request: an empty `403` that any origin may read, so pages do
-/// not stall on a CORS error. Also the answer to a `CONNECT` for a blocked host that gets
-/// no blocked connection (see `crate::connect`).
+/// An empty `403` that any origin may read, so a page that gets it does not stall on a CORS
+/// error: the answer to a blocked request from an app, which sends no `Sec-Fetch-Dest` (see
+/// `crate::request::answer_blocked`), and to a `CONNECT` for a blocked host that gets no
+/// blocked connection (see `crate::connect`).
 pub(crate) fn blocked() -> Response<Body> {
     let mut response = status(StatusCode::FORBIDDEN);
     response
         .headers_mut()
         .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
     response
+}
+
+/// What [`blocked_page`] says. It names no rule: the Activity log records the block with its
+/// URL, and allowing the site is done there.
+const BLOCKED_PAGE: &str = "Tollgate blocked this page.\n\n\
+                            One of your filter lists blocks it. To allow it, open Tollgate, \
+                            go to Activity and tap the block.\n";
+
+/// The answer to a blocked top-level navigation (`Sec-Fetch-Dest: document`, see
+/// `crate::request::answer_blocked`): a short plain-text `403` saying that Tollgate blocked
+/// the page, so the browser shows why it has nothing instead of an empty page. Not cached,
+/// so the page loads once the site is allowed.
+pub(crate) fn blocked_page() -> Response<Body> {
+    text(StatusCode::FORBIDDEN, BLOCKED_PAGE.to_string())
 }
 
 /// Wraps a body and runs `on_done` once, when the body ends, fails or is dropped.
