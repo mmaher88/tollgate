@@ -13,9 +13,9 @@
 //! - Apps that refuse Tollgate's certificate without a TLS alert, confirmed in a device log.
 //!   Such an app gives up in its own certificate check and closes the connection silently.
 //!   Pin learning learns such a host only once the refusals repeat in several different
-//!   seconds and nothing has trusted us for it lately (see `Policy::record_silent_refusal`),
-//!   so each of the app's hosts would fail a few times first, and none would be learned
-//!   while the app refuses on many hosts at once.
+//!   seconds and nothing has trusted us for it lately, or once they flood it (see
+//!   `Policy::record_silent_refusal`), so each of the app's hosts would fail a few times
+//!   first, and none would be learned while the app refuses on many hosts at once.
 //!
 //! Each group is sorted; a host listed in an earlier group is not repeated.
 

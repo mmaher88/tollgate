@@ -26,8 +26,9 @@ use crate::websocket;
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum NoResponse {
     /// The upstream could not be reached, or closed or reset the connection before any
-    /// response. The HTTP/2 stream is reset with INTERNAL_ERROR.
-    #[error("no response: the upstream is unreachable or closed the connection")]
+    /// response; or any other upstream failure of a browser's request that is not a
+    /// navigation (see [`failure`]). The HTTP/2 stream is reset with INTERNAL_ERROR.
+    #[error("no response: the upstream is unreachable, closed the connection or failed")]
     Closed,
     /// The upstream failure made the host a learned pin (see
     /// `upstream::learn_from_failure`). The client connection closes too (HTTP/2 GOAWAY),
@@ -94,8 +95,9 @@ impl NoResponse {
 /// pin, gets [`NoResponse`] rather than a `502`: the proxy answered the `CONNECT` and the
 /// TLS handshake itself, so a `502` over its trusted leaf would be an ordinary server
 /// response to the browser, shown as an empty page, and would keep it from falling back
-/// from `https://` to `http://`. A blocked request from a browser that is not a
-/// navigation gets [`NoResponse`] too (see [`answer_blocked`]).
+/// from `https://` to `http://`. A request from a browser that is not a navigation gets
+/// [`NoResponse`] too when it is blocked (see [`answer_blocked`]) and for any other
+/// upstream failure (see [`failure`]).
 pub(crate) async fn handle(
     state: Arc<State>,
     origin: Arc<Origin>,
@@ -156,15 +158,40 @@ pub(crate) async fn handle(
 /// Stats and the blocked log do not depend on the answer: `crate::filtering` records the
 /// block before this is called.
 pub(crate) fn answer_blocked(headers: &HeaderMap) -> Result<Response<Body>, NoResponse> {
-    match headers.get(SEC_FETCH_DEST) {
-        None => Ok(blocked()),
-        Some(dest) if dest.as_bytes().eq_ignore_ascii_case(b"document") => Ok(blocked_page()),
-        Some(_) => Err(NoResponse::blocked()),
+    match Destination::of(headers) {
+        Destination::App => Ok(blocked()),
+        Destination::Document => Ok(blocked_page()),
+        Destination::Subresource => Err(NoResponse::blocked()),
     }
 }
 
 /// The Fetch Metadata request header that says what a browser will do with the response.
 const SEC_FETCH_DEST: &str = "sec-fetch-dest";
+
+/// Who sent a request and what for, as its `Sec-Fetch-Dest` header says (see
+/// [`answer_blocked`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Destination {
+    /// No header: an app's own HTTP client.
+    App,
+    /// `document`, in any case: a browser's top-level navigation.
+    Document,
+    /// Any other value: a browser's request for part of a page, `fetch()` and XHR
+    /// included.
+    Subresource,
+}
+
+impl Destination {
+    fn of(headers: &HeaderMap) -> Destination {
+        match headers.get(SEC_FETCH_DEST) {
+            None => Destination::App,
+            Some(dest) if dest.as_bytes().eq_ignore_ascii_case(b"document") => {
+                Destination::Document
+            }
+            Some(_) => Destination::Subresource,
+        }
+    }
+}
 
 /// Filters and forwards one request; a blocked one, WebSocket upgrades included, is
 /// answered by [`answer_blocked`]. The flag is true when a WebSocket upstream's TLS
@@ -210,6 +237,8 @@ async fn forward(
     if let Ok(uri) = url.parse::<Uri>() {
         *request.uri_mut() = uri;
     }
+    // The pool takes the request, headers and all.
+    let destination = Destination::of(request.headers());
     match state
         .pool
         .send(&origin.target(), request.map(|b| b.boxed_unsync()))
@@ -218,22 +247,30 @@ async fn forward(
         Ok(response) => Ok((response, false)),
         Err(e) => {
             state.log_upstream_failure(&origin.authority(), &e);
-            failure(state, origin, &e)
+            failure(state, origin, &e, destination)
         }
     }
 }
 
-/// The answer to a request the upstream pool could not send. An upstream that cannot be
-/// reached at all, or that closes or resets the connection (or the HTTP/2 stream) before
-/// any response without a TLS error, gets no response; no free upstream connection `503`.
-/// A TLS failure that makes the host a learned pin gets no response either, and closes the
-/// client connection, so the browser retries on a new `CONNECT` (now passed through), or
-/// shows its own error page and may fall back to `http://`. Anything else gets `502` (see
-/// [`bad_gateway`]).
+/// The answer to a request from `destination` that the upstream pool could not send. An
+/// upstream that cannot be reached at all, or that closes or resets the connection (or the
+/// HTTP/2 stream) before any response without a TLS error, gets no response; no free
+/// upstream connection `503`. A TLS failure that makes the host a learned pin gets no
+/// response either, and closes the client connection, so the browser retries on a new
+/// `CONNECT` (now passed through), or shows its own error page and may fall back to
+/// `http://`. Anything else gets `502` (see [`bad_gateway`]), except that a browser's
+/// request that is not a navigation gets no response ([`NoResponse::Closed`]): without the
+/// proxy the browser would have refused the certificate itself or seen the broken
+/// connection, and the page a network error, while to the page a `502` is a response, so
+/// the request loaded (an ad-block test counts the host as not blocked). A navigation
+/// keeps the `502`, whose text says what went wrong, and an app keeps it, as it keeps the
+/// `403` of a blocked request (see [`answer_blocked`]). Pin learning does not depend on
+/// `destination`.
 fn failure(
     state: &State,
     origin: &Origin,
     error: &UpstreamError,
+    destination: Destination,
 ) -> Result<(Response<Body>, bool), NoResponse> {
     if gets_no_response(error) {
         return Err(NoResponse::Closed);
@@ -252,19 +289,20 @@ fn failure(
         };
         return Err(NoResponse::passed_through(reason));
     }
-    if http11 {
+    if http11 || destination == Destination::Subresource {
         return Err(NoResponse::Closed);
     }
     Ok((bad_gateway(error), false))
 }
 
-/// True for the failures [`failure`] answers with [`NoResponse`], and that
-/// [`crate::forward::forward`] answers with [`NoResponse`] too.
+/// True for the failures that get [`NoResponse`] whoever sent the request, in [`failure`]
+/// and in [`crate::forward::forward`].
 pub(crate) fn gets_no_response(error: &UpstreamError) -> bool {
     is_unreachable(error) || closed_without_response(error)
 }
 
-/// `502` for a failed upstream request. The client accepted the proxy's certificate (or,
+/// `502` for a failed upstream request (on an intercepted connection, only an app's or a
+/// navigation's: see [`failure`]). The client accepted the proxy's certificate (or,
 /// for an absolute-form `https://` request, left TLS to the proxy), so it cannot show its
 /// own warning for a server certificate that is expired or for another name; a short text
 /// says what is wrong instead of an empty page. So does a failure that would make the host

@@ -4,7 +4,8 @@
 
 use tollgate_policy::{
     Config, Decision, PassthroughReason, Policy, REJECTION_WINDOW_SECS, RejectionKind,
-    SILENT_BURST_HOSTS, SILENT_BURST_SECS, SILENT_RECENT_SECS, SILENT_REFUSALS,
+    SILENT_BURST_HOSTS, SILENT_BURST_SECS, SILENT_FLOOD_RATIO, SILENT_FLOOD_SECONDS,
+    SILENT_FLOOD_SECS, SILENT_HELD_BACK_LOG_SECS, SILENT_RECENT_SECS, SILENT_REFUSALS,
     SILENT_SUPPRESS_SECS,
 };
 
@@ -37,6 +38,10 @@ fn the_rule_is_three_refusals_in_different_seconds_within_ten_minutes() {
     assert_eq!(SILENT_BURST_HOSTS, 4);
     assert_eq!(SILENT_BURST_SECS, 10);
     assert_eq!(SILENT_SUPPRESS_SECS, 60);
+    assert_eq!(SILENT_FLOOD_SECS, 60);
+    assert_eq!(SILENT_FLOOD_SECONDS, 10);
+    assert_eq!(SILENT_FLOOD_RATIO, 5);
+    assert_eq!(SILENT_HELD_BACK_LOG_SECS, 300);
 }
 
 #[test]
@@ -114,7 +119,14 @@ fn uses_further_apart_than_the_window_teach_nothing() {
 fn a_trusted_handshake_keeps_the_host_from_being_learned_for_the_window() {
     let p = policy();
     p.record_intercepted_handshake("www.site.example", T0);
-    for at in T0 + 1..T0 + 20 {
+    // Refusals in as many different seconds as a minute can hold without a flood, many
+    // each, then every ten seconds for the rest of the window.
+    for at in T0 + 1..T0 + SILENT_FLOOD_SECONDS as u64 {
+        for _ in 0..20 {
+            assert!(!p.record_silent_refusal("www.site.example", at));
+        }
+    }
+    for at in (T0 + 70..T0 + REJECTION_WINDOW_SECS).step_by(10) {
         assert!(!p.record_silent_refusal("www.site.example", at));
     }
     assert!(hosts(&p).is_empty());
@@ -150,15 +162,32 @@ fn a_trusted_handshake_forgets_pending_refusals() {
 
 #[test]
 fn a_browser_that_trusts_us_is_never_learned() {
-    // A browser completes handshakes for a site, and between them hangs up some
-    // connections early (preconnects it did not need, races lost to another network).
+    // A browser completes handshakes for a site, and hangs up some connections early
+    // (preconnects it did not need, races lost to another network). The worst moment in a
+    // device log: 7 hang-ups within 2 seconds on two hosts that completed 18 and 2
+    // handshakes then. Here each host has 7 hang-ups every 5 seconds for ten minutes,
+    // before its handshakes of that moment: refusals in far more than
+    // SILENT_FLOOD_SECONDS different seconds a minute.
     let p = policy();
-    for second in 0..600 {
-        let now = T0 + second;
-        if second % 30 == 0 {
-            p.record_intercepted_handshake("news.example", now);
+    for burst in 0..120 {
+        let now = T0 + burst * 5;
+        for (host, handshakes) in [("www.news.example", 18), ("img.news.example", 2)] {
+            for _ in 0..4 {
+                assert!(!p.record_silent_refusal(host, now));
+            }
+            for _ in 0..3 {
+                assert!(!p.record_silent_refusal(host, now + 1));
+            }
+            for _ in 0..handshakes {
+                p.record_intercepted_handshake(host, now + 1);
+            }
         }
-        assert!(!p.record_silent_refusal("news.example", now));
+    }
+    // One that hangs up a connection every second and completes one every second.
+    for second in 0..600 {
+        let now = T0 + 1_000 + second;
+        assert!(!p.record_silent_refusal("api.news.example", now));
+        p.record_intercepted_handshake("api.news.example", now);
     }
     assert!(hosts(&p).is_empty());
 }
