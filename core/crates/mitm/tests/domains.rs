@@ -24,7 +24,7 @@ use tollgate_filter::{DomainSet, ListFormat, ListSource};
 use tollgate_mitm::{CertAuthority, ProxyContext, ServeOptions};
 use tollgate_policy::{Config, Decision, RejectionKind};
 
-use support::client::{get, proxy_get, read_to_close, wait_for};
+use support::client::{get, proxy_get, proxy_try_get, read_to_close, wait_for};
 use support::tunnel::{
     alpn, connect, connect_status, http2, peer_issuer, reset_reason, send2, tls, tls_config,
 };
@@ -558,8 +558,29 @@ async fn absolute_form_requests_to_a_blocked_host_get_403() {
     let s = setup(Config::default()).await;
     let reply = proxy_get(s.proxy.addr, "http://ads.example/pixel.gif", &[]).await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(reply.headers["access-control-allow-origin"], "*");
     let reply = proxy_get(s.proxy.addr, "https://ads.example/pixel.gif", &[]).await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     assert_eq!(s.proxy.stats().dns_blocked, 2);
+    assert_eq!(s.origin.connections(), 0);
+}
+
+/// Like a request the filter engine blocks: a browser's navigation gets a page saying that
+/// Tollgate blocked it, and its other requests no response.
+#[tokio::test]
+async fn absolute_form_requests_to_a_blocked_host_from_a_browser() {
+    let s = setup(Config::default()).await;
+    for url in ["http://ads.example/", "https://ads.example/"] {
+        let page = proxy_get(s.proxy.addr, url, &[("sec-fetch-dest", "document")]).await;
+        assert_eq!(page.status, StatusCode::FORBIDDEN, "{url}");
+        assert!(
+            page.body.starts_with("Tollgate blocked this page."),
+            "{url}"
+        );
+        let script = proxy_try_get(s.proxy.addr, url, &[("sec-fetch-dest", "script")]).await;
+        assert!(script.is_none(), "{url}: {script:?}");
+    }
+    assert_eq!(s.proxy.stats().dns_blocked, 4);
+    assert_eq!(dns_blocks(&s.events).len(), 4);
     assert_eq!(s.origin.connections(), 0);
 }

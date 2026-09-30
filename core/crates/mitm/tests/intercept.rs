@@ -16,14 +16,19 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tollgate_mitm::{CertAuthority, limits};
 use tollgate_policy::Config;
 
-use support::client::{get, http1, read_to_close, send1, wait_for};
-use support::tunnel::{alpn, connect, http2, issuer_via, peer_issuer, send2, tls, tls_config};
+use support::client::{get, http1, read_reply, read_to_close, send1, wait_for};
+use support::tunnel::{
+    alpn, connect, http2, issuer_via, peer_issuer, reset_reason, send2, tls, tls_config,
+};
 use support::{proxy, tls_origin};
 
 const RULES: &str = "\
 ||ads.tollgate.test^
 /pixel/*$image
 ||tracker.tollgate.test^$third-party
+/ads/*
+! Rules without a type skip top-level documents; this one blocks them.
+/ads/*$document
 ";
 
 struct Setup {
@@ -127,19 +132,37 @@ async fn blocked_requests_get_403_with_cors_header() {
     assert_eq!(s.proxy.stats().http_blocked, 1);
 }
 
-/// Opens an intercepted HTTP/2 connection for `name` and checks each case.
-/// A path, its request headers and the status the client should get.
-type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], StatusCode);
+/// What a request gets: a response with this status, or no response, its HTTP/2 stream
+/// reset with this reason.
+#[derive(Debug, PartialEq)]
+enum Answer {
+    Status(StatusCode),
+    Reset(Option<h2::Reason>),
+}
 
-async fn check_statuses(s: &Setup, name: &str, cases: &[Case<'_>]) {
+const OK: Answer = Answer::Status(StatusCode::OK);
+/// A blocked request from an app, or a blocked navigation.
+const FORBIDDEN: Answer = Answer::Status(StatusCode::FORBIDDEN);
+/// Any other blocked request from a browser.
+const NO_RESPONSE: Answer = Answer::Reset(Some(h2::Reason::INTERNAL_ERROR));
+
+/// A path, its request headers and what the client should get.
+type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], Answer);
+
+/// Opens an intercepted HTTP/2 connection for `name` and checks the cases on it in order,
+/// so a case after a reset also shows that the connection stayed open.
+async fn check_answers(s: &Setup, name: &str, cases: &[Case<'_>]) {
     let tcp = connect(s.proxy.addr, &s.target()).await;
     let tls = tls(tcp, tls_config(&[&s.ca], &[b"h2"]), name)
         .await
         .unwrap();
     let mut h2 = http2(tls).await;
     for (path, headers, expected) in cases {
-        let reply = send2(&mut h2, get(&s.url(name, path), headers)).await;
-        assert_eq!(reply.status, *expected, "{name}{path} {headers:?}");
+        let answer = match h2.send_request(get(&s.url(name, path), headers)).await {
+            Ok(response) => Answer::Status(read_reply(response).await.status),
+            Err(e) => Answer::Reset(reset_reason(&e)),
+        };
+        assert_eq!(answer, *expected, "{name}{path} {headers:?}");
     }
 }
 
@@ -148,25 +171,17 @@ async fn request_type_comes_from_fetch_dest_then_accept_then_extension() {
     let s = setup().await;
     // `/pixel/*$image`
     let cases: &[Case] = &[
-        (
-            "/pixel/a",
-            &[("sec-fetch-dest", "image")],
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            "/pixel/a",
-            &[("accept", "image/avif,*/*")],
-            StatusCode::FORBIDDEN,
-        ),
-        ("/pixel/a.png", &[], StatusCode::FORBIDDEN),
+        ("/pixel/a", &[("sec-fetch-dest", "image")], NO_RESPONSE),
+        ("/pixel/a", &[("accept", "image/avif,*/*")], FORBIDDEN),
+        ("/pixel/a.png", &[], FORBIDDEN),
         (
             "/pixel/a.png",
             &[("sec-fetch-dest", "script"), ("accept", "image/avif")],
-            StatusCode::OK,
+            OK,
         ),
-        ("/pixel/a", &[], StatusCode::OK),
+        ("/pixel/a", &[], OK),
     ];
-    check_statuses(&s, "www.tollgate.test", cases).await;
+    check_answers(&s, "www.tollgate.test", cases).await;
 }
 
 #[tokio::test]
@@ -175,28 +190,139 @@ async fn documents_are_their_own_source() {
     // `||tracker.tollgate.test^$third-party`: a top-level document is first party; the
     // same URL embedded by another site, or with no source at all, is third party.
     let cases: &[Case] = &[
-        ("/", &[("sec-fetch-dest", "document")], StatusCode::OK),
+        ("/", &[("sec-fetch-dest", "document")], OK),
         (
             "/",
             &[
                 ("sec-fetch-dest", "iframe"),
                 ("referer", "https://news.test/"),
             ],
-            StatusCode::FORBIDDEN,
+            NO_RESPONSE,
         ),
         (
             "/app.js",
             &[("referer", "https://tracker.tollgate.test/")],
-            StatusCode::OK,
+            OK,
         ),
         (
             "/app.js",
             &[("origin", "https://tracker.tollgate.test")],
-            StatusCode::OK,
+            OK,
         ),
-        ("/app.js", &[], StatusCode::FORBIDDEN),
+        ("/app.js", &[], FORBIDDEN),
     ];
-    check_statuses(&s, "tracker.tollgate.test", cases).await;
+    check_answers(&s, "tracker.tollgate.test", cases).await;
+}
+
+/// Browsers send `Sec-Fetch-Dest` and apps do not. A blocked request from a browser that
+/// is not a navigation gets no response: its HTTP/2 stream is reset, and the connection
+/// stays open for the page's next request. A blocked navigation gets a `403` page, and an
+/// app the empty `403`.
+#[tokio::test]
+async fn a_blocked_request_is_answered_by_its_fetch_destination() {
+    let s = setup().await;
+    let others = [
+        "script", "image", "style", "font", "iframe", "empty", "video",
+    ];
+    let headers: Vec<[(&str, &str); 1]> = others
+        .iter()
+        .map(|dest| [("sec-fetch-dest", *dest)])
+        .collect();
+    let mut cases: Vec<Case> = Vec::new();
+    for header in &headers {
+        cases.push(("/ads/1", header, NO_RESPONSE));
+        cases.push(("/page", &[("sec-fetch-dest", "document")], OK));
+    }
+    cases.push(("/ads/1", &[("sec-fetch-dest", "document")], FORBIDDEN));
+    cases.push(("/ads/1", &[], FORBIDDEN));
+    check_answers(&s, "www.tollgate.test", &cases).await;
+
+    assert_eq!(s.origin.requests(), others.len());
+    let stats = s.proxy.stats();
+    assert_eq!(stats.http_requests, 2 * others.len() as u64 + 2);
+    assert_eq!(stats.http_blocked, others.len() as u64 + 2);
+}
+
+#[tokio::test]
+async fn a_blocked_navigation_gets_a_page_that_says_so() {
+    let s = setup().await;
+    let tcp = connect(s.proxy.addr, &s.target()).await;
+    let tls = tls(tcp, tls_config(&[&s.ca], &[b"h2"]), "www.tollgate.test")
+        .await
+        .unwrap();
+    let mut h2 = http2(tls).await;
+    let request = get(
+        &s.url("www.tollgate.test", "/ads/landing"),
+        &[("sec-fetch-dest", "document")],
+    );
+
+    let page = send2(&mut h2, request).await;
+
+    assert_eq!(page.status, StatusCode::FORBIDDEN);
+    assert_eq!(page.headers["content-type"], "text/plain; charset=utf-8");
+    assert_eq!(page.headers["cache-control"], "no-store");
+    assert!(
+        page.body.starts_with("Tollgate blocked this page."),
+        "{}",
+        page.body
+    );
+    assert_eq!(s.origin.requests(), 0);
+    assert_eq!(s.proxy.stats().http_blocked, 1);
+}
+
+/// A host that became passed through while its connection was open (a pin learned
+/// elsewhere): a browser's blocked request still gets no response, and the connection
+/// closes (GOAWAY) as after any other request, so the next one opens a new `CONNECT`.
+#[tokio::test]
+async fn a_blocked_request_on_a_connection_to_a_newly_pinned_host_closes_it() {
+    let s = setup().await;
+    let tcp = connect(s.proxy.addr, &s.target()).await;
+    let tls = tls(tcp, tls_config(&[&s.ca], &[b"h2"]), "www.tollgate.test")
+        .await
+        .unwrap();
+    let mut h2 = http2(tls).await;
+    let url = s.url("www.tollgate.test", "/ads/1");
+
+    let now = tollgate_common::clock::unix_secs();
+    assert!(
+        s.proxy
+            .ctx
+            .policy
+            .learn_upstream_untrusted("www.tollgate.test", now)
+    );
+    let error = h2
+        .send_request(get(&url, &[("sec-fetch-dest", "script")]))
+        .await
+        .unwrap_err();
+    assert_eq!(reset_reason(&error), Some(h2::Reason::INTERNAL_ERROR));
+    wait_for("the HTTP/2 connection to close", || h2.is_closed()).await;
+}
+
+/// HTTP/1.1 has no stream to reset: a blocked request from a browser closes the connection
+/// without a response, and the browser opens a new one for its next request.
+#[tokio::test]
+async fn a_blocked_request_from_a_browser_closes_an_http1_connection() {
+    let s = setup().await;
+    let tcp = connect(s.proxy.addr, &s.target()).await;
+    let tls = tls(
+        tcp,
+        tls_config(&[&s.ca], &[b"http/1.1"]),
+        "www.tollgate.test",
+    )
+    .await
+    .unwrap();
+    let mut h1 = http1(tls).await;
+    let host = ("host", "www.tollgate.test");
+
+    let allowed = send1(&mut h1, get("/page", &[host])).await;
+    assert_eq!(allowed.status, StatusCode::OK);
+    let blocked = h1
+        .send_request(get("/ads/1", &[host, ("sec-fetch-dest", "script")]))
+        .await;
+    assert!(blocked.is_err(), "expected no response, got {blocked:?}");
+    wait_for("the connection to close", || h1.is_closed()).await;
+    assert_eq!(s.origin.requests(), 1);
+    assert_eq!(s.proxy.stats().http_blocked, 1);
 }
 
 #[tokio::test]

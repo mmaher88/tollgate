@@ -2,7 +2,11 @@
 //! reached by IP address, with the TLS name set explicitly.
 //!
 //! Each upstream has one shared connection. Queries are independent futures that clone the
-//! connection's sender, so any number of them run at once on the same connection.
+//! connection's sender, so any number of them run at once on the same connection. It is
+//! used again after an idle time of up to [`MAX_IDLE`] while the device stays awake, but
+//! not after the device slept ([`MAX_SLEEP`]); nothing is sent to keep it open, so an idle
+//! resolver costs no battery. A new connection resumes the TLS session of the last one
+//! when the server allows it (rustls keeps sessions by default).
 //!
 //! An upstream that times out or cannot be reached is marked down for [`DOWN_FOR`] and tried
 //! only after the others, so a network that silently drops its packets does not cost every
@@ -29,16 +33,31 @@ use tokio::net::TcpStream;
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
+use tollgate_common::clock::Reading;
 use tollgate_policy::DohUpstream;
 
 /// Deadline for one attempt that has to open a connection first.
 pub const COLD_DEADLINE: Duration = Duration::from_millis(2000);
 /// Deadline for one attempt on an open connection.
 pub const WARM_DEADLINE: Duration = Duration::from_millis(1500);
-/// A connection that has not completed a request for this long is not trusted to be
-/// alive (the device may have slept, and NAT or the server dropped it): the next query
-/// opens a new connection under the cold deadline instead of waiting out the warm one.
-pub const MAX_IDLE: Duration = Duration::from_secs(30);
+/// A connection that has not completed a request for this long, with the device awake the
+/// whole time, is not trusted to be alive: the next query opens a new connection under the
+/// cold deadline instead of risking the warm one. Losing a connection sooner costs little
+/// when the loss shows: the connection sees a server close it (Quad9 closed idle ones
+/// after 180 s), and a query on one the server dropped fails at once and is retried on a
+/// new one (seen once on a Quad9 connection idle for 90 s, and on a Cloudflare one idle
+/// for 600 s, although Cloudflare left another open for over 20 minutes). What this limits
+/// is a connection lost silently, which costs the warm deadline; NATs are not meant to
+/// drop one idle for less than two hours (RFC 5382). Reusing a connection saves a TCP and
+/// a TLS handshake: about 40 ms to Cloudflare and 60 ms to Quad9 from a home connection.
+pub const MAX_IDLE: Duration = Duration::from_secs(120);
+/// A connection is not used again once the device has slept for longer than this since
+/// it last completed a request, however short its idle time: after sleep it is probably
+/// dead (the network may have changed, and NAT or the server may have dropped it while
+/// the device could not answer), and finding out would cost the warm deadline. The clocks
+/// that tell sleep from idle time (see `tollgate_common::clock::Reading`) differ by
+/// milliseconds at most while the device is awake.
+pub const MAX_SLEEP: Duration = Duration::from_secs(1);
 /// Queries resolving at once, across all clones; above it `resolve` fails at once with
 /// [`DohError::Busy`]. The tunnel splits it: [`crate::LOOKUP_PERMITS`] for the proxy's name
 /// lookups (`HostResolver` waits for a turn instead of exceeding it) and the rest for the
@@ -102,7 +121,7 @@ struct Slot {
     sender: Option<SendRequest<Full<Bytes>>>,
     generation: u64,
     /// When the connection opened or last completed a request, from the resolver's clock.
-    last_used: u64,
+    last_used: Reading,
 }
 
 struct Upstream {
@@ -113,8 +132,8 @@ struct Upstream {
     slot: std::sync::Mutex<Slot>,
     /// Held while connecting, so concurrent cold queries open one connection, not many.
     connecting: tokio::sync::Mutex<()>,
-    /// Until when (on the resolver's clock) the upstream is tried after the others; 0 when
-    /// it is up.
+    /// Until when (in seconds on the resolver's clock that counts sleep) the upstream is
+    /// tried after the others; 0 when it is up.
     down_until: AtomicU64,
     /// Set while a background query checks whether a down upstream is back.
     probing: AtomicBool,
@@ -141,8 +160,10 @@ struct Inner {
     in_flight: Semaphore,
 }
 
-/// Seconds from a clock that keeps counting while the device sleeps.
-type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+/// Reads a clock that keeps counting while the device sleeps and one that stops (see
+/// [`Reading`]): how long connections were idle and whether the device slept meanwhile,
+/// and on the first, until when an upstream is down.
+type Clock = Arc<dyn Fn() -> Reading + Send + Sync>;
 
 /// DNS over HTTPS client. Cheap to clone; clones share connections and the in-flight limit.
 /// `resolve` must run on a tokio runtime (it spawns each connection's driver task), and its
@@ -199,14 +220,14 @@ impl DohResolver {
                 tls: TlsConnector::from(tls),
                 in_flight: Semaphore::new(MAX_IN_FLIGHT),
             }),
-            clock: Arc::new(tollgate_common::clock::now_secs),
+            clock: Arc::new(Reading::now),
         }
     }
 
-    /// This resolver with `clock` (seconds, counting through sleep) in place of
-    /// `tollgate_common::clock::now_secs` for measuring how long connections were idle.
-    /// Clones made earlier keep their clock. For tests.
-    pub fn with_clock(self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> DohResolver {
+    /// This resolver with `clock` in place of [`Reading::now`], for measuring how long
+    /// connections were idle and whether the device slept meanwhile, and for how long an
+    /// upstream stays down. Clones made earlier keep their clock. For tests.
+    pub fn with_clock(self, clock: impl Fn() -> Reading + Send + Sync + 'static) -> DohResolver {
         DohResolver {
             clock: Arc::new(clock),
             ..self
@@ -216,10 +237,10 @@ impl DohResolver {
     /// Drops every upstream's open connection, so the next query to each opens a new one,
     /// and forgets which upstreams were down, so each gets another chance on the new path.
     /// For a network path change or a wake from sleep: a connection made on the old path
-    /// would otherwise be reused for up to [`MAX_IDLE`] and cost each query the warm
-    /// deadline before it fails. Attempts in flight on the old path stop and try once more
-    /// on the new one, and whatever they do later does not mark an upstream down. Safe to
-    /// call from any thread, inside or outside the runtime.
+    /// would otherwise be reused for up to [`MAX_IDLE`] (after a change while awake) and
+    /// cost each query the warm deadline before it fails. Attempts in flight on the old
+    /// path stop and try once more on the new one, and whatever they do later does not
+    /// mark an upstream down. Safe to call from any thread, inside or outside the runtime.
     pub fn reset_connections(&self) {
         for upstream in &self.inner.upstreams {
             // Before clearing the mark, so a stale attempt marking it down now undoes that.
@@ -271,7 +292,7 @@ impl DohResolver {
     /// that are down in configured order. Starts a background query to each down upstream
     /// whose time is up.
     fn order(&self, body: &Bytes) -> Vec<usize> {
-        let now = (self.clock)();
+        let now = (self.clock)().total_secs();
         let mut up = Vec::with_capacity(self.inner.upstreams.len());
         let mut down = Vec::new();
         for (index, upstream) in self.inner.upstreams.iter().enumerate() {
@@ -410,16 +431,17 @@ impl Upstream {
     }
 
     /// One query: an attempt on the open connection if there is one that was used within
-    /// [`MAX_IDLE`] (retried once on a new connection if that connection turns out to be
-    /// closed), otherwise an attempt on a new connection. An answer, even an unusable one,
-    /// marks the upstream up; a timeout or a failure to connect or exchange marks it down.
-    /// A network path change ([`DohResolver::reset_connections`]) stops the attempt in
-    /// flight, which is then made once more on a new connection.
+    /// [`MAX_IDLE`] and the device has not slept since (retried once on a new connection
+    /// if that connection turns out to be closed), otherwise an attempt on a new
+    /// connection. An answer, even an unusable one, marks the upstream up; a timeout or a
+    /// failure to connect or exchange marks it down. A network path change
+    /// ([`DohResolver::reset_connections`]) stops the attempt in flight, which is then made
+    /// once more on a new connection.
     async fn query(
         &self,
         tls: &TlsConnector,
         body: &Bytes,
-        now: &(dyn Fn() -> u64 + Send + Sync),
+        now: &(dyn Fn() -> Reading + Send + Sync),
     ) -> Result<Vec<u8>, DohError> {
         // One retry after a reset, so a query cannot be held up by resets for long.
         let mut stop_on_reset = true;
@@ -451,7 +473,7 @@ impl Upstream {
                             // A connection that stops answering (for example after the
                             // device slept) is dropped, so the next query connects again.
                             self.discard(generation);
-                            self.mark_down(epoch, now());
+                            self.mark_down(epoch, now().total_secs());
                             return Err(DohError::Timeout);
                         }
                     }
@@ -485,7 +507,7 @@ impl Upstream {
             };
             match &result {
                 Ok(_) | Err(Failure::Answer(_)) => self.mark_up(),
-                Err(Failure::Connection(_)) => self.mark_down(epoch, now()),
+                Err(Failure::Connection(_)) => self.mark_down(epoch, now().total_secs()),
             }
             return result.map_err(Failure::into_error);
         }
@@ -495,16 +517,21 @@ impl Upstream {
         self.slot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The open connection, unless it has been idle for longer than [`MAX_IDLE`]: after the
-    /// device sleeps it is probably dead, and finding out would cost the warm deadline.
-    fn open_sender(&self, now: u64) -> Option<(u64, SendRequest<Full<Bytes>>)> {
+    /// The open connection, unless the device slept for longer than [`MAX_SLEEP`] since it
+    /// was last used, or it has been idle for longer than [`MAX_IDLE`]: it is probably dead
+    /// then, and finding out would cost the warm deadline. A connection that is dropped
+    /// here is closed once the queries still using it end.
+    fn open_sender(&self, now: Reading) -> Option<(u64, SendRequest<Full<Bytes>>)> {
         let mut slot = self.slot();
         let sender = slot.sender.as_ref().filter(|s| !s.is_closed())?.clone();
-        let idle = now.saturating_sub(slot.last_used);
-        if idle > MAX_IDLE.as_secs() {
+        let slept = now.slept_since(&slot.last_used);
+        let idle = now.awake_since(&slot.last_used);
+        if slept > MAX_SLEEP || idle > MAX_IDLE {
             log::debug!(
-                "DoH connection to {} was idle for {idle} s; reconnecting",
-                self.name
+                "DoH connection to {} was idle for {} s, {} s of it asleep; reconnecting",
+                self.name,
+                (idle + slept).as_secs(),
+                slept.as_secs()
             );
             slot.sender = None;
             return None;
@@ -513,7 +540,7 @@ impl Upstream {
     }
 
     /// Records that the connection `generation` just completed a request.
-    fn touch(&self, generation: u64, now: u64) {
+    fn touch(&self, generation: u64, now: Reading) {
         let mut slot = self.slot();
         if slot.generation == generation {
             slot.last_used = slot.last_used.max(now);
@@ -533,7 +560,7 @@ impl Upstream {
     async fn connected_sender(
         &self,
         tls: &TlsConnector,
-        now: &(dyn Fn() -> u64 + Send + Sync),
+        now: &(dyn Fn() -> Reading + Send + Sync),
     ) -> Result<(u64, SendRequest<Full<Bytes>>), DohError> {
         let _connecting = self.connecting.lock().await;
         if let Some(open) = self.open_sender(now()) {

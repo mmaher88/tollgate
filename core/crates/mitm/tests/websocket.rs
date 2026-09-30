@@ -19,7 +19,7 @@ use tokio_rustls::TlsAcceptor;
 use tollgate_mitm::CertAuthority;
 use tollgate_policy::Config;
 
-use support::client::{get, http1, read_reply};
+use support::client::{get, http1, read_reply, wait_for};
 use support::tunnel::{connect, tls, tls_config};
 use support::{proxy, tls_origin};
 
@@ -148,9 +148,20 @@ async fn websocket_rules_block_upgrades_only() {
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.body, "plain HTTP/2.0");
 
+    // An app's blocked upgrade gets the empty 403.
     let reply = read_reply(h1.send_request(upgrade_request("/blocked")).await.unwrap()).await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     assert_eq!(proxy.stats().http_blocked, 1);
+
+    // A browser's (`Sec-Fetch-Dest: websocket`) gets no response: the connection closes.
+    let mut request = upgrade_request("/blocked");
+    request
+        .headers_mut()
+        .insert("sec-fetch-dest", "websocket".parse().unwrap());
+    let result = h1.send_request(request).await;
+    assert!(result.is_err(), "expected no response, got {result:?}");
+    wait_for("the connection to close", || h1.is_closed()).await;
+    assert_eq!(proxy.stats().http_blocked, 2);
 }
 
 static WS_ADDRESS_PRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);

@@ -95,7 +95,8 @@ pub(crate) fn is_domain_blocked(ctx: &ProxyContext, host: &str) -> bool {
 /// check names that only the DNS lists block would load. A block counts in `dns_blocked`
 /// and is recorded as a DNS block. IP addresses are never blocked. The caller blocks the
 /// host: `CONNECT` with a connection whose requests all fail (see `crate::sink`), or `403`
-/// where that cannot be used, and a request in absolute form with `403`.
+/// where that cannot be used, and a request in absolute form as
+/// `crate::request::answer_blocked` says.
 pub(crate) fn domain_blocked_by(ctx: &ProxyContext, host: &str) -> Option<BlockedBy> {
     let host = host.strip_suffix('.').unwrap_or(host);
     let bare = host

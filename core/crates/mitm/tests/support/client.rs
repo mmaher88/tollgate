@@ -60,17 +60,33 @@ pub async fn send1(sender: &mut Sender1, request: Request<Empty<Bytes>>) -> Repl
 
 /// A plain request through the proxy in absolute form, on a new connection.
 pub async fn proxy_get(proxy: SocketAddr, url: &str, headers: &[(&str, &str)]) -> Reply {
+    proxy_try_get(proxy, url, headers)
+        .await
+        .expect("the proxy closed the connection without a response")
+}
+
+/// [`proxy_get`], or `None` when the proxy closes the connection without a response.
+pub async fn proxy_try_get(
+    proxy: SocketAddr,
+    url: &str,
+    headers: &[(&str, &str)],
+) -> Option<Reply> {
     let tcp = TcpStream::connect(proxy).await.unwrap();
     let mut sender = http1(tcp).await;
     let mut request = get(url, headers);
     let host = request.uri().authority().unwrap().to_string();
     request.headers_mut().insert("host", host.parse().unwrap());
-    send1(&mut sender, request).await
+    Some(read_reply(sender.send_request(request).await.ok()?).await)
 }
 
 /// Sends `GET url` to the proxy in absolute form on a new connection and returns every
 /// byte the proxy sends until it closes the connection (within 5 s).
 pub async fn proxy_get_raw(proxy: SocketAddr, url: &str) -> Vec<u8> {
+    proxy_get_raw_with(proxy, url, &[]).await
+}
+
+/// [`proxy_get_raw`] with extra request headers.
+pub async fn proxy_get_raw_with(proxy: SocketAddr, url: &str, headers: &[(&str, &str)]) -> Vec<u8> {
     use tokio::io::AsyncWriteExt;
     let host = url
         .parse::<hyper::Uri>()
@@ -79,7 +95,11 @@ pub async fn proxy_get_raw(proxy: SocketAddr, url: &str) -> Vec<u8> {
         .unwrap()
         .to_string();
     let mut tcp = TcpStream::connect(proxy).await.unwrap();
-    let request = format!("GET {url} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+    let mut request = format!("GET {url} HTTP/1.1\r\nHost: {host}\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
     tcp.write_all(request.as_bytes()).await.unwrap();
     read_to_close(&mut tcp, Duration::from_secs(5))
         .await

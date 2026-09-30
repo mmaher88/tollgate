@@ -4,18 +4,22 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 
-use crate::body::{Body, blocked, status};
+use crate::body::{Body, status};
 use crate::filtering::{is_blocked, is_domain_blocked};
 use crate::http::bare_host;
 use crate::proxy::State;
-use crate::request::{NoResponse, bad_gateway, gets_no_response};
+use crate::request::{NoResponse, answer_blocked, bad_gateway, gets_no_response};
 use crate::upstream::{Target, UpstreamError, learn_from_failure};
 
 /// Filters and forwards one request. `https://` URLs are forwarded over TLS; anything
-/// that is not an absolute `http://` or `https://` URL gets `400`. An upstream that cannot
-/// be reached, or closes or resets the connection before any response, gets
-/// [`NoResponse`]: the client connection closes, so the browser shows its own error page,
-/// as without the proxy, instead of an empty `502`.
+/// that is not an absolute `http://` or `https://` URL gets `400`. A request whose host
+/// the DNS blocklist blocks, or that the filter engine blocks, is answered by
+/// [`answer_blocked`], as on an intercepted connection. The Fetch Metadata standard has
+/// browsers send `Sec-Fetch-Dest` only to `https://` URLs, which they send through
+/// `CONNECT` rather than here, so a blocked `http://` request from a browser gets the
+/// empty `403` an app gets. An upstream that cannot be reached, or closes or resets the
+/// connection before any response, gets [`NoResponse`]: the client connection closes, so
+/// the browser shows its own error page, as without the proxy, instead of an empty `502`.
 pub(crate) async fn forward(
     state: &State,
     request: Request<Incoming>,
@@ -30,7 +34,7 @@ pub(crate) async fn forward(
         return Ok(status(StatusCode::BAD_REQUEST));
     };
     if is_domain_blocked(&state.ctx, host) {
-        return Ok(blocked());
+        return answer_blocked(request.headers());
     }
     let target = Target {
         tls,
@@ -40,7 +44,7 @@ pub(crate) async fn forward(
     };
     let url = uri.to_string();
     if is_blocked(&state.ctx, &url, uri.path(), request.headers(), None) {
-        return Ok(blocked());
+        return answer_blocked(request.headers());
     }
     match state
         .pool
