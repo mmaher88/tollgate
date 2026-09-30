@@ -16,6 +16,9 @@ struct TunnelStats: Codable, Equatable {
     var connectionsPassthrough: UInt64 = 0
     var tlsClientRejections: UInt64 = 0
     var tlsAbandonedAfterHandshake: UInt64 = 0
+    /// Clients that hung up during the TLS handshake, without an alert, after the
+    /// certificate reached them: how an app that pins certificates may refuse it.
+    var tlsSilentRefusals: UInt64 = 0
     var httpsFilteringActive = false
     var availableMemoryBytes = 0
     /// When the tunnel process that answered was created. Unlike the heartbeat file, it

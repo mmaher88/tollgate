@@ -320,6 +320,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             httpRequests: s.httpRequests, httpBlocked: s.httpBlocked,
             connectionsIntercepted: s.connectionsIntercepted, connectionsPassthrough: s.connectionsPassthrough,
             tlsClientRejections: s.tlsClientRejections, tlsAbandonedAfterHandshake: s.tlsAbandonedAfterHandshake,
+            tlsSilentRefusals: s.tlsSilentRefusals,
             httpsFilteringActive: engine.mitmActive(), availableMemoryBytes: os_proc_available_memory(),
             tunnelStartedAt: startedAt)
     }
