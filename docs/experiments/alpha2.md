@@ -486,22 +486,26 @@ Result:
 
 With HTTPS filtering on, a request to an intercepted host whose server presents a
 certificate a browser would refuse (for another name, expired, not yet valid, revoked),
-or one iOS does not trust while pin learning is paused by several such failures at once,
-used to get a short text `502` from Tollgate, which a page sees as loaded. Now a
-browser's request that is not a top-level page gets no response, so the page sees a
-network error, as without Tollgate, where the browser refuses the certificate itself. A
-top-level page still gets the text, and requests from apps, which do not say what they
-are for, still get the `502`. Tollgate logs these failures at debug level only, so the
-checks are what the browsers show.
+or one Tollgate cannot verify with its built-in roots while pin learning is paused by
+several such failures at once (as behind a Wi-Fi sign-in page or a network filter that
+intercepts HTTPS), used to get a short text `502` from Tollgate, which a page sees as
+loaded. Now a browser's request that is not a top-level page gets no response, so the
+page sees a network error, as without Tollgate, where the browser refuses the
+certificate itself. A top-level page still gets the text, and requests from apps, which
+do not say what they are for, still get the `502`. Tollgate logs these failures at debug
+level only, so the checks are what the browsers show.
 
 1. HTTPS filtering on, Connectivity Assist off. In Safari, open the ad-block test page
    used in E18, then do the same in Chrome. Pass: the score is at least E25's. For each
    host the page still reports as loaded, open `https://<that host>/` in Safari. Pass:
    none shows a plain text page that starts with "Tollgate: the server's certificate"
    (a host that does was counted as loaded only because of the `502`). Learned
-   certificate pins may gain hosts of the page whose certificates iOS does not trust,
+   certificate pins may gain hosts of the page whose certificates Tollgate could not
+   verify with its built-in roots (or that it could not make a secure connection to),
    each with `<host>: upstream TLS failed (...); passing it through from now on` in the
-   log; note them.
+   log; note them. Once a host is passed through, the browser checks its certificate
+   itself and may trust it and load it, so such a host can count as loaded without any
+   fault in this change.
 2. Find a host whose server's certificate is for another name (sites that demonstrate
    certificate errors have one) and open `https://<that host>/` in Safari. Pass: a plain
    text page "Tollgate: the server's certificate is for another name, so this site was
