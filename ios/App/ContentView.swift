@@ -109,9 +109,24 @@ struct ContentView: View {
     /// certificate is loaded, and "not checked yet" must not turn the setting off.
     private func enforceTrust() {
         guard certificate.evaluated else { return }
-        if httpsFiltering, !certificate.trusted { httpsFiltering = false }
+        if httpsFiltering, !certificate.trusted { turnOffForUntrustedCertificate() }
     }
 
+    /// Turns HTTPS filtering off because iOS does not trust the Tollgate certificate, and
+    /// records that for the learned pins: while the certificate was untrusted, apps rejected
+    /// every intercepted connection, so pins learned then may name hosts that do not pin.
+    /// The next time filtering is turned on clears them. Recorded before the toggle changes,
+    /// so the record is there before the restart its onChange starts.
+    private func turnOffForUntrustedCertificate() {
+        TunnelController.noteUntrustedCertificate()
+        httpsFiltering = false
+    }
+
+    /// Saves the HTTPS filtering setting and restarts the tunnel with it. Learned pins are
+    /// kept when the owner turns filtering off and on, since they were learned with a
+    /// trusted certificate; they are cleared only when filtering is turned on after the app
+    /// turned it off because the certificate was not trusted
+    /// (`TunnelController.learnedPinsMayBeWrong`).
     private func applyHttpsFiltering(_ enabled: Bool) {
         var config = CoreConfig.load()
         guard config.mitmEnabled != enabled else { return }
@@ -124,10 +139,11 @@ struct ContentView: View {
             return
         }
         Task {
-            await tunnel.restartIfRunning(clearingLearnedPins: enabled)
+            let clearPins = enabled && TunnelController.learnedPinsMayBeWrong
+            await tunnel.restartIfRunning(clearingLearnedPins: clearPins)
             if enabled, tunnel.status == .connected,
                await TunnelController.httpsBrokenByUntrustedCertificate() {
-                httpsFiltering = false
+                turnOffForUntrustedCertificate()
                 tunnel.showError("HTTPS filtering was turned off: iOS does not trust the Tollgate certificate for websites yet. Turn on full trust in Settings, General, About, Certificate Trust Settings.")
             }
         }
