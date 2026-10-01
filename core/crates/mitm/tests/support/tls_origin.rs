@@ -36,6 +36,16 @@ impl ResolvesServerCert for AnyName {
     }
 }
 
+/// Presents one leaf, whatever name the client sends.
+#[derive(Debug)]
+struct OneLeaf(Arc<CertifiedKey>);
+
+impl ResolvesServerCert for OneLeaf {
+    fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.0.clone())
+    }
+}
+
 /// Whether a TLS origin asks for a client certificate.
 #[derive(Clone, Copy, Debug)]
 pub enum ClientAuth {
@@ -49,6 +59,26 @@ pub enum ClientAuth {
 /// A TLS origin on 127.0.0.1 with certificates from `ca`, offering `alpn`.
 pub async fn https(ca: Arc<CertAuthority>, alpn: &[&[u8]]) -> Origin {
     https_with(ca, alpn, rustls::DEFAULT_VERSIONS, ClientAuth::None).await
+}
+
+/// A TLS origin like [`https`] (HTTP/2 and HTTP/1.1) whose leaf from `ca` is for `name`
+/// whatever name the client sends, as a server that hosts another site presents: a client
+/// that checks the name rejects it, as it would talking to the server itself.
+pub async fn for_name(ca: Arc<CertAuthority>, name: &str) -> Origin {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(OneLeaf(ca.leaf(name).unwrap())));
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    serve_tls(
+        TlsAcceptor::from(Arc::new(config)),
+        |tls, conn, counters| async move {
+            serve_http(tls, conn, counters).await;
+        },
+    )
+    .await
 }
 
 /// [`https`] limited to `versions`, asking for client certificates as `client_auth` says.

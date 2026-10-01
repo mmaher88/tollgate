@@ -29,7 +29,8 @@ pub use engine::{
 };
 pub use error::{TollgateError, catch_panic, panic_message};
 pub use lists::{
-    CompileReport, ListFormat, ListInput, ListTarget, compile_lists, detect_list_format,
+    CompileReport, ListFormat, ListInput, ListTarget, TOLLGATE_EXTRAS, TOLLGATE_EXTRAS_NAME,
+    compile_lists, detect_list_format,
 };
 pub use logging::{CoreLogger, LogLevel, set_logger};
 

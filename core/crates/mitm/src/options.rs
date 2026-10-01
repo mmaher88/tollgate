@@ -43,8 +43,9 @@ pub struct ServeOptions {
     /// Default 5 minutes.
     pub tunnel_idle_timeout: Duration,
     /// Blocked hosts' connections open at once. A host the DNS blocklist blocks gets `200`
-    /// and a connection that completes TLS and fails every request, because iOS retries a
-    /// refused connection over another network without the proxy. When this many are open,
+    /// and a connection that completes TLS and answers every request as blocked (see
+    /// `crate::sink`), because iOS retries a refused connection over another network
+    /// without the proxy. When this many are open,
     /// the one idle longest is closed to make room; when none is idle, or none becomes idle
     /// within a short wait, a blocked host gets `403`, and a blocked TLS server name behind
     /// another `CONNECT` host is closed. Default 64.

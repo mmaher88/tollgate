@@ -67,7 +67,7 @@ async fn compile(args: &Args, data_dir: &str) -> Result<(), String> {
         log::info!("{}: {} bytes", spec.source, text.len());
         let (format, target) = match spec.kind {
             ListKind::Url => (ListFormat::Adblock, ListTarget::Url),
-            ListKind::Dns => (ListFormat::Adblock, ListTarget::Dns),
+            ListKind::Dns | ListKind::DnsExempting => (ListFormat::Adblock, ListTarget::Dns),
             ListKind::Hosts => (ListFormat::Hosts, ListTarget::Dns),
         };
         inputs.push(ListInput {
@@ -75,6 +75,7 @@ async fn compile(args: &Args, data_dir: &str) -> Result<(), String> {
             text,
             format,
             target,
+            exempt_sensitive_hosts: spec.kind == ListKind::DnsExempting,
         });
     }
     let report = compile_lists(inputs, data_dir.to_string()).map_err(|e| e.to_string())?;

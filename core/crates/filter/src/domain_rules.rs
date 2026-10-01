@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use crate::wildcard::{is_unkeyed, is_valid_pattern};
-use crate::{ListFormat, ListSource};
+use crate::{DnsList, Exemption, ListFormat, ListSource};
 
 /// The most wildcard patterns, blocks and exceptions together, that one compile keeps.
 /// The tunnel parses every pattern into its heap when it loads `domains.bin`, up to about
@@ -39,6 +39,9 @@ pub const MAX_UNKEYED_PATTERNS: usize = 64;
 /// [`MAX_UNKEYED_PATTERNS`] start and end with `*`: exceptions first, since leaving one out
 /// would block what a list unblocks, then blocks, each in the order the lists give them.
 /// Each pattern left out counts as one skipped line.
+///
+/// A list may exempt hosts (see [`DnsList::exempt`]): its block rules that cover one are
+/// left out and counted in `exempted`, before `$badfilter` and the limits apply.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DomainRules {
     /// `$important` blocks. They win over every exception.
@@ -68,6 +71,9 @@ pub struct DomainRules {
     /// regexes, `$important` exact-host and wildcard blocks, and hosts lines without a
     /// usable name. Also one for each pattern over the limits.
     pub skipped: u64,
+    /// Block rules left out because they cover a host their list exempts: one for each
+    /// rule, and one for each name of a hosts line.
+    pub exempted: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,6 +90,20 @@ enum Kind {
 }
 
 impl Kind {
+    /// Whether a rule of this kind covers a host `exempt` exempts, so that a list with the
+    /// exemption leaves it out. Exceptions never do: they block nothing.
+    fn covers_exempt(self, name: &str, exempt: &Exemption) -> bool {
+        match self {
+            Kind::Important | Kind::Block => exempt.covers_subtree(name),
+            Kind::ExactBlock => exempt.covers_host(name),
+            Kind::WildcardBlock => exempt.covers_pattern(name, true),
+            Kind::ExactWildcardBlock => exempt.covers_pattern(name, false),
+            Kind::Allow | Kind::ExactAllow | Kind::WildcardAllow | Kind::ExactWildcardAllow => {
+                false
+            }
+        }
+    }
+
     fn is_pattern(self) -> bool {
         matches!(
             self,
@@ -113,7 +133,9 @@ enum Line {
 }
 
 #[derive(Default)]
-struct Builder {
+struct Builder<'a> {
+    /// The hosts the list being added exempts.
+    exempt: Option<&'a Exemption>,
     important: HashSet<String>,
     allow: HashSet<String>,
     block: HashSet<String>,
@@ -128,6 +150,7 @@ struct Builder {
     /// limits [`Builder::limit_patterns`] applies.
     pattern_order: Vec<(Kind, String)>,
     skipped: u64,
+    exempted: u64,
 }
 
 impl DomainRules {
@@ -145,25 +168,51 @@ impl DomainRules {
     /// over the limits in [`DomainRules`] are skipped. Hosts lists contribute every name on
     /// `address name...` lines and bare `name` lines.
     pub fn parse(lists: &[ListSource]) -> DomainRules {
+        let lists: Vec<DnsList> = lists.iter().copied().map(DnsList::from).collect();
+        DomainRules::parse_exempting(&lists)
+    }
+
+    /// Like [`DomainRules::parse`], leaving out each list's block rules that cover a host
+    /// it exempts (see [`DnsList::exempt`]).
+    pub fn parse_exempting(lists: &[DnsList]) -> DomainRules {
         let mut builder = Builder::default();
         for list in lists {
-            let text = list.text.strip_prefix('\u{feff}').unwrap_or(list.text);
-            let before = builder.skipped;
-            match list.format {
+            let DnsList { source, exempt } = *list;
+            builder.exempt = exempt;
+            let text = source.text.strip_prefix('\u{feff}').unwrap_or(source.text);
+            let (skipped, exempted) = (builder.skipped, builder.exempted);
+            match source.format {
                 ListFormat::Adblock => text.lines().for_each(|line| builder.add_adblock_line(line)),
                 ListFormat::Hosts => text.lines().for_each(|line| builder.add_hosts_line(line)),
             }
             log::info!(
                 "{}: skipped {} lines for the DNS blocklist",
-                list.name,
-                builder.skipped - before
+                source.name,
+                builder.skipped - skipped
             );
+            if exempt.is_some() {
+                log::info!(
+                    "{}: left out {} blocks of exempt hosts",
+                    source.name,
+                    builder.exempted - exempted
+                );
+            }
         }
         builder.finish()
     }
 }
 
-impl Builder {
+impl Builder<'_> {
+    /// Whether the list being added exempts a host that a rule of `kind` for `name`
+    /// covers; if so, counts the rule as exempted.
+    fn exempts(&mut self, kind: Kind, name: &str) -> bool {
+        let exempted = self
+            .exempt
+            .is_some_and(|exempt| kind.covers_exempt(name, exempt));
+        self.exempted += u64::from(exempted);
+        exempted
+    }
+
     fn add_adblock_line(&mut self, line: &str) {
         match parse_adblock_line(line) {
             Line::Comment => {}
@@ -175,6 +224,7 @@ impl Builder {
             } => {
                 self.badfilter.insert((kind, name));
             }
+            Line::Rule { kind, name, .. } if self.exempts(kind, &name) => {}
             Line::Rule { kind, name, .. } if kind.is_pattern() => {
                 if self.set(kind).insert(name.clone()) {
                     self.pattern_order.push((kind, name));
@@ -221,7 +271,9 @@ impl Builder {
                 continue;
             }
             if let Some(name) = normalize_name(name) {
-                self.block.insert(name);
+                if !self.exempts(Kind::Block, &name) {
+                    self.block.insert(name);
+                }
                 accepted += 1;
             }
         }
@@ -283,6 +335,7 @@ impl Builder {
             wildcard_block: sorted(&self.wildcard_block),
             exact_wildcard_block: sorted(&self.exact_wildcard_block),
             skipped: self.skipped,
+            exempted: self.exempted,
         }
     }
 }

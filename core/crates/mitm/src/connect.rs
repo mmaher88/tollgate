@@ -2,9 +2,10 @@
 //! host's connection.
 //!
 //! A host the DNS blocklist blocks gets `200` and a connection that completes TLS with a
-//! Tollgate leaf and then fails every request, without anything being dialed; so does a
-//! TLS server name the blocklist blocks behind another `CONNECT` host (see [`crate::sink`]
-//! for why they are not refused). A blocked host that the policy passes through gets `403`
+//! Tollgate leaf and then answers every request as blocked (an app's with `403`, a
+//! browser's with no response), without anything being dialed; so does a TLS server name
+//! the blocklist blocks behind another `CONNECT` host (see [`crate::sink`] for why they are
+//! not refused). A blocked host that the policy passes through gets `403`
 //! instead, because intercepting it is against the policy or known to fail in the client,
 //! and so does any blocked host when memory is low. When `ServeOptions::max_blocked`
 //! blocked connections are open, the one idle longest is closed to make room, however

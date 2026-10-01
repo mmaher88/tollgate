@@ -6,12 +6,13 @@ mod config;
 mod pattern;
 mod policy;
 
-pub use bundled::bundled_passthrough;
+pub use bundled::{BundledGroup, bundled_passthrough};
 pub use config::{Config, DohUpstream};
 pub use pattern::HostPattern;
 pub use policy::{
     Decision, PIN_LIFETIME_SECS, PassthroughReason, Policy, REJECTION_WINDOW_SECS, RejectionKind,
-    SILENT_BURST_HOSTS, SILENT_BURST_SECS, SILENT_RECENT_SECS, SILENT_REFUSALS,
+    SILENT_BURST_HOSTS, SILENT_BURST_SECS, SILENT_FLOOD_RATIO, SILENT_FLOOD_SECONDS,
+    SILENT_FLOOD_SECS, SILENT_HELD_BACK_LOG_SECS, SILENT_RECENT_SECS, SILENT_REFUSALS,
     SILENT_SUPPRESS_SECS, UPSTREAM_BURST_HOSTS, UPSTREAM_BURST_SECS, UPSTREAM_RECENT_SECS,
     UPSTREAM_SUPPRESS_SECS,
 };

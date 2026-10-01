@@ -11,9 +11,10 @@ that uses the carrier's DNS and no proxy. An attempt through the proxy is ready 
 `CONNECT` answer and the TLS handshake (including the browser's certificate check) are
 done. Tollgate used to answer a `CONNECT` to a blocked host with `403`; iOS then started
 the cellular attempt at once and the blocked host loaded over cellular. Now it answers
-`200`, completes TLS with its own certificate for that host and fails every request on the
-connection without a response, so the attempt through the proxy is ready and wins, and
-the page sees a network error for each blocked request, as before. At most 64 blocked
+`200`, completes TLS with its own certificate for that host and answers every request on
+the connection itself, so the attempt through the proxy is ready and wins. A browser's
+request fails without a response, so the page sees a network error for each blocked
+request, as before; an app's request gets an empty `403` (E37). At most 64 blocked
 connections are open at once; when all are taken, the one idle longest is closed to make
 room. Blocked hosts that are passed through (Never filtered, the built-in list, Learned
 certificate pins) still get `403`, and so do blocked hosts while the tunnel is low on
@@ -29,6 +30,15 @@ kept through idle time, certificate pins learned from apps that hang up without 
 hosts files recognized by their content, and learned pins kept when HTTPS filtering is
 turned off and on. Run E23 right after installing the build, since it checks what its
 first launch does.
+
+E31 to E35 check the changes made after E30: two more built-in DNS lists that leave the
+hosts of banks and sensitive services alone, two hosts Tollgate blocks on its own, browser
+requests that fail when a server's certificate is bad, and pins learned from an app that
+keeps refusing Tollgate's certificate for a host that other apps trust it for. Run E31
+right after installing the build, for the same reason as E23. E36 checks the apps behind
+the hosts added to the built-in passthrough list, E37 that apps get an answer from a
+blocked host instead of a failure they retry, and E38 the log line that names a server
+whose certificate a browser would refuse.
 
 ## Logs
 
@@ -343,11 +353,16 @@ refusals in that time).
    its host the log shows `<host> hangs up on our certificate without an alert; passing
    it through from now on`, and the host appears under Learned certificate pins. Note
    each such app and host.
-5. Forget one of those hosts in Learned certificate pins and use its app again. Pass: it
-   fails briefly and the host is learned again. Within a minute of that, turn airplane
-   mode on and off. Pass: the log shows `network changed: dropped 1 certificate pins
-   learned from silent refusals in the last 60 s`, and the app gets its host learned again
-   when it next fails.
+5. Forget one of those hosts in Learned certificate pins and use its app again, on Wi-Fi
+   with cellular data on. Pass: it fails briefly and the host is learned again (a new
+   `learned certificate pin for <host>` line). Within about 30 s of that line, turn Wi-Fi
+   off in Control Center. Pass: within 60 s of that line the log shows `network path
+   changed` and then `network changed: dropped 1 certificate pins learned from silent
+   refusals in the last 60 s`, and the app gets its host learned again when it next
+   fails. A `network path changed` line more than 60 s after the learned line keeps the
+   pin by design, so repeat the step. Airplane mode is no substitute: it can stop the
+   tunnel, and a pin is saved when the tunnel stops and kept after it restarts. Turn Wi-Fi
+   back on afterwards.
 
 Result:
 
@@ -384,5 +399,268 @@ Result:
    may be wrong, so they are cleared. Apps that pin are learned again as they are used.
 4. Once an app's host is learned again, turn HTTPS filtering off and on. Pass: that host is
    still listed.
+
+Result:
+
+## E31: two more built-in DNS lists
+
+HaGeZi Multi LIGHT and OISD small (addresses in `ios/Shared/FilterLists.swift`) are now
+built-in DNS lists, on for existing installs. Their maintainers build them not to break
+anything, but they also list telemetry hosts of banking apps, so the compile leaves out
+each of their blocks that covers a host of the built-in passthrough groups for sensitive
+services and banks (`BundledGroup::Sensitive` and `BundledGroup::Banks` in
+`core/crates/policy/src/bundled.rs`). The other lists still block what they list.
+
+1. Before installing the build under test, note in Tollgate: Settings, Filter lists (the
+   built-in lists that are on, and each list under Added by you with its address and
+   type). If a log of the previous build's last list update is at hand, note its
+   `lists compiled: <rules> rules, <domains> domains` line.
+2. Start the log command above; it includes the core's lines in the app
+   (`dev.tollgate.core`) and the app's own (`dev.tollgate.app`). Install the build, open
+   Tollgate and stay on Home for a minute without tapping anything. Pass: within that
+   minute, in this order: `HaGeZi Multi LIGHT: left out <n> blocks of exempt hosts` and
+   `OISD small: left out <n> blocks of exempt hosts` (about 115 and 22 when this was
+   written, never 0), and no such line for any other list; `Tollgate extras: skipped 0
+   lines for the DNS blocklist` (see E33); `compiled filter lists: CompileReport {...}`
+   with `domain_exempted` the sum of the two `<n>`; then one `lists compiled: <rules>
+   rules, <domains> domains` line, with `<rules>` as before the update and `<domains>`
+   about 21,800 higher (about 232,000 in all when this was written). Settings, Filter
+   lists shows HaGeZi Multi LIGHT and OISD small as the sixth and seventh built-in lists,
+   switched on; the button below the lists reads "Update now" and the status line under
+   it does not say "Changes are not applied yet." A new list that could not be downloaded
+   is named in the status and left out; tap "Update now" later and check again.
+3. If Added by you has a list with the address of either new list (for OISD small, with
+   or without a `/` at the end) typed Domain rules or Hosts file: Pass: the log line of
+   step 2 comes after `<its name> skipped: same address as <built-in name>`, and the
+   list's row says "Not used: the same list as the built-in <built-in name>. You can
+   delete it." (a copy used in place of the built-in list would block the bank hosts the
+   built-in list leaves out). Delete it and tap "Apply changes now". Pass: `lists
+   compiled` with the numbers of step 2.
+4. Switch HaGeZi Multi LIGHT and OISD small off and tap "Apply changes now". Pass: no
+   `left out` line; `<domains>` drops by about 21,800 and `<rules>` stays the same.
+   Switch both on again and apply. Pass: the numbers of step 2.
+
+Result:
+
+## E32: banks and sensitive services with the new lists
+
+1. HTTPS filtering on. Use each banking, card, payment, brokerage, identity and password
+   manager app you use: sign in, open the screens you use most (balances, statements,
+   cards, a transfer screen without sending anything). Pass: every app works as with the
+   previous build: no failed sign-in, no screen that stays empty or says it cannot
+   connect, no new security or device warning.
+2. Activity, Domains: look for blocks of hosts under those apps' own domains. For each,
+   switch HaGeZi Multi LIGHT and OISD small off, tap "Apply changes now" and use the app
+   again. Pass: the same host is blocked again (a newer entry in Activity), so the block
+   comes from a list the previous build had too, not from the new lists. Switch both on
+   again and apply.
+3. Turn HTTPS filtering off and repeat step 1. Pass: the same.
+4. The exemption does not cover Apple's hosts, so the new lists block a few of them: ad
+   and attribution hosts, and hosts of Apple's feedback service. Use the App Store
+   (search, an app's page, an update), iCloud (Photos, Notes), Wallet, and the Feedback
+   Assistant app if it is installed (open your feedback list). Pass: everything works as
+   with the previous build. Note each Apple host that Activity lists as a domain block and
+   what, if anything, failed at that time.
+
+Result:
+
+## E33: hosts Tollgate blocks on its own
+
+Every compile of the DNS blocklist now adds the rules of `TOLLGATE_EXTRAS`
+(`core/crates/tollgate-ffi/src/lists.rs`, each with the reason it is there) as a list
+named "Tollgate extras", after the other lists: an ad platform's host with its
+subdomains, and an analytics service's own name alone, whose subdomains run the
+service's site and stay open. No default list blocks either. An exception in any list,
+My rules included, still wins.
+
+1. Protection on, HTTPS filtering on. In Safari, open `https://<host>/` for each of the
+   two rules' hosts. Pass: both fail with Safari's own error page, and Activity, Domains
+   lists both as domain blocks.
+2. Open `https://www.<host>/` for the second rule's host. Pass: the site loads normally
+   and is not listed in Activity.
+3. In My rules, add `@@||<host>^` for the second rule's host and Save. Pass: after
+   `lists compiled`, `https://<host>/` loads (it redirects to the `www.` name) and
+   Activity lists no new block for it. Remove the line and Save. Pass: it is blocked
+   again.
+4. Turn HTTPS filtering off and repeat steps 1 and 2. Pass: the same.
+
+Result:
+
+## E34: browser requests to servers with bad certificates
+
+With HTTPS filtering on, a request to an intercepted host whose server presents a
+certificate a browser would refuse (for another name, expired, not yet valid, revoked),
+or one Tollgate cannot verify with its built-in roots while pin learning is paused by
+several such failures at once (as behind a Wi-Fi sign-in page or a network filter that
+intercepts HTTPS), used to get a short text `502` from Tollgate, which a page sees as
+loaded. Now a browser's request that is not a top-level page gets no response, so the
+page sees a network error, as without Tollgate, where the browser refuses the
+certificate itself. A top-level page still gets the text, and requests from apps, which
+do not say what they are for, still get the `502`. Tollgate logs the failures of a
+certificate a browser would refuse at info level (see E38) and the others at debug level
+only, so the checks are what the browsers show.
+
+1. HTTPS filtering on, Connectivity Assist off. In Safari, open the ad-block test page
+   used in E18, then do the same in Chrome. Pass: the score is at least E25's. For each
+   host the page still reports as loaded, open `https://<that host>/` in Safari. Pass:
+   none shows a plain text page that starts with "Tollgate: the server's certificate"
+   (a host that does was counted as loaded only because of the `502`). Learned
+   certificate pins may gain hosts of the page whose certificates Tollgate could not
+   verify with its built-in roots (or that it could not make a secure connection to),
+   each with `<host>: upstream TLS failed (...); passing it through from now on` in the
+   log; note them. Once a host is passed through, the browser checks its certificate
+   itself and may trust it and load it, so such a host can count as loaded without any
+   fault in this change.
+2. Find a host whose server's certificate is for another name (sites that demonstrate
+   certificate errors have one) and open `https://<that host>/` in Safari. Pass: a plain
+   text page "Tollgate: the server's certificate is for another name, so this site was
+   not loaded." (a top-level page keeps the text).
+3. Open three or four sites with heavy advertising in Safari and Chrome, and use two or
+   three apps for a few minutes. Pass: the pages load normally, with nothing missing that
+   shows with protection off, and the apps work as before.
+
+Result:
+
+## E35: an app that refuses the certificate for a host other apps trust
+
+E28's rule learns nothing while any client has completed a handshake with Tollgate's
+certificate for the host in the last 10 minutes. An app that pins a host shared with
+apps of the same company that do trust the certificate (a messaging app uploading a
+video to a host the company's main app also uses) was refused hundreds of times within
+a minute and never learned. Now a flood of refusals makes the host a pin despite that
+trust: refusals in 10 different seconds within the last 60 s, at least 5 times the
+handshakes clients completed for that host in the same 60 s. Refusals the guard holds
+back are logged at info level with the host's name once they fall in 3 different seconds
+within 60 s, at most once per host every 5 minutes, so the log names the host an app
+pins (Network.framework names hosts only by hash).
+
+1. HTTPS filtering on, Connectivity Assist off. Note Diagnostics, Silent certificate
+   refusals, and the hosts under Settings, Learned certificate pins. Start the log command
+   above.
+2. Use an app that failed this way before (for example one that could not send videos or
+   uploads with HTTPS filtering on while the rest of it worked), and its company's main
+   app if it has one. Use the main app for a minute first, send it to the background, then
+   within 10 minutes do in the pinning app what failed before. Pass: it fails or stalls
+   for at most about 30 s, then succeeds by itself or on retry, and keeps working. The
+   log shows, for one host: first `not learning a certificate pin for <host> yet: <n>
+   silent refusals in <s> different seconds within 60 s, but a client trusted our
+   certificate for it <t> s ago, with <h> handshakes within 60 s (a flood of refusals in
+   10 different seconds, 5 times the handshakes, would make it a pin)`, then `learned
+   certificate pin for <host> after a flood of <n> silent refusals in <s> different
+   seconds within 60 s, against <h> handshakes; a client trusted our certificate for it
+   <t> s ago` and `<host> hangs up on our certificate without an alert; passing it through
+   from now on`; the host appears under Learned certificate pins. Note the host, the
+   numbers in the lines and how long the app failed. If the host is learned with
+   `learned certificate pin for <host> after 3 silent refusals` instead, no client had
+   trusted it within 10 minutes: note it and repeat the step with more use of the main
+   app, since the flood was not tested. If the app keeps failing, note every `not
+   learning a certificate pin` line and every `silent refusals on <n> hosts within 10 s
+   have a common cause` line, with the time.
+3. Use the main app again. Pass: it works as before.
+4. Forget the host in Learned certificate pins, and repeat step 2 on Wi-Fi with cellular
+   data on (its `not learning` line is left out if the last one came less than 5 minutes
+   before). Within about 30 s of the flood line, turn Wi-Fi off in Control Center. Pass:
+   within 60 s of the flood line the log shows `network path changed` and then `network
+   changed: dropped 1 certificate pins learned from silent refusals in the last 60 s`, and
+   the host is learned again (another `learned certificate pin for <host>` line) when the
+   app next keeps retrying. A `network path changed` line more than 60 s after the flood
+   line keeps the pin by design, so repeat the step. Airplane mode is no substitute: it
+   can stop the tunnel, and a pin is saved when the tunnel stops and kept after it
+   restarts. Turn Wi-Fi back on afterwards.
+5. Browse in Safari and Chrome for 10 minutes as in E28 step 2. Pass: no `learned
+   certificate pin for <host> after a flood` line for a host of the sites visited, and
+   none of their hosts appears under Learned certificate pins. Note each `not learning a
+   certificate pin for <host> yet` line with its numbers; a browser should cause few, and
+   each names a host some client trusted within 10 minutes.
+
+Result:
+
+## E36: apps behind the newer built-in passthrough hosts
+
+The built-in list (`core/crates/policy/src/bundled.rs`) now also passes through, without
+decrypting or filtering them: the Microsoft Intune, Entra ID and Enterprise SSO plug-in
+hosts that Microsoft says must not be TLS-inspected, hosts that apps pin in their
+Info.plist or that vendors list as pinning, Meta's OHTTP relay, and the hosts of two
+payment services, Google Pay and Braintree. The DNS lists still block what they list
+under them. Tollgate logs no line for a built-in passthrough.
+
+1. Only on a phone enrolled in Microsoft Intune; skip it otherwise. HTTPS filtering on.
+   Add `-e 'mdmd'` to the log command above. In Company Portal, open Devices, this
+   device, and tap Check status. Pass: the check finishes without an error and the device
+   is shown as compliant (or as before the build, with the same reasons), and mdmd logs no
+   `Could not send response to MDM server`.
+2. HTTPS filtering on. Use the apps whose hosts the new groups list (the comment at the
+   head of each group names them; in a messaging app, send and open a photo), and make a
+   payment through Google Pay or Braintree if an app offers one: sign in and open the
+   screens you use. Pass: each works as with HTTPS filtering off, and the log shows no
+   `learned certificate pin` line for their hosts.
+3. Settings, Learned certificate pins. Pass: none of the hosts of step 2 is added, and
+   `meta-ohttp-relay-prod.fastly-edge.com` is not added again once forgotten and the
+   Facebook app is used.
+4. Repeat step 2 for 5 minutes with the log command above running. A host that a DNS
+   list blocks under one of the new patterns (WhatsApp's statistics host is one: the
+   AdGuard DNS filter and OISD small block it) is passed through, so its `CONNECT` gets
+   `403`, which the app sees as a network error, not the `403` inside a blocked
+   connection of E37. Pass: Activity, Domains lists such hosts as domain blocks, and no
+   app of step 2 logs more than a few `http connect Proxy received status: HTTP/1.1 403
+   Forbidden` lines a minute. Note any app that does, with its process and count: it
+   retries a blocked host as Claude did before E37's change.
+
+Result:
+
+## E37: apps' requests to blocked hosts
+
+With HTTPS filtering on, a host the DNS lists block gets a working connection from
+Tollgate (E18), and every request on it used to fail without a response. Some apps send
+such a request again and again: in a device log, Claude's telemetry sent 239 requests to
+two blocked hosts in 5 minutes, each reset by Tollgate within milliseconds, until the app
+went to the background. Now a request without a `Sec-Fetch-Dest` header, which is how
+apps send them, gets an empty `403`, as a request the filter lists block does (E25). A
+browser's request carries the header and still fails without a response, a top-level
+page included.
+
+1. HTTPS filtering on, Connectivity Assist off. In a second terminal, stream the app's
+   network lines:
+
+       tooling/scripts/device.sh syslog live --label -pn Claude -e 'received response, status 403' -e 'RST_STREAM with error code' -e 'error code: -1005' -e 'consecutive failures' -e 'reject limit'
+
+2. Open Claude, send a message and wait for the whole reply, attach a PDF to a message,
+   and keep using it for 5 minutes, then send it to the background. Pass: everything
+   works as before (the reply streams in, the upload finishes); the log shows
+   `received response, status 403` lines, few or no `received H2 RST_STREAM with error
+   code: 2` and `error code: -1005` lines, and no `consecutive failures` line. Count the
+   `403` lines: at most a few a minute (the previous build's log had 239 failures in the
+   same time). Note each `Drop a batch due to reject limit reached` line.
+3. Repeat steps 1 and 2 with the Google app (`-pn Google`), X (`-pn Twitter`) and the
+   SwiftKey keyboard (`-pn SwiftKey`), whose requests to blocked hosts were reset in the
+   same log. Pass: each works as before and shows no error it did not show with the
+   previous build (an app that took the `403` for a sign-in problem would ask to sign in
+   again, for example); note any that does, with the time.
+4. In Safari, repeat E18 step 4. Pass: Safari's own error page, as before, not
+   Tollgate's "Tollgate blocked this page." Open the ad-block test page of E18. Pass: the
+   score is at least E25's.
+
+Result:
+
+## E38: the host of a certificate a browser would refuse
+
+When a server's certificate is one a browser would refuse (for another name, expired,
+not yet valid, revoked), Tollgate answers an app's request with a short text `502` (E34).
+In three device logs SwiftKey got 21 such `502`s from one of its hosts, whose server
+presents a certificate for another name (iOS refuses it too with Tollgate off), and
+nothing named the host: Tollgate logged the failure at debug level only, and
+Network.framework names hosts only by hash. Now the tunnel logs `upstream <host>:
+certificate rejected (<the error>)` at info level, at most once a minute for each host,
+as it logs `upstream <host>: unreachable (...)`.
+
+1. HTTPS filtering on. Start the log command above. Open SwiftKey, then bring up the
+   SwiftKey keyboard in any app a few times within a minute. Pass: typing works as
+   before, and within a few seconds Tollgate logs one `upstream <host>: certificate
+   rejected (connecting: invalid peer certificate: certificate not valid for name
+   "<host>"; ...)` line for a SwiftKey host, and no second one for the same host within
+   the minute. If no such line appears, the server may have been fixed: note it and go on.
+2. Open the host of E34 step 2 in Safari. Pass: the text page of E34, and one
+   `upstream <that host>: certificate rejected (...)` line. Reload it three times within
+   a minute. Pass: no second line. Reload it again after a minute. Pass: a second line.
 
 Result:

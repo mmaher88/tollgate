@@ -10,6 +10,9 @@ pub enum ListKind {
     Url,
     /// Adblock syntax for the DNS blocklist (`domains.bin`).
     Dns,
+    /// Adblock syntax for the DNS blocklist, without its blocks of hosts of sensitive
+    /// services and banks (`ListInput::exempt_sensitive_hosts`).
+    DnsExempting,
     /// Hosts format for the DNS blocklist (`domains.bin`).
     Hosts,
 }
@@ -36,8 +39,8 @@ pub enum Command {
     Help,
 }
 
-/// The lists the app ships with: three URL lists, then two DNS lists.
-pub const DEFAULT_LISTS: [(ListKind, &str); 5] = [
+/// The lists the app ships with: three URL lists, then four DNS lists.
+pub const DEFAULT_LISTS: [(ListKind, &str); 7] = [
     (ListKind::Url, "https://easylist.to/easylist/easylist.txt"),
     (
         ListKind::Url,
@@ -55,6 +58,11 @@ pub const DEFAULT_LISTS: [(ListKind, &str); 5] = [
         ListKind::Hosts,
         "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
     ),
+    (
+        ListKind::DnsExempting,
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/light.txt",
+    ),
+    (ListKind::DnsExempting, "https://small.oisd.nl"),
 ];
 
 pub const DEFAULT_DATA_DIR: &str = "devproxy-data";
@@ -73,8 +81,11 @@ Options:
   --url-list SRC     adblock list for URL filtering; SRC is a file or an http(s) URL
   --dns-list SRC     adblock-syntax list for the DNS blocklist
   --hosts-list SRC   hosts-format list for the DNS blocklist
-  --default-lists    EasyList, EasyPrivacy, AdGuard Mobile Ads, AdGuard DNS filter
-                     and StevenBlack hosts, downloaded
+  --exempting-dns-list SRC
+                     like --dns-list, without its blocks of hosts of sensitive
+                     services and banks (the app's bundled passthrough groups)
+  --default-lists    EasyList, EasyPrivacy, AdGuard Mobile Ads, AdGuard DNS filter,
+                     StevenBlack hosts, HaGeZi Multi LIGHT and OISD small, downloaded
   --dns ADDR         UDP address of the DNS responder (default: 127.0.0.1:5353)
   --proxy ADDR       TCP address of the proxy (default: 127.0.0.1:8080)
   -h, --help         this text
@@ -105,11 +116,12 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
             "-h" | "--help" => return Ok(Command::Help),
             "--data-dir" => parsed.data_dir = PathBuf::from(value()?),
             "--config" => parsed.config = Some(PathBuf::from(value()?)),
-            "--url-list" | "--dns-list" | "--hosts-list" => {
+            "--url-list" | "--dns-list" | "--hosts-list" | "--exempting-dns-list" => {
                 let kind = match flag.as_str() {
                     "--url-list" => ListKind::Url,
                     "--dns-list" => ListKind::Dns,
-                    _ => ListKind::Hosts,
+                    "--hosts-list" => ListKind::Hosts,
+                    _ => ListKind::DnsExempting,
                 };
                 parsed.lists.push(ListSpec {
                     kind,

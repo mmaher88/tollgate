@@ -31,13 +31,14 @@ use crate::limits::{
 use crate::request::NoResponse;
 use crate::shutdown::{self, Shutdown};
 use crate::throttle::LogThrottle;
-use crate::upstream::{Pool, PoolOptions, UpstreamError, is_unreachable};
+use crate::upstream::{Pool, PoolOptions, UpstreamError, certificate_problem, is_unreachable};
 use crate::{CertAuthority, ServeOptions, connect, forward};
 
 /// TLS sessions remembered for resumption across intercepted connections.
 const TLS_SESSION_CACHE: usize = 256;
-/// An unreachable upstream host is logged at most once in this interval.
-const UNREACHABLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// An upstream failure logged at info level (see [`State::log_upstream_failure`]) is
+/// logged at most once in this interval for each host.
+const UPSTREAM_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Each cause of refusing a blocked host a blocked connection is logged at info level at most
 /// once in this interval.
 const REFUSED_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -48,9 +49,10 @@ pub struct ProxyContext {
     pub filter: ArcSwapOption<FilterEngine>,
     /// The DNS blocklist, the same one the tunnel's DNS responder uses. Clients using the
     /// proxy do not look names up themselves, so the proxy blocks those hosts itself: a
-    /// `CONNECT` gets a connection whose requests all fail (see `ServeOptions::max_blocked`
-    /// for when it gets `403` instead), and a request in absolute form is answered like a
-    /// request the filter engine blocks (see `crate::request::answer_blocked`).
+    /// `CONNECT` gets a connection whose requests are all answered as blocked (see
+    /// `crate::sink`, and `ServeOptions::max_blocked` for when it gets `403` instead), and
+    /// a request in absolute form is answered like a request the filter engine blocks (see
+    /// `crate::request::answer_blocked`).
     pub domains: ArcSwapOption<DomainSet>,
     pub ca: Arc<CertAuthority>,
     pub stats: Arc<Stats>,
@@ -106,24 +108,24 @@ pub(crate) struct State {
     /// Serves intercepted and blocked connections: HTTP/1.1 or HTTP/2, with the mandatory
     /// limits.
     pub(crate) server: auto::Builder<TokioExecutor>,
-    /// Keeps unreachable upstream hosts to one log line per host a minute.
-    pub(crate) unreachable_log: LogThrottle,
+    /// Keeps the upstream failures logged at info level to one line per host a minute.
+    pub(crate) upstream_log: LogThrottle,
     /// Keeps blocked hosts refused a blocked connection (see `crate::connect`) to one info
     /// line a minute for each cause.
     pub(crate) refused_log: LogThrottle,
 }
 
 impl State {
-    /// Logs a failed upstream request to `authority`. An unreachable host is logged at info
-    /// level, which the tunnel's log shows, at most once a minute per host; anything else at
-    /// debug level.
+    /// Logs a failed upstream request to `authority`. An unreachable host, and a server
+    /// whose certificate the client would reject too (see [`info_level_failure`]), are
+    /// logged at info level, which the tunnel's log shows, at most once a minute per host;
+    /// anything else at debug level.
     pub(crate) fn log_upstream_failure(&self, authority: &str, error: &UpstreamError) {
-        if is_unreachable(error) {
-            if self.unreachable_log.allow(authority) {
-                log::info!("upstream {authority}: unreachable ({error})");
-            }
-        } else {
-            log::debug!("upstream {authority}: {error}");
+        let Some(what) = info_level_failure(error) else {
+            return log::debug!("upstream {authority}: {error}");
+        };
+        if self.upstream_log.allow(authority) {
+            log::info!("upstream {authority}: {what} ({error})");
         }
     }
 
@@ -152,6 +154,23 @@ impl State {
     /// milliseconds.
     pub(crate) fn close_longest_idle_blocked(&self) -> Option<Weak<Activity>> {
         reclaim_longest_idle(&self.blocked, Duration::ZERO)
+    }
+}
+
+/// What an upstream failure logged at info level is called in the line, or `None` for one
+/// logged at debug level. Info level is for failures that name a host worth knowing and
+/// that nothing else logs at info: an unreachable host, and a server whose certificate the
+/// client would reject too (see `upstream::certificate_problem`), which is never learned as
+/// a pin, so `upstream::learn_from_failure` does not log it. The tunnel passes nothing
+/// below info to the device's log, and a client's own lines there name the host only by a
+/// hash, so without this line nothing says which host an app's `502` came from.
+fn info_level_failure(error: &UpstreamError) -> Option<&'static str> {
+    if is_unreachable(error) {
+        Some("unreachable")
+    } else if certificate_problem(error).is_some() {
+        Some("certificate rejected")
+    } else {
+        None
     }
 }
 
@@ -256,7 +275,7 @@ pub async fn serve_with_options(
         provider: Arc::new(rustls::crypto::ring::default_provider()),
         sessions: ServerSessionMemoryCache::new(TLS_SESSION_CACHE),
         server,
-        unreachable_log: LogThrottle::new(UNREACHABLE_LOG_INTERVAL),
+        upstream_log: LogThrottle::new(UPSTREAM_LOG_INTERVAL),
         refused_log: LogThrottle::new(REFUSED_LOG_INTERVAL),
         options,
     });
@@ -338,4 +357,75 @@ async fn front(
         forward::forward(&state, request).await?
     };
     Ok(response.map(|body| DoneBody::new(body, move || drop(in_flight)).boxed_unsync()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use rustls::pki_types::{ServerName, UnixTime};
+    use rustls::{AlertDescription, CertificateError, ExtendedKeyPurpose};
+
+    use super::*;
+
+    fn tls_failure(error: rustls::Error) -> UpstreamError {
+        UpstreamError::Connect(io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    fn certificate(error: CertificateError) -> UpstreamError {
+        tls_failure(rustls::Error::InvalidCertificate(error))
+    }
+
+    #[test]
+    fn unreachable_hosts_and_certificates_the_client_would_reject_are_logged_at_info() {
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        for error in [UpstreamError::Timeout, UpstreamError::Connect(refused)] {
+            assert_eq!(info_level_failure(&error), Some("unreachable"), "{error}");
+        }
+
+        // What rustls reports is the variant with context.
+        let at = |secs| UnixTime::since_unix_epoch(Duration::from_secs(secs));
+        let now = 1_790_000_000;
+        for error in [
+            CertificateError::NotValidForNameContext {
+                expected: ServerName::try_from("api.tollgate.test")
+                    .unwrap()
+                    .to_owned(),
+                presented: vec![r#"DnsName("*.cdn.tollgate.test")"#.to_string()],
+            },
+            CertificateError::ExpiredContext {
+                time: at(now),
+                not_after: at(now - 86_400),
+            },
+            CertificateError::NotValidYetContext {
+                time: at(now),
+                not_before: at(now + 86_400),
+            },
+            CertificateError::InvalidPurposeContext {
+                required: ExtendedKeyPurpose::ServerAuth,
+                presented: vec![ExtendedKeyPurpose::ClientAuth],
+            },
+            CertificateError::NotValidForName,
+            CertificateError::Revoked,
+        ] {
+            let failure = certificate(error.clone());
+            assert_eq!(
+                info_level_failure(&failure),
+                Some("certificate rejected"),
+                "{error:?}"
+            );
+        }
+
+        // An unverified certificate is learned as a pin, which `learn_from_failure` logs;
+        // the rest name nothing worth a line at info level.
+        for error in [
+            certificate(CertificateError::UnknownIssuer),
+            tls_failure(rustls::Error::AlertReceived(
+                AlertDescription::InternalError,
+            )),
+            UpstreamError::Exhausted,
+        ] {
+            assert_eq!(info_level_failure(&error), None, "{error}");
+        }
+    }
 }

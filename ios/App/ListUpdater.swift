@@ -196,6 +196,9 @@ final class ListUpdater: ObservableObject {
         let url: URL
         let format: ListFormat
         let target: ListTarget
+        /// Whether the core leaves out the list's blocks of hosts of sensitive services and
+        /// banks (`FilterList.exemptSensitiveHosts`); false for custom lists.
+        var exemptSensitiveHosts = false
         /// The custom list this source comes from, whose type is checked against its
         /// content; nil for a built-in list.
         var custom: CustomList? = nil
@@ -221,7 +224,8 @@ final class ListUpdater: ObservableObject {
         var settings = ListSettings.load()
         var problems: [String] = []
         var sources = FilterLists.defaults.filter(settings.isEnabled).map {
-            Source(cacheKey: $0.id, name: $0.name, url: $0.url, format: $0.format, target: $0.target)
+            Source(cacheKey: $0.id, name: $0.name, url: $0.url, format: $0.format, target: $0.target,
+                   exemptSensitiveHosts: $0.exemptSensitiveHosts)
         }
         for list in settings.custom {
             // Settings shows the reason on the list's row.
@@ -283,7 +287,9 @@ final class ListUpdater: ObservableObject {
                     target = kind.target
                 }
             }
-            inputs.append(ListInput(name: source.name, text: listText, format: format, target: target))
+            // The core refuses the exemption on a request list, which would fail the compile.
+            inputs.append(ListInput(name: source.name, text: listText, format: format, target: target,
+                                    exemptSensitiveHosts: source.exemptSensitiveHosts && target == .dns))
         }
         if !sources.isEmpty, inputs.isEmpty {
             warnings = problems

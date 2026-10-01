@@ -1,4 +1,5 @@
-//! Blocked hosts behind `CONNECT`: a connection that works, carrying requests that fail.
+//! Blocked hosts behind `CONNECT`: a connection that works, carrying requests that are
+//! blocked.
 //!
 //! A host the DNS blocklist blocks is not refused. iOS 27 and later race each connection
 //! (Connectivity Assist): when the attempt over Wi-Fi, which goes through this proxy, fails
@@ -7,13 +8,21 @@
 //! nothing blocks it, and the blocked host loads. An attempt is ready once the `CONNECT`
 //! answer and the TLS handshake, including the client's check of the certificate, are
 //! done. So the proxy answers `200` at once, without dialing anything, completes the
-//! handshake with a leaf for the host, and fails every request on the connection without a
-//! response ([`NoResponse::Blocked`]). For HTTP/2 hyper resets the request's stream and
-//! keeps the connection open for the next request; for HTTP/1.1 it ends the connection
-//! with the error, without writing anything, and the socket is closed (without a TLS
-//! close_notify). To the page each request is a network error, as a refused `CONNECT` was,
-//! so pages that treat a failed request as blocked still do; to iOS the connection works,
-//! so it has no reason to try another network.
+//! handshake with a leaf for the host, and answers each request on the connection itself
+//! (see `crate::request::answer_on_blocked_connection`). A browser's request, which carries
+//! `Sec-Fetch-Dest`, fails without a response ([`NoResponse::Blocked`]): for HTTP/2 hyper
+//! resets the request's stream and keeps the connection open for the next request; for
+//! HTTP/1.1 it ends the connection with the error, without writing anything, and the
+//! socket is closed (without a TLS close_notify). To the page each request is a network
+//! error, as a refused `CONNECT` was, so pages that treat a failed request as blocked still
+//! do. An app's request, which carries no such header, gets the empty `403` of a request
+//! the filter engine blocks, so an SDK that retries network errors stops, and the
+//! connection stays open. Its body is not read, though: hyper drains once what has arrived
+//! of it and otherwise gives up on the connection. So an HTTP/1.1 request whose body has
+//! not all arrived when the answer is sent (in tests, a body of 16 KiB or more, which no
+//! longer fits in the TLS record of the request's head) gets the `403` with `connection:
+//! close`, and the connection closes; the client still reads the `403`. To iOS the
+//! connection works either way, so it has no reason to try another network.
 //!
 //! A client whose ClientHello offers ALPN protocols but no HTTP one (an app's own protocol
 //! over TLS) would fail the handshake if the proxy insisted on HTTP, so it gets no ALPN
@@ -37,23 +46,22 @@
 use std::future::ready;
 use std::sync::Arc;
 
+use hyper::Request;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use rustls::sign::CertifiedKey;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_rustls::TlsAcceptor;
 
-use crate::body::Body;
 use crate::connect::{NoHello, read_hello};
 use crate::filtering::BlockedBy;
 use crate::hello::ClientHelloInfo;
 use crate::idle::{self, Activity};
 use crate::intercept::{HTTP_ALPN, server_config};
 use crate::proxy::State;
-use crate::request::NoResponse;
+use crate::request::{NoResponse, answer_on_blocked_connection};
 use crate::rewind::Rewind;
 
 /// A blocked connection about to be served: what was settled when its host, or its TLS
@@ -126,11 +134,12 @@ pub(crate) async fn sink<C>(
 }
 
 /// Completes the TLS handshake with the blocked connection's leaf (the ClientHello is
-/// replayed by `client` when it was read already) and fails every request without a
-/// response, until the client closes, nothing has been in flight for
-/// `blocked_idle_timeout`, a new blocked connection needs the slot of this idle one, the
-/// lists change, or the proxy shuts down. A client that offered no HTTP protocol is closed
-/// right after the handshake. Holds the slot until the connection ends.
+/// replayed by `client` when it was read already) and answers every request without an
+/// upstream (see `crate::request::answer_on_blocked_connection`), until the client closes,
+/// nothing has been in flight for `blocked_idle_timeout`, a new blocked connection needs
+/// the slot of this idle one, the lists change, or the proxy shuts down. A client that
+/// offered no HTTP protocol is closed right after the handshake. Holds the slot until the
+/// connection ends.
 pub(crate) async fn serve<C>(state: Arc<State>, client: C, blocked: Blocked)
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -164,26 +173,26 @@ where
     let service = {
         let state = state.clone();
         let activity = activity.clone();
-        service_fn(move |_: Request<Incoming>| {
+        service_fn(move |request: Request<Incoming>| {
             let in_flight = activity.start();
-            let error = if by.lists_changed(&state.ctx) {
-                NoResponse::lists_changed()
+            let answer = if by.lists_changed(&state.ctx) {
+                Err(NoResponse::lists_changed())
             } else {
-                NoResponse::blocked()
+                answer_on_blocked_connection(request.headers())
             };
-            if error.closes_connection() {
+            if answer.as_ref().is_err_and(NoResponse::closes_connection) {
                 in_flight.request_close();
             }
             // In flight only for this moment, which restarts the idle timeout.
             drop(in_flight);
-            ready(Err::<Response<Body>, _>(error))
+            ready(answer)
         })
     };
     let conn = state.server.serve_connection(TokioIo::new(tls), service);
     let idle = state.options.blocked_idle_timeout;
     let (result, _) = idle::serve(conn, &activity, idle, |conn| conn.graceful_shutdown()).await;
     match result {
-        // HTTP/1.1 ends here with the first request's NoResponse.
+        // HTTP/1.1 ends here with the first request that gets a NoResponse.
         Some(Err(e)) => log::debug!("blocked connection to {name}: {e}"),
         Some(Ok(())) => {}
         None => {
