@@ -105,6 +105,7 @@ pub(crate) async fn handle(
     in_flight: InFlight,
     request: Request<Incoming>,
 ) -> Result<Response<Body>, NoResponse> {
+    diag_request(&state, &origin, &request);
     let http1 = request.version() < Version::HTTP_2;
     // The client connection closes after this request when its host is now passed through
     // (a pin learned on another connection, or by this request), so the client's next
@@ -351,6 +352,34 @@ pub(crate) fn bad_gateway(error: &UpstreamError) -> Response<Body> {
         );
     }
     status(StatusCode::BAD_GATEWAY)
+}
+
+/// Diagnostic build only: logs at info level how the client of an intercepted connection
+/// identifies its requests (User-Agent and the Fetch Metadata headers browsers send), at
+/// most once a minute per host and User-Agent, to compare with what its `CONNECT` said.
+fn diag_request(state: &State, origin: &Origin, request: &Request<Incoming>) {
+    let headers = request.headers();
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-")
+    };
+    let ua = get("user-agent");
+    if !state
+        .diag_log
+        .allow(&format!("request {} {ua}", origin.name))
+    {
+        return;
+    }
+    log::info!(
+        "diag request {} ua={ua:?} sec-fetch-dest={} sec-fetch-mode={} sec-fetch-site={} version={:?}",
+        origin.name,
+        get("sec-fetch-dest"),
+        get("sec-fetch-mode"),
+        get("sec-fetch-site"),
+        request.version()
+    );
 }
 
 #[cfg(test)]

@@ -79,6 +79,7 @@ pub(crate) async fn connect(state: &Arc<State>, request: Request<Incoming>) -> R
     };
     let host = bare_host(authority.host()).to_string();
     let port = authority.port_u16().unwrap_or(443);
+    diag_connect(state, &request, &host, port);
 
     if let Some(by) = domain_blocked_by(&state.ctx, &host) {
         let Some(slot) = blocked_slot(state, &host, "with 403").await else {
@@ -440,4 +441,24 @@ where
         Some(Ok(Ended::Idle)) => log::debug!("tunnel {host}:{port}: idle for {idle:?}, closing"),
         Some(Err(e)) => log::debug!("tunnel {host}:{port}: {e}"),
     }
+}
+
+/// Diagnostic build only: logs at info level how a client identifies itself when it opens a
+/// connection through the proxy (its User-Agent and the names of the headers it sends), at
+/// most once a minute per host and User-Agent. It answers whether connections from web
+/// content and from apps' own code can be told apart before deciding to decrypt them.
+fn diag_connect(state: &State, request: &Request<Incoming>, host: &str, port: u16) {
+    let headers = request.headers();
+    let ua = headers
+        .get(hyper::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+    if !state.diag_log.allow(&format!("connect {host} {ua}")) {
+        return;
+    }
+    let names: Vec<&str> = headers.keys().map(|name| name.as_str()).collect();
+    log::info!(
+        "diag CONNECT {host}:{port} ua={ua:?} headers={names:?} version={:?}",
+        request.version()
+    );
 }

@@ -42,6 +42,8 @@ const UPSTREAM_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// Each cause of refusing a blocked host a blocked connection is logged at info level at most
 /// once in this interval.
 const REFUSED_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// Diagnostic build only: how often the same client identification is logged per host.
+const DIAG_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Everything the proxy needs from the engine that owns it.
 pub struct ProxyContext {
@@ -113,6 +115,10 @@ pub(crate) struct State {
     /// Keeps blocked hosts refused a blocked connection (see `crate::connect`) to one info
     /// line a minute for each cause.
     pub(crate) refused_log: LogThrottle,
+    /// Diagnostic build only: keeps the client identification lines (see
+    /// `crate::connect::diag_connect` and `crate::request::diag_request`) to one a minute
+    /// per host and User-Agent.
+    pub(crate) diag_log: LogThrottle,
 }
 
 impl State {
@@ -277,6 +283,7 @@ pub async fn serve_with_options(
         server,
         upstream_log: LogThrottle::new(UPSTREAM_LOG_INTERVAL),
         refused_log: LogThrottle::new(REFUSED_LOG_INTERVAL),
+        diag_log: LogThrottle::new(DIAG_LOG_INTERVAL),
         options,
     });
 
